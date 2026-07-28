@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist",
+    "rootDir": "src",
+    "noEmit": false,
+    "isolatedModules": false,
+    "declaration": false,
+    "sourceMap": true
+  },
+  "include": ["src/cli.ts", "src/server.ts", "src/types.ts", "src/lib/**/*.ts"],
+  "exclude": ["src/client"]
+}

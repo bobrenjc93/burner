@@ -1,0 +1,37 @@
+{
+  "name": "burner",
+  "version": "0.1.0",
+  "description": "A local control room for autonomous, evaluation-driven repo improvement.",
+  "type": "module",
+  "bin": {
+    "burner": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build:server && npm run build:web",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:web": "vite build",
+    "dev": "npm run build && node dist/cli.js --no-open",
+    "start": "node dist/cli.js --no-open",
+    "test": "npm run build:server && node --test tests/*.test.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "20.19.30",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "5.1.4",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "typescript": "5.9.3",
+    "vite": "7.3.1"
+  }
+}
