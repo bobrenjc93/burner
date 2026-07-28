@@ -68,6 +68,7 @@ function validateSettings(input: Record<string, unknown>): BurnerSettings {
     baseBranch: text("baseBranch"),
     remote: text("remote"),
     defaultResources: Array.isArray(input.defaultResources) ? input.defaultResources.map(String).map((value) => value.trim()).filter(Boolean).slice(0, 20) : [],
+    maxReviewRounds: integer("maxReviewRounds", 1, 50),
   };
 }
 
@@ -163,6 +164,23 @@ export async function createBurnerServer(options: BurnerServerOptions) {
       });
       if (!found) return json(response, 404, { error: "Idea not found or cannot be changed." });
       events.emit("state", store.get());
+      json(response, 200, { ok: true });
+    }),
+    route("POST", "/api/composites", async (_request, response, _params, body) => {
+      const agentRunIds = Array.isArray(body.agentRunIds) ? body.agentRunIds.map(String) : [];
+      const composite = await orchestrator.createComposite(agentRunIds, String(body.title ?? ""), String(body.description ?? ""));
+      json(response, 202, composite);
+    }),
+    route("POST", "/api/composites/:compositeId/merge", async (_request, response, params) => {
+      await orchestrator.mergeComposite(params.compositeId);
+      json(response, 202, { accepted: true });
+    }),
+    route("POST", "/api/composites/:compositeId/retry", async (_request, response, params) => {
+      await orchestrator.retryComposite(params.compositeId);
+      json(response, 202, { accepted: true });
+    }),
+    route("POST", "/api/pull-requests/sync", async (_request, response) => {
+      await orchestrator.syncPullRequests(true);
       json(response, 200, { ok: true });
     }),
     route("PUT", "/api/settings", async (_request, response, _params, body) => {

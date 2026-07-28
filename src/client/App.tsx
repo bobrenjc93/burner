@@ -35,6 +35,7 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties, type Form
 import type {
   AgentRun,
   BurnerSettings,
+  CompositePr,
   DashboardPayload,
   Evaluation,
   EvaluationRun,
@@ -42,12 +43,13 @@ import type {
 } from "../types";
 import { api } from "./lib/api";
 
-type Tab = "overview" | "evaluations" | "queue" | "settings";
+type Tab = "overview" | "evaluations" | "queue" | "composites" | "settings";
 
 const nav = [
   { id: "overview" as const, label: "Overview", icon: LayoutDashboard },
   { id: "evaluations" as const, label: "Evaluations", icon: Gauge },
   { id: "queue" as const, label: "Improvement queue", icon: Boxes },
+  { id: "composites" as const, label: "Master cook", icon: GitPullRequest },
   { id: "settings" as const, label: "Settings", icon: SettingsIcon },
 ];
 
@@ -59,6 +61,7 @@ export function App() {
   const [busy, setBusy] = useState<string>();
   const [evaluationModal, setEvaluationModal] = useState<Evaluation | "new">();
   const [ideaModal, setIdeaModal] = useState(false);
+  const [compositeModal, setCompositeModal] = useState(false);
   const refreshTimer = useRef<number | undefined>(undefined);
 
   const refresh = useCallback(async () => {
@@ -77,7 +80,7 @@ export function App() {
       window.clearTimeout(refreshTimer.current);
       refreshTimer.current = window.setTimeout(() => void refresh(), 250);
     };
-    ["state", "evaluation", "agent", "error"].forEach((name) => events.addEventListener(name, scheduleRefresh));
+    ["state", "evaluation", "agent", "composite", "review", "error"].forEach((name) => events.addEventListener(name, scheduleRefresh));
     return () => {
       events.close();
       window.clearTimeout(refreshTimer.current);
@@ -123,6 +126,7 @@ export function App() {
             <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => { setTab(item.id); setSidebar(false); }}>
               <item.icon size={17} /> {item.label}
               {item.id === "queue" && <span className="nav-count">{dashboard.state.ideas.filter((idea) => idea.status === "queued").length}</span>}
+              {item.id === "composites" && <span className="nav-count">{dashboard.state.composites.filter((composite) => composite.status === "open").length}</span>}
             </button>
           ))}
         </nav>
@@ -160,6 +164,9 @@ export function App() {
           {tab === "queue" && (
             <Queue dashboard={dashboard} busy={busy} action={action} onAdd={() => setIdeaModal(true)} />
           )}
+          {tab === "composites" && (
+            <Composites dashboard={dashboard} busy={busy} action={action} onCreate={() => setCompositeModal(true)} />
+          )}
           {tab === "settings" && <Settings dashboard={dashboard} onSaved={refresh} setError={setError} />}
         </div>
       </main>
@@ -173,6 +180,7 @@ export function App() {
         />
       )}
       {ideaModal && <IdeaDialog evaluations={dashboard.state.evaluations} onClose={() => setIdeaModal(false)} onSaved={async () => { setIdeaModal(false); await refresh(); }} setError={setError} />}
+      {compositeModal && <CompositeDialog dashboard={dashboard} onClose={() => setCompositeModal(false)} onSaved={async () => { setCompositeModal(false); await refresh(); }} setError={setError} />}
     </div>
   );
 }
@@ -314,6 +322,32 @@ function Queue({ dashboard, busy, action, onAdd }: { dashboard: DashboardPayload
   </>;
 }
 
+function Composites({ dashboard, busy, action, onCreate }: { dashboard: DashboardPayload; busy?: string; action: (key: string, path: string, body?: unknown) => Promise<void>; onCreate: () => void }) {
+  const composites = [...dashboard.state.composites].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const eligible = dashboard.state.agentRuns.filter((run) => run.prUrl && (!run.prState || run.prState === "open")).length;
+  return <>
+    <PageHeading eyebrow="Combined impact" title="Master cook" body="Combine reviewed PRs in a real worktree, review the integration, and recalculate every evaluation against the actual merged code." actions={<><button className="button button-secondary" disabled={busy === "sync"} onClick={() => void action("sync", "/pull-requests/sync")}><RotateCcw size={16} /> Sync GitHub</button><button className="button button-primary" disabled={eligible < 2} onClick={onCreate}><Flame size={16} /> Master cook</button></>} />
+    <div className="master-note"><Sparkles size={18} /><div><strong>No score arithmetic</strong><p>Burner checks out the base, merges every selected branch, resolves integration, completes the reviewer loop, and runs all evaluations again.</p></div></div>
+    {composites.length ? <div className="composite-grid">{composites.map((composite) => <CompositeCard key={composite.id} composite={composite} dashboard={dashboard} action={action} busy={busy} />)}</div> : <EmptyState icon={<Flame />} title="Nothing is cooking yet" body="Once two individual Burner PRs are open, combine them into a measured composite." action={<button className="button button-primary" disabled={eligible < 2} onClick={onCreate}>Choose PRs</button>} />}
+  </>;
+}
+
+function CompositeCard({ composite, dashboard, action, busy }: { composite: CompositePr; dashboard: DashboardPayload; action: (key: string, path: string, body?: unknown) => Promise<void>; busy?: string }) {
+  const latestReview = composite.reviewRounds.at(-1);
+  return <article className="panel composite-card">
+    <div className="composite-head"><div><span className="section-kicker">{composite.sources.length} source PRs</span><h2>{composite.title}</h2></div><StatusPill status={composite.status} /></div>
+    <p className="composite-description">{composite.description}</p>
+    <div className="source-prs">{composite.sources.map((source) => {
+      const run = dashboard.state.agentRuns.find((item) => item.id === source.agentRunId);
+      return <span key={source.agentRunId} className={run?.prState && run.prState !== "open" ? "source-closed" : ""}><GitPullRequest size={12} /> #{source.prNumber} <small>{run?.prState ?? "open"}</small></span>;
+    })}</div>
+    <div className="composite-score-row"><div><small>Recalculated composite</small><strong>{composite.compositeScore?.toFixed(1) ?? "—"}<em>/100</em></strong></div><div><small>Measured impact</small><strong className={(composite.impact ?? 0) >= 0 ? "positive-number" : "negative-number"}>{composite.impact === undefined ? "—" : `${composite.impact >= 0 ? "+" : ""}${composite.impact.toFixed(1)}`}</strong></div><div><small>Review loop</small><strong className="review-count">{latestReview?.approved ? <><Check size={15} /> Approved</> : composite.reviewRounds.length ? `Round ${composite.reviewRounds.length}` : "Waiting"}</strong></div></div>
+    {composite.deltas.length > 0 && <div className="mini-deltas">{composite.deltas.map((delta) => <div key={delta.evaluationId}><span>{delta.name}</span><strong className={(delta.delta ?? 0) >= 0 ? "positive-number" : "negative-number"}>{delta.after?.toFixed(1)} <small>{delta.delta === undefined ? "" : `(${delta.delta >= 0 ? "+" : ""}${delta.delta.toFixed(1)})`}</small></strong></div>)}</div>}
+    {composite.error && <div className="idea-error">{composite.error}</div>}
+    <div className="composite-actions"><span>{composite.status === "rebuilding" ? "Recalculating after base change…" : timeAgo(composite.updatedAt)}</span><div>{composite.prUrl && <a className="button button-secondary" href={composite.prUrl} target="_blank" rel="noreferrer"><ExternalLink size={14} /> GitHub</a>}{composite.status === "failed" && <button className="button button-secondary" disabled={busy === `retry-${composite.id}`} onClick={() => void action(`retry-${composite.id}`, `/composites/${composite.id}/retry`)}><RotateCcw size={14} /> Retry</button>}{composite.status === "open" && <button className="button button-primary" disabled={busy === `merge-${composite.id}`} onClick={() => { if (window.confirm(`Merge “${composite.title}” and close its ${composite.sources.length} source PRs?`)) void action(`merge-${composite.id}`, `/composites/${composite.id}/merge`); }}><GitPullRequest size={14} /> Merge composite</button>}</div></div>
+  </article>;
+}
+
 function Settings({ dashboard, onSaved, setError }: { dashboard: DashboardPayload; onSaved: () => Promise<void>; setError: (value?: string) => void }) {
   const [form, setForm] = useState<BurnerSettings>(dashboard.state.settings);
   const [saving, setSaving] = useState(false);
@@ -329,7 +363,7 @@ function Settings({ dashboard, onSaved, setError }: { dashboard: DashboardPayloa
     <form className="settings-layout" onSubmit={submit}>
       <div className="settings-main">
         <SettingsSection icon={<Bot size={19} />} title="Agent orchestration" body="Control how much autonomous work Burner can run at once.">
-          <div className="form-grid"><Field label="Parallel agents" hint="Maximum concurrent implementation worktrees"><input type="number" min={1} max={12} value={form.parallelism} onChange={(event) => change("parallelism", Number(event.target.value))} /></Field><Field label="Planning interval" hint="Minutes between orchestrator planning passes"><input type="number" min={1} value={form.orchestratorIntervalMinutes} onChange={(event) => change("orchestratorIntervalMinutes", Number(event.target.value))} /></Field><Field label="Evaluation interval" hint="Minutes between repo baseline refreshes"><input type="number" min={1} value={form.evaluationIntervalMinutes} onChange={(event) => change("evaluationIntervalMinutes", Number(event.target.value))} /></Field><Field label="Default resource locks" hint="Comma-separated; every agent acquires these"><input value={form.defaultResources.join(", ")} placeholder="e.g. gpu, simulator" onChange={(event) => change("defaultResources", event.target.value.split(",").map((value) => value.trim()).filter(Boolean))} /></Field></div>
+          <div className="form-grid"><Field label="Parallel agents" hint="Maximum concurrent implementation worktrees"><input type="number" min={1} max={12} value={form.parallelism} onChange={(event) => change("parallelism", Number(event.target.value))} /></Field><Field label="Review safety limit" hint="Maximum author/reviewer rounds before stopping"><input type="number" min={1} max={50} value={form.maxReviewRounds} onChange={(event) => change("maxReviewRounds", Number(event.target.value))} /></Field><Field label="Planning interval" hint="Minutes between orchestrator planning passes"><input type="number" min={1} value={form.orchestratorIntervalMinutes} onChange={(event) => change("orchestratorIntervalMinutes", Number(event.target.value))} /></Field><Field label="Evaluation interval" hint="Minutes between repo baseline refreshes"><input type="number" min={1} value={form.evaluationIntervalMinutes} onChange={(event) => change("evaluationIntervalMinutes", Number(event.target.value))} /></Field><Field label="Default resource locks" hint="Comma-separated; every agent acquires these"><input value={form.defaultResources.join(", ")} placeholder="e.g. gpu, simulator" onChange={(event) => change("defaultResources", event.target.value.split(",").map((value) => value.trim()).filter(Boolean))} /></Field></div>
           <Toggle checked={form.autoRun} onChange={(value) => change("autoRun", value)} label="Ignite automatically on launch" body="Resume the continuous loop whenever Burner starts." />
         </SettingsSection>
         <SettingsSection icon={<Sparkles size={19} />} title="Codex" body="Leave model fields empty to inherit your local Codex configuration.">
@@ -366,6 +400,13 @@ function IdeaDialog({ evaluations, onClose, onSaved, setError }: { evaluations: 
   return <Modal onClose={onClose}><form onSubmit={submit}><div className="modal-head"><div><span className="section-kicker">Manual dispatch</span><h2>Queue an improvement</h2></div><button type="button" className="icon-btn" onClick={onClose}><X size={18} /></button></div><div className="modal-fields"><Field label="Title"><input autoFocus required value={title} placeholder="Improve empty states" onChange={(event) => setTitle(event.target.value)} /></Field><Field label="Implementation brief"><textarea required rows={5} value={description} placeholder="Describe the concrete change and expected outcome…" onChange={(event) => setDescription(event.target.value)} /></Field><div className="form-grid compact"><Field label="Predicted impact"><input type="number" min={0} max={100} value={impact} onChange={(event) => setImpact(Number(event.target.value))} /></Field><Field label="Resource locks" hint="Comma-separated, only when scarce"><input value={resources} placeholder="gpu, ios-simulator" onChange={(event) => setResources(event.target.value)} /></Field></div><Field label="Target evaluations"><div className="check-grid">{evaluations.map((evaluation) => <label className="check-chip" key={evaluation.id}><input type="checkbox" checked={selected.includes(evaluation.id)} onChange={() => setSelected((values) => values.includes(evaluation.id) ? values.filter((id) => id !== evaluation.id) : [...values, evaluation.id])} /><span>{evaluation.name}</span></label>)}</div></Field></div><div className="modal-actions"><button type="button" className="button button-secondary" onClick={onClose}>Cancel</button><button className="button button-primary" disabled={saving}>{saving && <LoaderCircle size={15} className="spin" />} Add to queue</button></div></form></Modal>;
 }
 
+function CompositeDialog({ dashboard, onClose, onSaved, setError }: { dashboard: DashboardPayload; onClose: () => void; onSaved: () => Promise<void>; setError: (value?: string) => void }) {
+  const candidates = dashboard.state.agentRuns.filter((run) => run.prUrl && (!run.prState || run.prState === "open"));
+  const [selected, setSelected] = useState<string[]>([]); const [title, setTitle] = useState(""); const [description, setDescription] = useState(""); const [saving, setSaving] = useState(false);
+  const submit = async (event: FormEvent) => { event.preventDefault(); setSaving(true); try { await api("/composites", { method: "POST", body: JSON.stringify({ agentRunIds: selected, title, description }) }); await onSaved(); } catch (error) { setError(error instanceof Error ? error.message : String(error)); setSaving(false); } };
+  return <Modal onClose={onClose}><form onSubmit={submit}><div className="modal-head"><div><span className="section-kicker">Composite PR</span><h2>Master cook PRs</h2></div><button type="button" className="icon-btn" onClick={onClose}><X size={18} /></button></div><p className="modal-intro">Select at least two open PRs. Burner will combine their branches—not their scores—then review and evaluate the resulting code.</p><div className="modal-fields"><Field label="Composite title"><input value={title} placeholder="Composite: onboarding and performance" onChange={(event) => setTitle(event.target.value)} /></Field><Field label="Description"><textarea rows={3} value={description} placeholder="Why these changes belong together…" onChange={(event) => setDescription(event.target.value)} /></Field><Field label="Open source PRs"><div className="composite-picker">{candidates.map((run) => { const idea = dashboard.state.ideas.find((item) => item.id === run.ideaId); return <label key={run.id}><input type="checkbox" checked={selected.includes(run.id)} onChange={() => setSelected((values) => values.includes(run.id) ? values.filter((id) => id !== run.id) : [...values, run.id])} /><span><GitPullRequest size={15} /><strong>#{run.prNumber} · {idea?.title ?? run.branch}</strong><small>{run.impact === undefined ? "No impact score" : `${run.impact >= 0 ? "+" : ""}${run.impact.toFixed(1)} individual impact`} · {run.reviewRounds.length} review round{run.reviewRounds.length === 1 ? "" : "s"}</small></span></label>; })}</div></Field></div><div className="modal-actions"><button type="button" className="button button-secondary" onClick={onClose}>Cancel</button><button className="button button-primary" disabled={saving || selected.length < 2}>{saving && <LoaderCircle size={15} className="spin" />} Cook {selected.length || ""} PR{selected.length === 1 ? "" : "s"}</button></div></form></Modal>;
+}
+
 function Metric({ icon, label, value, note, tone }: { icon: ReactNode; label: string; value: string | number; note: string; tone: string }) { return <div className="panel metric-card"><span className={`metric-icon ${tone}`}>{icon}</span><div><small>{label}</small><strong>{value}</strong><p>{note}</p></div></div>; }
 function Delta({ value }: { value: number }) { const up = value >= 0; return <span className={`delta ${up ? "positive" : "negative"}`}>{up ? <ArrowUpRight size={13} /> : <ArrowDownRight size={13} />}{up ? "+" : ""}{value.toFixed(1)} since prior baseline</span>; }
 function ScoreRing({ score }: { score?: number }) { const value = score ?? 0; return <div className="score-ring" style={{ "--score": `${value * 3.6}deg` } as CSSProperties}><div><strong>{score?.toFixed(1) ?? "—"}</strong><small>/ 100</small></div></div>; }
@@ -373,7 +414,7 @@ function Sparkline({ values }: { values: number[] }) { if (values.length < 2) re
 function EvaluationRow({ evaluation, run, history }: { evaluation: Evaluation; run?: EvaluationRun; history: EvaluationRun[] }) { return <div className="eval-row"><div className="eval-score">{run?.score?.toFixed(0) ?? "—"}</div><div className="eval-copy"><strong>{evaluation.name}</strong><p>{run?.summary ?? "Waiting for its first baseline."}</p></div><Sparkline values={history.map((item) => item.score ?? 0)} /><span className="eval-time">{run ? timeAgo(run.createdAt) : "Not run"}</span></div>; }
 function ActivityGlyph({ type }: { type: string }) { if (type === "pr") return <GitPullRequest size={13} />; if (type === "agent") return <Bot size={13} />; if (type === "evaluation") return <Gauge size={13} />; if (type === "error") return <X size={13} />; if (type === "idea") return <Sparkles size={13} />; return <Zap size={13} />; }
 function ImpactRow({ index, run, idea }: { index: number; run?: AgentRun; idea?: Idea }) { const impact = run?.impact ?? idea?.predictedImpact; return <div className="impact-row"><span className="rank">{String(index).padStart(2, "0")}</span><span className="impact-name"><strong>{idea?.title ?? "Completed improvement"}</strong><small>{run ? "Measured across branch evaluations" : "Predicted impact · awaiting dispatch"}</small></span><span><StatusPill status={run?.status ?? idea?.status ?? "queued"} /></span><span className={`impact-value ${(impact ?? 0) >= 0 ? "up" : "down"}`}>{run && (impact ?? 0) >= 0 ? "+" : ""}{impact?.toFixed(1) ?? "—"}</span><span>{run?.prUrl ? <a className="icon-btn" href={run.prUrl} target="_blank" rel="noreferrer"><ExternalLink size={15} /></a> : <MoreHorizontal size={17} />}</span></div>; }
-function IdeaCard({ idea, run, action }: { idea: Idea; run?: AgentRun; action: (key: string, path: string, body?: unknown) => Promise<void> }) { return <article className="idea-card"><div className="idea-top"><span className="impact-badge"><Zap size={12} /> {idea.predictedImpact.toFixed(0)}</span><span className="idea-source">{idea.source}</span></div><h3>{idea.title}</h3><p>{idea.description}</p>{idea.resources.length > 0 && <div className="lock-chips">{idea.resources.map((resource) => <span key={resource}><LockKeyhole size={11} /> {resource}</span>)}</div>}<div className="idea-foot"><span>{timeAgo(idea.createdAt)}</span>{run?.prUrl ? <a href={run.prUrl} target="_blank" rel="noreferrer"><GitPullRequest size={14} /> PR #{run.prNumber}</a> : idea.status === "failed" || idea.status === "dismissed" ? <button onClick={() => void action(`retry-${idea.id}`, `/ideas/${idea.id}/status`, { status: "queued" })}><RotateCcw size={13} /> Retry</button> : idea.status === "queued" ? <button onClick={() => void action(`dismiss-${idea.id}`, `/ideas/${idea.id}/status`, { status: "dismissed" })}>Dismiss</button> : <span>{run?.status.replace("_", " ")}</span>}</div>{run?.error && <div className="idea-error">{run.error}</div>}</article>; }
+function IdeaCard({ idea, run, action }: { idea: Idea; run?: AgentRun; action: (key: string, path: string, body?: unknown) => Promise<void> }) { return <article className="idea-card"><div className="idea-top"><span className="impact-badge"><Zap size={12} /> {idea.predictedImpact.toFixed(0)}</span><span className="idea-source">{idea.source}</span></div><h3>{idea.title}</h3><p>{idea.description}</p>{idea.resources.length > 0 && <div className="lock-chips">{idea.resources.map((resource) => <span key={resource}><LockKeyhole size={11} /> {resource}</span>)}</div>}{run && run.reviewRounds.length > 0 && <div className="review-chip"><ShieldCheck size={12} /> {run.reviewApproved ? `Approved in ${run.reviewRounds.length} round${run.reviewRounds.length === 1 ? "" : "s"}` : `Review round ${run.reviewRounds.length}`}</div>}<div className="idea-foot"><span>{timeAgo(idea.createdAt)}</span>{run?.prUrl ? <a href={run.prUrl} target="_blank" rel="noreferrer"><GitPullRequest size={14} /> PR #{run.prNumber}</a> : idea.status === "failed" || idea.status === "dismissed" ? <button onClick={() => void action(`retry-${idea.id}`, `/ideas/${idea.id}/status`, { status: "queued" })}><RotateCcw size={13} /> Retry</button> : idea.status === "queued" ? <button onClick={() => void action(`dismiss-${idea.id}`, `/ideas/${idea.id}/status`, { status: "dismissed" })}>Dismiss</button> : <span>{run?.status.replace("_", " ")}</span>}</div>{run?.error && <div className="idea-error">{run.error}</div>}</article>; }
 function StatusPill({ status }: { status: string }) { return <span className={`status-pill ${status}`}><span />{status.replace("_", " ")}</span>; }
 function Notice({ icon, title, body }: { icon: ReactNode; title: string; body: string }) { return <div className="notice">{icon}<div><strong>{title}</strong><p>{body}</p></div></div>; }
 function EmptyState({ icon, title, body, action }: { icon: ReactNode; title: string; body: string; action?: ReactNode }) { return <div className="empty-state"><span>{icon}</span><strong>{title}</strong><p>{body}</p>{action}</div>; }

@@ -19,8 +19,9 @@ export type EvaluationRun = {
   durationMs: number;
   status: "running" | "completed" | "failed";
   error?: string;
-  context: "baseline" | "agent" | "manual";
+  context: "baseline" | "agent" | "composite" | "manual";
   agentRunId?: string;
+  compositeId?: string;
 };
 
 export type Idea = {
@@ -47,12 +48,35 @@ export type ScoreDelta = {
   summary?: string;
 };
 
+export type ReviewFinding = {
+  severity: "critical" | "high" | "medium" | "low";
+  title: string;
+  detail: string;
+  file: string;
+};
+
+export type ReviewRound = {
+  id: string;
+  round: number;
+  commit: string;
+  approved: boolean;
+  summary: string;
+  findings: ReviewFinding[];
+  authorResponse?: string;
+  createdAt: string;
+  completedAt?: string;
+};
+
+export type PullRequestState = "open" | "closed" | "merged" | "superseded";
+
 export type AgentRun = {
   id: string;
   ideaId: string;
   status:
     | "starting"
     | "running"
+    | "reviewing"
+    | "revising"
     | "evaluating"
     | "opening_pr"
     | "completed"
@@ -66,9 +90,44 @@ export type AgentRun = {
   error?: string;
   prUrl?: string;
   prNumber?: number;
+  prState?: PullRequestState;
+  supersededByCompositeId?: string;
   deltas: ScoreDelta[];
   impact?: number;
   resources: string[];
+  authorThreadId?: string;
+  reviewRounds: ReviewRound[];
+  reviewApproved?: boolean;
+};
+
+export type CompositeSource = {
+  agentRunId: string;
+  prNumber: number;
+  title: string;
+  branch: string;
+};
+
+export type CompositePr = {
+  id: string;
+  title: string;
+  description: string;
+  status: "queued" | "building" | "reviewing" | "revising" | "evaluating" | "open" | "rebuilding" | "merged" | "closed" | "failed";
+  branch: string;
+  worktree: string;
+  baseCommit?: string;
+  sources: CompositeSource[];
+  deltas: ScoreDelta[];
+  compositeScore?: number;
+  impact?: number;
+  reviewRounds: ReviewRound[];
+  reviewApproved?: boolean;
+  authorThreadId?: string;
+  prUrl?: string;
+  prNumber?: number;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+  mergedAt?: string;
 };
 
 export type Activity = {
@@ -90,21 +149,24 @@ export type BurnerSettings = {
   baseBranch: string;
   remote: string;
   defaultResources: string[];
+  maxReviewRounds: number;
 };
 
 export type BurnerState = {
-  version: 1;
+  version: 2;
   projectName: string;
   settings: BurnerSettings;
   evaluations: Evaluation[];
   evaluationRuns: EvaluationRun[];
   ideas: Idea[];
   agentRuns: AgentRun[];
+  composites: CompositePr[];
   activity: Activity[];
   orchestrator: {
     enabled: boolean;
     lastEvaluationAt?: string;
     lastPlanningAt?: string;
+    baseSyncPending?: boolean;
   };
 };
 
@@ -114,6 +176,7 @@ export type RuntimeStatus = {
   gh: { available: boolean; authenticated: boolean };
   runningEvaluations: number;
   runningAgents: number;
+  runningComposites: number;
   heldLocks: string[];
 };
 

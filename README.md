@@ -21,6 +21,9 @@ burner
 - Runs coding agents in separate git worktrees and branches.
 - Limits concurrency globally and uses atomic file locks for scarce resources such as a GPU, simulator, or CPU-heavy test suite.
 - Re-runs every evaluation on a candidate branch, computes weighted before/after deltas, and stamps the exact table into the pull request body.
+- Runs an independent Codex reviewer against every candidate and resumes the original author session with feedback until the reviewer approves.
+- “Master cooks” multiple open PRs into a composite branch, reviews their integration, and recalculates every evaluation from the actual combined code.
+- Detects merges from Burner or GitHub, fast-forwards the local base, closes source PRs consumed by a composite, and rebuilds other affected composites.
 - Ranks completed proposals by measured impact and queued ideas by predicted impact.
 
 ## Requirements
@@ -48,6 +51,14 @@ Options:
 
 Run `burner` from the repo you want to improve, configure evaluation prompts in the UI, and run a baseline. “Ignite” starts the continuous loop. Pausing stops new dispatches but lets already-running agents finish safely.
 
+## Review and composite workflow
+
+Each implementation author runs in a persistent Codex session. After the author commits a candidate, Burner starts an independent structured reviewer. Requested changes are fed back by resuming the same author session, and the cycle repeats. A PR is opened only after approval and complete branch evaluations. The configurable review safety limit prevents a pathological loop from consuming resources forever.
+
+The **Master cook** view combines two or more open Burner PRs. Burner creates a worktree from the current base, merges the selected branches, asks an integration author to resolve conflicts and test the result, completes the same review loop, then runs every evaluation on that exact code state. Its composite score is therefore measured directly—not calculated by adding individual scores.
+
+When a composite merges, Burner closes its included source PRs. It fast-forwards the configured base branch so new agents start from the new main, invalidates the old baseline, and rebuilds every other affected composite after removing PRs that are now merged, closed, or superseded. This reconciliation also runs when a PR is merged from GitHub instead of the Burner dashboard.
+
 ## Safety and concurrency
 
 Implementation agents receive explicit `workspace-write` access only inside their isolated worktree. Evaluators and the planner are read-only. Burner asks Codex not to push or open PRs; the orchestrator owns those state transitions.
@@ -58,7 +69,7 @@ Each idea may declare resource locks. Locks are acquired atomically under `.burn
 
 ```bash
 npm install
-npm run dev       # Vite middleware + API on :4321
+npm run dev       # Build and run the local app on :4321
 npm run typecheck
 npm test
 npm run build

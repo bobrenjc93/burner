@@ -1,13 +1,25 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { get } from "node:http";
+import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
+import { CodexClient } from "../dist/lib/codex.js";
+import { EventHub } from "../dist/lib/events.js";
+import { Orchestrator } from "../dist/lib/orchestrator.js";
+import { buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
 import { createBurnerServer } from "../dist/server.js";
 import { StateStore, validateEvaluation } from "../dist/lib/store.js";
 import { clampScore, parseJsonObject, slugify, weightedScore } from "../dist/lib/utils.js";
+
+const exec = (cwd, command, args) => new Promise((resolve, reject) => {
+  execFile(command, args, { cwd }, (error, stdout, stderr) => {
+    if (error) reject(new Error(stderr || error.message));
+    else resolve(stdout);
+  });
+});
 
 test("score helpers clamp and weight enabled evaluations", () => {
   assert.equal(clampScore(105), 100);
@@ -61,6 +73,8 @@ test("compiled server serves the API and closes connected event streams", async 
       body: JSON.stringify({ name: "Docs", prompt: "Score the docs", weight: 2, enabled: true }),
     });
     assert.equal(created.status, 201);
+    const invalidComposite = await fetch(`${base}/api/composites`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ agentRunIds: [] }) });
+    assert.equal(invalidComposite.status, 400);
 
     await new Promise((resolve, reject) => {
       const request = get(`${base}/api/events`, (response) => {
@@ -75,6 +89,121 @@ test("compiled server serves the API and closes connected event streams", async 
     ]);
   } finally {
     if (burner.server.listening) await burner.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("git service assembles source branches into an actual composite worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-composite-test-"));
+  try {
+    await exec(root, "git", ["init", "-b", "main"]);
+    await writeFile(join(root, "base.txt"), "base\n");
+    await exec(root, "git", ["add", "."]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "base"]);
+    await exec(root, "git", ["switch", "-c", "feature-a"]);
+    await writeFile(join(root, "a.txt"), "a\n");
+    await exec(root, "git", ["add", "."]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "a"]);
+    await exec(root, "git", ["switch", "main"]);
+    await exec(root, "git", ["switch", "-c", "feature-b"]);
+    await writeFile(join(root, "b.txt"), "b\n");
+    await exec(root, "git", ["add", "."]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "b"]);
+    await exec(root, "git", ["switch", "main"]);
+    const git = new GitService(root, join(root, ".burner"));
+    const worktree = await git.createWorktree("composite", "burner/composite-test", "main");
+    assert.equal((await git.mergeBranch(worktree, "feature-a")).merged, true);
+    assert.equal((await git.mergeBranch(worktree, "feature-b")).merged, true);
+    assert.equal(await git.hasRef("burner/composite-test"), true);
+    assert.equal(await import("node:fs/promises").then((fs) => fs.readFile(join(worktree, "a.txt"), "utf8")), "a\n");
+    assert.equal(await import("node:fs/promises").then((fs) => fs.readFile(join(worktree, "b.txt"), "utf8")), "b\n");
+    await git.removeWorktree(worktree);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PR bodies record review approval and recalculated composite scores", () => {
+  const rounds = [{ id: "r1", round: 1, commit: "abc", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() }];
+  const deltas = [{ evaluationId: "quality", name: "Quality", before: 70, after: 82, delta: 12 }];
+  assert.match(buildPrBody("Change", "Done", deltas, 12, rounds), /Approved by an independent Codex reviewer/);
+  const body = buildCompositePrBody({ description: "Combined", sources: [{ agentRunId: "a", prNumber: 12, title: "A", branch: "a" }, { agentRunId: "b", prNumber: 13, title: "B", branch: "b" }], deltas, compositeScore: 82, impact: 12, reviewRounds: rounds });
+  assert.match(body, /Composite score: 82\.0 \/ 100/);
+  assert.match(body, /#12/);
+  assert.match(body, /never inferred by adding individual deltas/);
+});
+
+test("Codex author sessions resume with reviewer feedback and reviewers stay structured", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-codex-test-"));
+  const bin = join(root, "bin");
+  await import("node:fs/promises").then((fs) => fs.mkdir(bin));
+  const executable = join(bin, "codex");
+  const argsLog = join(root, "args.jsonl");
+  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");const args=process.argv.slice(2);fs.appendFileSync(process.env.BURNER_TEST_ARGS,JSON.stringify(args)+"\\n");const i=args.indexOf("--output-last-message");const out=args[i+1];if(args.includes("review")){fs.writeFileSync(out,JSON.stringify({approved:true,summary:"Ready",findings:[]}));}else{fs.writeFileSync(out,"Author complete");console.log(JSON.stringify({type:"thread.started",thread_id:"thread-test"}));}\n`);
+  await chmod(executable, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath}`;
+  process.env.BURNER_TEST_ARGS = argsLog;
+  const settings = { parallelism: 1, evaluationIntervalMinutes: 30, orchestratorIntervalMinutes: 15, autoRun: false, autoCreatePrs: true, evaluatorModel: "", agentModel: "", baseBranch: "main", remote: "origin", defaultResources: [], maxReviewRounds: 8 };
+  try {
+    const codex = new CodexClient();
+    const author = await codex.implement(root, { id: "idea", title: "Improve", description: "Do it", rationale: "Quality", predictedImpact: 20, evaluationIds: [], resources: [], status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "manual" }, [], settings);
+    assert.equal(author.threadId, "thread-test");
+    const revision = await codex.revise(root, author.threadId, { approved: false, summary: "Fix it", findings: [{ severity: "high", title: "Bug", detail: "Resolve", file: "app.js" }] }, settings);
+    assert.equal(revision.message, "Author complete");
+    const review = await codex.review(root, "main", "Improve", settings);
+    assert.equal(review.approved, true);
+    const calls = (await readFile(argsLog, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.ok(calls[0].includes("--json"));
+    assert.ok(calls[1].includes("resume"));
+    assert.ok(calls[1].includes("thread-test"));
+    assert.ok(calls[2].includes("review"));
+    assert.ok(calls[2].includes("--output-schema"));
+  } finally {
+    process.env.PATH = previousPath;
+    delete process.env.BURNER_TEST_ARGS;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("merged composites supersede source PRs and queue overlapping composites for rebuild", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-reconcile-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const run = (id, number) => ({ id, ideaId: `idea-${id}`, status: "completed", branch: `branch-${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp, prUrl: `https://example.test/pull/${number}`, prNumber: number, prState: "open", deltas: [], resources: [], reviewRounds: [], reviewApproved: true });
+    await store.update((state) => {
+      state.agentRuns.push(run("a", 1), run("b", 2), run("c", 3), run("d", 4));
+      state.composites.push(
+        { id: "merged", title: "Merged composite", description: "", status: "open", branch: "composite-merged", worktree: "", sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a" }, { agentRunId: "b", prNumber: 2, title: "B", branch: "branch-b" }], deltas: [], reviewRounds: [], prNumber: 100, prUrl: "https://example.test/pull/100", createdAt: timestamp, updatedAt: timestamp },
+        { id: "overlap", title: "Overlap", description: "", status: "open", branch: "composite-overlap", worktree: "", sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a" }, { agentRunId: "c", prNumber: 3, title: "C", branch: "branch-c" }, { agentRunId: "d", prNumber: 4, title: "D", branch: "branch-d" }], deltas: [], reviewRounds: [], prNumber: 101, prUrl: "https://example.test/pull/101", createdAt: timestamp, updatedAt: timestamp },
+      );
+    });
+    const closed = [];
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = {
+      remoteExists: async () => true,
+      listPullRequests: async () => [
+        { number: 1, state: "OPEN", headRefName: "branch-a", url: "" }, { number: 2, state: "OPEN", headRefName: "branch-b", url: "" },
+        { number: 3, state: "OPEN", headRefName: "branch-c", url: "" }, { number: 4, state: "OPEN", headRefName: "branch-d", url: "" },
+        { number: 100, state: "MERGED", headRefName: "composite-merged", url: "" }, { number: 101, state: "OPEN", headRefName: "composite-overlap", url: "" },
+      ],
+      closePr: async (_cwd, number) => { closed.push(number); },
+      syncBase: async () => "abcdef1234567890",
+    };
+    await orchestrator.syncPullRequests(true);
+    const state = store.get();
+    assert.equal(state.composites.find((item) => item.id === "merged").status, "merged");
+    assert.equal(state.agentRuns.find((item) => item.id === "a").prState, "superseded");
+    assert.equal(state.agentRuns.find((item) => item.id === "b").prState, "superseded");
+    const overlap = state.composites.find((item) => item.id === "overlap");
+    assert.equal(overlap.status, "rebuilding");
+    assert.deepEqual(overlap.sources.map((source) => source.agentRunId), ["c", "d"]);
+    assert.deepEqual(closed.sort(), [1, 2]);
+    assert.equal(state.orchestrator.baseSyncPending, false);
+    assert.equal(state.orchestrator.lastEvaluationAt, undefined);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -95,6 +224,8 @@ test("state persists evaluation configuration and excludes candidate scores from
     const reloaded = new StateStore(root);
     await reloaded.init();
     assert.equal(reloaded.get().projectName, root.split("/").at(-1));
+    assert.equal(reloaded.get().version, 2);
+    assert.equal(reloaded.get().settings.maxReviewRounds, 8);
     assert.equal(reloaded.latestRuns().get(evaluation.id)?.score, 61);
     assert.deepEqual(validateEvaluation({ name: " UX ", prompt: " Score it ", weight: 2 }), { name: "UX", prompt: "Score it", weight: 2, enabled: true });
   } finally {

@@ -1,6 +1,6 @@
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
-import type { ScoreDelta } from "../types.js";
+import type { CompositeSource, ReviewRound, ScoreDelta } from "../types.js";
 import { runCommand } from "./process.js";
 
 export class GitService {
@@ -48,6 +48,36 @@ export class GitService {
     return path;
   }
 
+  async createRebuildWorktree(runId: string, branch: string, baseBranch: string): Promise<string> {
+    const worktreesDir = join(this.dataDir, "worktrees");
+    const path = join(worktreesDir, runId);
+    await mkdir(worktreesDir, { recursive: true });
+    await rm(path, { recursive: true, force: true });
+    const add = await runCommand("git", ["worktree", "add", path, branch], { cwd: this.root });
+    if (add.exitCode !== 0) throw new Error(add.stderr.trim() || "Could not recreate composite worktree");
+    const reset = await runCommand("git", ["reset", "--hard", baseBranch], { cwd: path });
+    if (reset.exitCode !== 0) throw new Error(reset.stderr.trim() || `Could not reset composite to ${baseBranch}`);
+    return path;
+  }
+
+  async mergeBranch(cwd: string, branch: string): Promise<{ merged: boolean; conflict: boolean }> {
+    const result = await runCommand(
+      "git",
+      ["-c", "user.name=Burner", "-c", "user.email=burner@localhost", "merge", "--no-ff", "--no-edit", branch],
+      { cwd },
+    );
+    if (result.exitCode === 0) return { merged: true, conflict: false };
+    const status = await runCommand("git", ["diff", "--name-only", "--diff-filter=U"], { cwd });
+    if (status.stdout.trim()) return { merged: false, conflict: true };
+    throw new Error(result.stderr.trim() || `Could not merge ${branch}`);
+  }
+
+  async fetchBranch(remote: string, branch: string): Promise<string> {
+    const result = await runCommand("git", ["fetch", remote, `refs/heads/${branch}:refs/remotes/${remote}/${branch}`], { cwd: this.root, timeoutMs: 10 * 60 * 1000 });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not fetch ${remote}/${branch}`);
+    return `${remote}/${branch}`;
+  }
+
   async hasChanges(cwd: string): Promise<boolean> {
     const result = await runCommand("git", ["status", "--porcelain"], { cwd });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not inspect worktree changes");
@@ -69,6 +99,11 @@ export class GitService {
   async push(cwd: string, remote: string, branch: string): Promise<void> {
     const result = await runCommand("git", ["push", "-u", remote, branch], { cwd, timeoutMs: 10 * 60 * 1000 });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not push branch");
+  }
+
+  async forcePush(cwd: string, remote: string, branch: string): Promise<void> {
+    const result = await runCommand("git", ["push", "--force-with-lease", "-u", remote, branch], { cwd, timeoutMs: 10 * 60 * 1000 });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not update composite branch");
   }
 
   async openPr(options: {
@@ -93,22 +128,68 @@ export class GitService {
     await runCommand("git", ["worktree", "remove", "--force", path], { cwd: this.root });
   }
 
+  async editPr(cwd: string, number: number, title: string, body: string): Promise<void> {
+    const result = await runCommand("gh", ["pr", "edit", String(number), "--title", title, "--body", body], { cwd, timeoutMs: 5 * 60 * 1000 });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not update PR #${number}`);
+  }
+
+  async closePr(cwd: string, number: number, comment: string): Promise<void> {
+    const result = await runCommand("gh", ["pr", "close", String(number), "--comment", comment], { cwd, timeoutMs: 5 * 60 * 1000 });
+    if (result.exitCode !== 0 && !result.stderr.includes("already closed")) throw new Error(result.stderr.trim() || `Could not close PR #${number}`);
+  }
+
+  async mergePr(cwd: string, number: number): Promise<void> {
+    const result = await runCommand("gh", ["pr", "merge", String(number), "--merge"], { cwd, timeoutMs: 10 * 60 * 1000 });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not merge PR #${number}`);
+  }
+
+  async listPullRequests(cwd = this.root): Promise<Array<{ number: number; state: "OPEN" | "CLOSED" | "MERGED"; headRefName: string; url: string }>> {
+    const result = await runCommand("gh", ["pr", "list", "--state", "all", "--limit", "1000", "--json", "number,state,headRefName,url"], { cwd, timeoutMs: 2 * 60 * 1000 });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not synchronize pull requests");
+    return JSON.parse(result.stdout) as Array<{ number: number; state: "OPEN" | "CLOSED" | "MERGED"; headRefName: string; url: string }>;
+  }
+
+  async syncBase(remote: string, baseBranch: string): Promise<string> {
+    const fetch = await runCommand("git", ["fetch", remote, baseBranch], { cwd: this.root, timeoutMs: 10 * 60 * 1000 });
+    if (fetch.exitCode !== 0) throw new Error(fetch.stderr.trim() || `Could not fetch ${remote}/${baseBranch}`);
+    const status = await this.status();
+    if (status.dirty) throw new Error("Cannot update the base branch while the root checkout has uncommitted changes.");
+    if (status.branch !== baseBranch) throw new Error(`Switch the root checkout to '${baseBranch}' so Burner can fast-forward after merges.`);
+    const merge = await runCommand("git", ["merge", "--ff-only", `${remote}/${baseBranch}`], { cwd: this.root });
+    if (merge.exitCode !== 0) throw new Error(merge.stderr.trim() || `Could not fast-forward ${baseBranch}`);
+    return this.head();
+  }
+
   async remoteExists(remote: string): Promise<boolean> {
     return (await runCommand("git", ["remote", "get-url", remote], { cwd: this.root })).exitCode === 0;
   }
 }
 
-export function buildPrBody(description: string, lastMessage: string, deltas: ScoreDelta[], impact: number): string {
-  const rows = deltas.length
-    ? deltas
-        .map((delta) => {
-          const before = delta.before === undefined ? "—" : delta.before.toFixed(1);
-          const after = delta.after === undefined ? "—" : delta.after.toFixed(1);
-          const change = delta.delta === undefined ? "—" : `${delta.delta >= 0 ? "+" : ""}${delta.delta.toFixed(1)}`;
-          return `| ${delta.name.replace(/\|/g, "\\|")} | ${before} | ${after} | ${change} |`;
-        })
-        .join("\n")
+function reviewSection(reviewRounds: ReviewRound[]): string[] {
+  const approved = reviewRounds.at(-1)?.approved;
+  return [
+    "## Review loop",
+    "",
+    approved ? `✅ Approved by an independent Codex reviewer after ${reviewRounds.length} round${reviewRounds.length === 1 ? "" : "s"}.` : "⚠️ Review approval was not recorded.",
+    "",
+    ...reviewRounds.map((round) => `- Round ${round.round}: ${round.approved ? "approved" : `${round.findings.length} finding${round.findings.length === 1 ? "" : "s"}`}`),
+    "",
+  ];
+}
+
+function evaluationRows(deltas: ScoreDelta[]): string {
+  return deltas.length
+    ? deltas.map((delta) => {
+        const before = delta.before === undefined ? "—" : delta.before.toFixed(1);
+        const after = delta.after === undefined ? "—" : delta.after.toFixed(1);
+        const change = delta.delta === undefined ? "—" : `${delta.delta >= 0 ? "+" : ""}${delta.delta.toFixed(1)}`;
+        return `| ${delta.name.replace(/\|/g, "\\|")} | ${before} | ${after} | ${change} |`;
+      }).join("\n")
     : "| No completed evaluations | — | — | — |";
+}
+
+export function buildPrBody(description: string, lastMessage: string, deltas: ScoreDelta[], impact: number, reviewRounds: ReviewRound[] = []): string {
+  const rows = evaluationRows(deltas);
   return [
     "## What changed",
     "",
@@ -116,6 +197,7 @@ export function buildPrBody(description: string, lastMessage: string, deltas: Sc
     "",
     lastMessage,
     "",
+    ...reviewSection(reviewRounds),
     "## Evaluation impact",
     "",
     `**Burner impact score: ${impact >= 0 ? "+" : ""}${impact.toFixed(1)}**`,
@@ -125,5 +207,30 @@ export function buildPrBody(description: string, lastMessage: string, deltas: Sc
     rows,
     "",
     "<sub>Generated and evaluated locally by Burner. Scores are model-based signals; review the code and evidence before merging.</sub>",
+  ].join("\n");
+}
+
+export function buildCompositePrBody(options: { description: string; sources: CompositeSource[]; deltas: ScoreDelta[]; compositeScore: number; impact: number; reviewRounds: ReviewRound[] }): string {
+  return [
+    "## Master cook",
+    "",
+    options.description,
+    "",
+    `This composite was built and evaluated from the actual combined code for ${options.sources.length} pull requests:`,
+    "",
+    ...options.sources.map((source) => `- #${source.prNumber} — ${source.title}`),
+    "",
+    ...reviewSection(options.reviewRounds),
+    "## Recalculated composite evaluation",
+    "",
+    `**Composite score: ${options.compositeScore.toFixed(1)} / 100** · **Impact: ${options.impact >= 0 ? "+" : ""}${options.impact.toFixed(1)}**`,
+    "",
+    "| Evaluation | Base | Composite | Delta |",
+    "| --- | ---: | ---: | ---: |",
+    evaluationRows(options.deltas),
+    "",
+    "Merging this PR tells Burner to close the included source PRs and rebuild every other open composite against the new base.",
+    "",
+    "<sub>Composite scores are recalculated from the combined worktree, never inferred by adding individual deltas.</sub>",
   ].join("\n");
 }

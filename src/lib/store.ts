@@ -8,7 +8,7 @@ type Listener = (state: BurnerState) => void;
 function initialState(root: string): BurnerState {
   const createdAt = now();
   return {
-    version: 1,
+    version: 2,
     projectName: basename(root),
     settings: {
       parallelism: 2,
@@ -21,6 +21,7 @@ function initialState(root: string): BurnerState {
       baseBranch: "main",
       remote: "origin",
       defaultResources: [],
+      maxReviewRounds: 8,
     },
     evaluations: [
       {
@@ -51,6 +52,7 @@ function initialState(root: string): BurnerState {
     evaluationRuns: [],
     ideas: [],
     agentRuns: [],
+    composites: [],
     activity: [
       {
         id: id("activity"),
@@ -80,12 +82,21 @@ export class StateStore {
     await mkdir(this.dataDir, { recursive: true });
     try {
       this.state = JSON.parse(await readFile(this.statePath, "utf8")) as BurnerState;
+      this.migrate();
       this.state.orchestrator.enabled = false;
       for (const run of this.state.agentRuns) {
         if (["starting", "running", "evaluating", "opening_pr"].includes(run.status)) {
           run.status = "failed";
           run.error = "Burner stopped before this run completed.";
           run.completedAt = now();
+        }
+        run.reviewRounds ??= [];
+      }
+      for (const composite of this.state.composites) {
+        if (["building", "reviewing", "revising", "evaluating", "rebuilding"].includes(composite.status)) {
+          composite.status = "failed";
+          composite.error = "Burner stopped before this composite run completed.";
+          composite.updatedAt = now();
         }
       }
       for (const idea of this.state.ideas) {
@@ -135,7 +146,7 @@ export class StateStore {
       if (
         run.status !== "completed" ||
         run.score === undefined ||
-        (context ? run.context !== context : run.context === "agent")
+        (context ? run.context !== context : run.context === "agent" || run.context === "composite")
       ) continue;
       const current = latest.get(run.evaluationId);
       if (!current || run.createdAt > current.createdAt) latest.set(run.evaluationId, run);
@@ -176,8 +187,26 @@ export class StateStore {
   private trim(): void {
     this.state.activity = this.state.activity.slice(0, 250);
     this.state.evaluationRuns = this.state.evaluationRuns.slice(-1000);
-    this.state.ideas = this.state.ideas.slice(-250);
-    this.state.agentRuns = this.state.agentRuns.slice(-250);
+    this.state.ideas = this.state.ideas.slice(-500);
+    const retainedComposites = new Set(this.state.composites.slice(-250).map((item) => item.id));
+    for (const composite of this.state.composites) {
+      if (["queued", "building", "reviewing", "revising", "evaluating", "open", "rebuilding", "failed"].includes(composite.status)) retainedComposites.add(composite.id);
+    }
+    this.state.composites = this.state.composites.filter((item) => retainedComposites.has(item.id));
+    const referencedRuns = new Set(this.state.composites.flatMap((composite) => composite.sources.map((source) => source.agentRunId)));
+    const recentRuns = new Set(this.state.agentRuns.slice(-500).map((run) => run.id));
+    this.state.agentRuns = this.state.agentRuns.filter((run) => recentRuns.has(run.id) || referencedRuns.has(run.id) || run.prState === "open");
+  }
+
+  private migrate(): void {
+    const legacy = this.state as BurnerState & { version: number; composites?: BurnerState["composites"] };
+    legacy.version = 2;
+    legacy.composites ??= [];
+    legacy.settings.maxReviewRounds ??= 8;
+    for (const run of legacy.agentRuns ?? []) {
+      run.reviewRounds ??= [];
+      if (run.prUrl && !run.prState) run.prState = "open";
+    }
   }
 }
 
