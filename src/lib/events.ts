@@ -19,4 +19,9 @@ export class EventHub {
   heartbeat(): void {
     for (const client of this.clients) client.write(": heartbeat\n\n");
   }
+
+  close(): void {
+    for (const client of this.clients) client.end();
+    this.clients.clear();
+  }
 }

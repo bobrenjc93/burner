@@ -44,6 +44,10 @@ function openBrowser(url: string): void {
 const options = parseArgs(process.argv.slice(2));
 const root = resolve(options.directory);
 const port = Number(options.port);
+if (!new Set(["127.0.0.1", "localhost", "::1"]).has(options.host)) {
+  console.error(colors.red("Burner only binds to the local machine. Use 127.0.0.1, localhost, or ::1."));
+  process.exit(1);
+}
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   console.error(colors.red("Port must be an integer between 1 and 65535."));
   process.exit(1);
@@ -51,7 +55,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 
 try {
   const burner = await createBurnerServer({ root, host: options.host, port });
-  const url = `http://${options.host === "0.0.0.0" ? "localhost" : options.host}:${port}`;
+  const url = `http://${options.host}:${port}`;
   console.log();
   console.log(colors.fire("  ◉ BURNER"));
   console.log(colors.dim("  Evaluation-driven repo improvement, running locally."));

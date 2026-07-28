@@ -25,7 +25,7 @@ burner
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 20.19 or newer
 - A git repository with at least one commit
 - [Codex CLI](https://developers.openai.com/codex/cli) installed and authenticated
 - GitHub CLI (`gh`) authenticated when automatic pull requests are enabled

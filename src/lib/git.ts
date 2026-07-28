@@ -28,6 +28,12 @@ export class GitService {
     return result.stdout.trim();
   }
 
+  async resolveRef(ref: string): Promise<string> {
+    const result = await runCommand("git", ["rev-parse", ref], { cwd: this.root });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not resolve ${ref}`);
+    return result.stdout.trim();
+  }
+
   async hasRef(ref: string): Promise<boolean> {
     return (await runCommand("git", ["rev-parse", "--verify", ref], { cwd: this.root })).exitCode === 0;
   }

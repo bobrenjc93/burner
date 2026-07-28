@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { get } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
+import { createBurnerServer } from "../dist/server.js";
 import { StateStore, validateEvaluation } from "../dist/lib/store.js";
 import { clampScore, parseJsonObject, slugify, weightedScore } from "../dist/lib/utils.js";
 
@@ -36,7 +38,43 @@ test("resource locks are exclusive and recover after release", async () => {
     const second = await locks.tryAcquire("gpu", "agent-two");
     assert.ok(second);
     await second.release();
+    await writeFile(join(root, "orphan.lock"), JSON.stringify({ pid: 2_147_483_647, createdAt: new Date().toISOString() }));
+    assert.deepEqual(await locks.reapOrphans(), ["orphan"]);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("compiled server serves the API and closes connected event streams", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-server-test-"));
+  const burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0 });
+  try {
+    const address = burner.server.address();
+    assert.ok(address && typeof address === "object");
+    const base = `http://127.0.0.1:${address.port}`;
+    const health = await (await fetch(`${base}/api/health`)).json();
+    assert.deepEqual(health, { ok: true, project: root.split("/").at(-1) });
+
+    const created = await fetch(`${base}/api/evaluations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Docs", prompt: "Score the docs", weight: 2, enabled: true }),
+    });
+    assert.equal(created.status, 201);
+
+    await new Promise((resolve, reject) => {
+      const request = get(`${base}/api/events`, (response) => {
+        response.once("data", resolve);
+        response.on("error", reject);
+      });
+      request.on("error", reject);
+    });
+    await Promise.race([
+      burner.close(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Server shutdown timed out with an SSE client")), 1_500)),
+    ]);
+  } finally {
+    if (burner.server.listening) await burner.close();
     await rm(root, { recursive: true, force: true });
   }
 });

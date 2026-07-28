@@ -34,6 +34,10 @@ export class Orchestrator {
 
   async init(): Promise<void> {
     await this.locks.init();
+    const orphanedLocks = await this.locks.reapOrphans();
+    if (orphanedLocks.length) {
+      await this.store.addActivity({ type: "system", message: "Recovered stale resource locks", detail: orphanedLocks.join(", ") });
+    }
     const status = await this.git.status();
     if (status.available && status.branch) {
       const state = this.store.get();
@@ -268,6 +272,14 @@ export class Orchestrator {
     let worktree = "";
     try {
       const settings = this.store.get().settings;
+      const rootStatus = await this.git.status();
+      if (!rootStatus.available) throw new Error("Implementation agents require a git repository with at least one commit.");
+      if (rootStatus.dirty) throw new Error("The base checkout has uncommitted changes. Commit or stash them before dispatching an agent so evaluation deltas stay comparable.");
+      const baseCommit = await this.git.resolveRef(settings.baseBranch);
+      const baseline = this.store.latestRuns();
+      const enabledEvaluations = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
+      const missingBaseline = enabledEvaluations.find((evaluation) => baseline.get(evaluation.id)?.commit !== baseCommit);
+      if (missingBaseline) throw new Error(`Run a clean baseline at ${settings.baseBranch} before dispatching; '${missingBaseline.name}' is missing a comparable score.`);
       const gitLock = await this.locks.tryAcquire("git-metadata", runId);
       if (!gitLock) throw new Error("Git metadata is busy; retry this idea in a moment.");
       try {
@@ -287,8 +299,9 @@ export class Orchestrator {
       }
       await this.git.commit(worktree, `burner: ${idea.title}`);
       await this.updateAgent(runId, { status: "evaluating" });
-      const baseline = this.store.latestRuns();
       const afterRuns = await this.runEvaluations("agent", worktree, runId);
+      const failedEvaluation = afterRuns.find((run) => run.status !== "completed" || run.score === undefined);
+      if (failedEvaluation) throw new Error("Candidate evaluation failed; Burner will not deliver a PR without complete before/after scores.");
       const deltas = this.calculateDeltas(this.store.get(), baseline, afterRuns);
       const impact = this.calculateImpact(this.store.get(), deltas);
       await this.updateAgent(runId, { deltas, impact });
@@ -317,7 +330,12 @@ export class Orchestrator {
         message: pr ? `PR opened: ${idea.title}` : `Agent completed: ${idea.title}`,
         detail: pr?.url ?? `Measured impact: ${impact >= 0 ? "+" : ""}${impact.toFixed(1)}`,
       });
-      if (pr) await this.git.removeWorktree(worktree);
+      if (pr) {
+        const cleanupLock = await this.locks.tryAcquire("git-metadata", `${runId}-cleanup`);
+        if (cleanupLock) {
+          try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
+        }
+      }
       this.events.emit("agent", { runId, status: "completed", prUrl: pr?.url, impact });
     } catch (error) {
       const message = errorMessage(error);

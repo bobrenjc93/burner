@@ -62,4 +62,29 @@ export class LockManager {
     await this.init();
     return (await readdir(this.lockDir)).filter((name) => name.endsWith(".lock")).map((name) => name.slice(0, -5));
   }
+
+  async reapOrphans(): Promise<string[]> {
+    await this.init();
+    const removed: string[] = [];
+    for (const filename of await readdir(this.lockDir)) {
+      if (!filename.endsWith(".lock")) continue;
+      const path = join(this.lockDir, filename);
+      try {
+        const contents = JSON.parse(await readFile(path, "utf8")) as { pid?: number; createdAt?: string };
+        const stale = contents.createdAt && Date.now() - new Date(contents.createdAt).getTime() > this.staleMs;
+        let alive = false;
+        if (contents.pid) {
+          try { process.kill(contents.pid, 0); alive = true; } catch { alive = false; }
+        }
+        if (stale || !alive) {
+          await rm(path, { force: true });
+          removed.push(filename.slice(0, -5));
+        }
+      } catch {
+        await rm(path, { force: true });
+        removed.push(filename.slice(0, -5));
+      }
+    }
+    return removed;
+  }
 }
