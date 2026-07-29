@@ -9,6 +9,13 @@ import { commandExists, runCommand } from "./process.js";
 import { StateStore } from "./store.js";
 import { errorMessage, id, mapLimit, now, slugify, weightedScore } from "./utils.js";
 
+type AgentBase = {
+  ref: string;
+  commit: string;
+  baseline: Map<string, EvaluationRun>;
+  compositeId?: string;
+};
+
 export class Orchestrator {
   private readonly git: GitService;
   private readonly locks: LockManager;
@@ -145,15 +152,39 @@ export class Orchestrator {
   async plan(): Promise<Idea[]> {
     const state = this.store.get();
     const evaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
-    const latest = this.store.latestRuns();
+    const living = this.findLivingComposite(state);
+    const latest = living ? this.store.latestCompositeRuns(living.id) : this.store.latestRuns();
     if (!evaluations.some((evaluation) => latest.has(evaluation.id))) {
-      throw new Error("Run a baseline evaluation before generating ideas.");
+      throw new Error(living ? "The living composite needs a completed evaluation before planning experiments." : "Run a baseline evaluation before generating ideas.");
     }
-    await this.store.addActivity({ type: "idea", message: "Planning the next improvements", detail: "Codex is inspecting weak signals and open work." });
-    const planned = await this.codex.planIdeas(this.root, evaluations, latest, state.ideas, state.settings);
+    await this.store.addActivity({ type: "idea", message: "Planning the next improvements", detail: living ? `Exploring from living line: ${living.title}` : "Codex is inspecting weak signals and open work." });
+    let planningCwd = this.root;
+    let planningWorktree = "";
+    if (living) {
+      const planningRef = await this.git.fetchBranch(state.settings.remote, living.branch);
+      const gitLock = await this.locks.tryAcquire("git-metadata", `plan-${living.id}`);
+      if (!gitLock) throw new Error("Git metadata is busy; retry planning shortly.");
+      try {
+        planningWorktree = await this.git.createDetachedWorktree(id("planning"), planningRef);
+        planningCwd = planningWorktree;
+      } finally {
+        await gitLock.release();
+      }
+    }
+    let planned;
+    try {
+      planned = await this.codex.planIdeas(planningCwd, evaluations, latest, state.ideas, state.settings);
+    } finally {
+      if (planningWorktree) {
+        const cleanupLock = await this.locks.tryAcquire("git-metadata", `plan-cleanup-${living?.id}`);
+        if (cleanupLock) {
+          try { await this.git.removeWorktree(planningWorktree); } finally { await cleanupLock.release(); }
+        }
+      }
+    }
     const created: Idea[] = planned
       .filter((idea) => idea.title && idea.description)
-      .map((idea) => ({ ...idea, id: id("idea"), status: "queued", createdAt: now(), updatedAt: now(), source: "codex" }));
+      .map((idea) => ({ ...idea, id: id("idea"), status: "queued", createdAt: now(), updatedAt: now(), source: "codex", baseCompositeId: living?.id }));
     await this.store.update((draft) => {
       draft.ideas.push(...created);
       draft.orchestrator.lastPlanningAt = now();
@@ -204,11 +235,13 @@ export class Orchestrator {
       const run = state.agentRuns.find((item) => item.id === runId);
       const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
       if (!run?.prNumber || !run.prUrl || (run.prState && run.prState !== "open")) throw new Error("Every composite source must be an open Burner pull request.");
-      return { agentRunId: run.id, prNumber: run.prNumber, title: idea?.title ?? run.branch, branch: run.branch };
+      return { agentRunId: run.id, prNumber: run.prNumber, title: idea?.title ?? run.branch, branch: run.branch, kind: "pull_request" as const };
     });
     if (sources.length < 2) throw new Error("Choose at least two open pull requests to master cook.");
     const compositeId = id("composite");
     const timestamp = now();
+    const currentLiving = state.orchestrator.livingCompositeId ? state.composites.find((item) => item.id === state.orchestrator.livingCompositeId) : undefined;
+    const makeLiving = !currentLiving || ["merged", "closed"].includes(currentLiving.status);
     const composite: CompositePr = {
       id: compositeId,
       title: title?.trim().slice(0, 120) || `Composite: ${sources.map((source) => `#${source.prNumber}`).join(" + ")}`,
@@ -221,12 +254,30 @@ export class Orchestrator {
       reviewRounds: [],
       createdAt: timestamp,
       updatedAt: timestamp,
+      isLiving: makeLiving,
+      pendingExperimentRunIds: [],
     };
-    await this.store.update((draft) => draft.composites.push(composite));
-    await this.store.addActivity({ type: "pr", message: `Composite queued: ${composite.title}`, detail: `${sources.length} source PRs will be merged and re-evaluated.` });
+    await this.store.update((draft) => {
+      draft.composites.push(composite);
+      if (makeLiving) draft.orchestrator.livingCompositeId = composite.id;
+    });
+    await this.store.addActivity({ type: "pr", message: `Composite queued: ${composite.title}`, detail: `${sources.length} source PRs will seed a continuously evaluated living line.` });
     this.events.emit("state", this.store.get());
     void this.scheduleComposites(true);
     return composite;
+  }
+
+  async setLivingComposite(compositeId: string): Promise<void> {
+    let title = "";
+    await this.store.update((state) => {
+      const composite = state.composites.find((item) => item.id === compositeId);
+      if (!composite || composite.status !== "open" || !composite.reviewApproved) throw new Error("Only an open, approved composite can become the living line.");
+      state.orchestrator.livingCompositeId = compositeId;
+      for (const item of state.composites) item.isLiving = item.id === compositeId;
+      title = composite.title;
+    });
+    await this.store.addActivity({ type: "system", message: `Living line selected: ${title}`, detail: "New planning and experiments will build from this composite." });
+    this.events.emit("state", this.store.get());
   }
 
   async mergeComposite(compositeId: string): Promise<void> {
@@ -293,9 +344,13 @@ export class Orchestrator {
           newlyMergedCompositeIds.push(composite.id);
           baseChanged = true;
           draft.orchestrator.baseSyncPending = true;
+          composite.isLiving = false;
+          if (draft.orchestrator.livingCompositeId === composite.id) draft.orchestrator.livingCompositeId = undefined;
         } else if (remote.state === "CLOSED" && composite.status !== "merged" && composite.status !== "closed") {
           composite.status = "closed";
           composite.updatedAt = now();
+          composite.isLiving = false;
+          if (draft.orchestrator.livingCompositeId === composite.id) draft.orchestrator.livingCompositeId = undefined;
         } else if (remote.state === "OPEN" && composite.status === "closed") {
           composite.status = "open";
           composite.updatedAt = now();
@@ -308,7 +363,7 @@ export class Orchestrator {
       if (!composite) continue;
       for (const source of composite.sources) {
         const run = this.store.get().agentRuns.find((item) => item.id === source.agentRunId);
-        if (run?.prState === "open") {
+        if (source.prNumber && run?.prState === "open") {
           await this.git.closePr(this.root, source.prNumber, `Superseded by merged composite PR #${composite.prNumber}.`);
           await this.store.update((draft) => {
             const current = draft.agentRuns.find((item) => item.id === source.agentRunId);
@@ -332,7 +387,10 @@ export class Orchestrator {
 
     const after = this.store.get();
     for (const composite of after.composites.filter((item) => item.status === "open")) {
-      const filtered = composite.sources.filter((source) => after.agentRuns.find((run) => run.id === source.agentRunId)?.prState === "open");
+      const filtered = composite.sources.filter((source) => {
+        const run = after.agentRuns.find((item) => item.id === source.agentRunId);
+        return source.kind === "experiment" ? run?.status === "absorbed" : run?.prState === "open";
+      });
       const affected = baseChanged || filtered.length !== composite.sources.length || filtered.some((source) => changedRunIds.has(source.agentRunId));
       if (!affected) continue;
       if (filtered.length < 2) {
@@ -344,10 +402,11 @@ export class Orchestrator {
       } else {
         await this.store.update((draft) => {
           const current = draft.composites.find((item) => item.id === composite.id);
-          if (current) { current.sources = filtered; current.status = "rebuilding"; current.reviewApproved = false; current.reviewRounds = []; current.updatedAt = now(); }
+          if (current) { current.sources = filtered; current.status = "rebuilding"; current.rebuildMode = "from_base"; current.reviewApproved = false; current.reviewRounds = []; current.updatedAt = now(); }
         });
       }
     }
+    await this.ensureLivingComposite();
     this.events.emit("state", this.store.get());
   }
 
@@ -367,6 +426,11 @@ export class Orchestrator {
         await this.runEvaluations("baseline");
       }
       const refreshed = this.store.get();
+      const configuredLiving = refreshed.orchestrator.livingCompositeId ? refreshed.composites.find((item) => item.id === refreshed.orchestrator.livingCompositeId) : undefined;
+      if (refreshed.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") {
+        await this.scheduleComposites();
+        return;
+      }
       const planningDue =
         force ||
         !refreshed.orchestrator.lastPlanningAt ||
@@ -384,9 +448,83 @@ export class Orchestrator {
     }
   }
 
+  private findLivingComposite(state: BurnerState): CompositePr | undefined {
+    if (!state.settings.preferLivingComposite || !state.orchestrator.livingCompositeId) return undefined;
+    const composite = state.composites.find((item) => item.id === state.orchestrator.livingCompositeId);
+    return composite?.status === "open" && composite.reviewApproved ? composite : undefined;
+  }
+
+  private async ensureLivingComposite(): Promise<void> {
+    await this.store.update((state) => {
+      if (!state.settings.preferLivingComposite) return;
+      const current = state.orchestrator.livingCompositeId ? state.composites.find((item) => item.id === state.orchestrator.livingCompositeId) : undefined;
+      if (current && !["merged", "closed"].includes(current.status)) {
+        for (const item of state.composites) item.isLiving = item.id === current.id;
+        return;
+      }
+      const next = state.composites
+        .filter((item) => item.status === "open" && item.reviewApproved)
+        .sort((a, b) => (b.compositeScore ?? -Infinity) - (a.compositeScore ?? -Infinity))[0];
+      state.orchestrator.livingCompositeId = next?.id;
+      for (const item of state.composites) item.isLiving = item.id === next?.id;
+    });
+  }
+
+  private async resolveAgentBase(idea: Idea, state: BurnerState): Promise<AgentBase> {
+    const living = this.findLivingComposite(state);
+    const requested = idea.baseCompositeId ? state.composites.find((item) => item.id === idea.baseCompositeId) : undefined;
+    const composite = requested?.status === "open" && requested.reviewApproved ? requested : living;
+    if (composite && state.settings.preferLivingComposite) {
+      const ref = await this.git.fetchBranch(state.settings.remote, composite.branch);
+      const commit = await this.git.resolveRef(ref);
+      const baseline = this.store.latestCompositeRuns(composite.id);
+      return { ref, commit, baseline, compositeId: composite.id };
+    }
+    const commit = await this.git.resolveRef(state.settings.baseBranch);
+    return { ref: state.settings.baseBranch, commit, baseline: this.store.latestRuns() };
+  }
+
+  private async absorbExperiment(
+    compositeId: string,
+    runId: string,
+    idea: Idea,
+    worktree: string,
+    branch: string,
+    impact: number,
+    settings: BurnerState["settings"],
+  ): Promise<void> {
+    const state = this.store.get();
+    const composite = state.composites.find((item) => item.id === compositeId);
+    const run = state.agentRuns.find((item) => item.id === runId);
+    if (!composite || composite.status !== "open" || !run?.baseCommit) throw new Error("The living composite is no longer available for absorption.");
+    if (await this.git.resolveRef(composite.branch) !== run.baseCommit) throw new Error("The living composite advanced during evaluation. Retry this experiment from its latest state.");
+    await this.git.push(worktree, settings.remote, branch);
+    const absorbedAt = now();
+    await this.store.update((draft) => {
+      const currentComposite = draft.composites.find((item) => item.id === compositeId);
+      const currentRun = draft.agentRuns.find((item) => item.id === runId);
+      if (!currentComposite || !currentRun) return;
+      currentComposite.sources.push({ agentRunId: runId, title: idea.title, branch, kind: "experiment", absorbedAt, impact });
+      currentComposite.status = "rebuilding";
+      currentComposite.rebuildMode = "incremental";
+      currentComposite.pendingExperimentRunIds = [...new Set([...(currentComposite.pendingExperimentRunIds ?? []), runId])];
+      currentComposite.reviewApproved = false;
+      currentComposite.reviewRounds = [];
+      currentComposite.updatedAt = absorbedAt;
+      currentRun.status = "absorbed";
+      currentRun.absorbedAt = absorbedAt;
+      currentRun.completedAt = absorbedAt;
+      draft.orchestrator.lastPlanningAt = undefined;
+    });
+    await this.store.addActivity({ type: "pr", message: `Experiment absorbed: ${idea.title}`, detail: `Impact +${impact.toFixed(1)}. ${composite.title} will now be rebuilt, reviewed, and fully reevaluated.` });
+    this.events.emit("state", this.store.get());
+  }
+
   private async schedule(): Promise<void> {
     const state = this.store.get();
     if (!state.orchestrator.enabled) return;
+    const configuredLiving = state.orchestrator.livingCompositeId ? state.composites.find((item) => item.id === state.orchestrator.livingCompositeId) : undefined;
+    if (state.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") return;
     const capacity = Math.max(0, state.settings.parallelism - this.activeAgents.size - this.activeComposites.size);
     if (!capacity) return;
     const queue = state.ideas
@@ -395,17 +533,20 @@ export class Orchestrator {
     let started = 0;
     for (const idea of queue) {
       if (started >= capacity) break;
-      const resources = [...new Set([...state.settings.defaultResources, ...idea.resources])];
+      let base: AgentBase;
+      try { base = await this.resolveAgentBase(idea, state); } catch { continue; }
+      const resources = [...new Set([...state.settings.defaultResources, ...idea.resources, ...(base.compositeId ? [`living-${base.compositeId}`] : [])])];
       const lease = await this.locks.tryAcquireAll(resources, idea.id);
       if (!lease) continue;
       started += 1;
       this.activeAgents.add(idea.id);
-      void this.runIdea(idea, resources, lease.locks, lease.release);
+      void this.runIdea(idea, base, resources, lease.locks, lease.release);
     }
   }
 
   private async runIdea(
     idea: Idea,
+    base: AgentBase,
     resources: string[],
     heldLocks: HeldLock[],
     releaseLocks: () => Promise<void>,
@@ -422,6 +563,9 @@ export class Orchestrator {
       deltas: [],
       resources,
       reviewRounds: [],
+      baseRef: base.ref,
+      baseCommit: base.commit,
+      parentCompositeId: base.compositeId,
     };
     await this.store.update((state) => {
       state.agentRuns.push(initialRun);
@@ -436,15 +580,15 @@ export class Orchestrator {
       const rootStatus = await this.git.status();
       if (!rootStatus.available) throw new Error("Implementation agents require a git repository with at least one commit.");
       if (rootStatus.dirty) throw new Error("The base checkout has uncommitted changes. Commit or stash them before dispatching an agent so evaluation deltas stay comparable.");
-      const baseCommit = await this.git.resolveRef(settings.baseBranch);
-      const baseline = this.store.latestRuns();
+      const baseCommit = base.commit;
+      const baseline = base.baseline;
       const enabledEvaluations = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
       const missingBaseline = enabledEvaluations.find((evaluation) => baseline.get(evaluation.id)?.commit !== baseCommit);
-      if (missingBaseline) throw new Error(`Run a clean baseline at ${settings.baseBranch} before dispatching; '${missingBaseline.name}' is missing a comparable score.`);
+      if (missingBaseline) throw new Error(`Refresh evaluations at ${base.ref} before dispatching; '${missingBaseline.name}' is missing a comparable score.`);
       const gitLock = await this.locks.tryAcquire("git-metadata", runId);
       if (!gitLock) throw new Error("Git metadata is busy; retry this idea in a moment.");
       try {
-        worktree = await this.git.createWorktree(runId, branch, settings.baseBranch);
+        worktree = await this.git.createWorktree(runId, branch, base.ref);
       } finally {
         await gitLock.release();
       }
@@ -462,10 +606,10 @@ export class Orchestrator {
         return;
       }
       if (hasUncommittedChanges) await this.git.commit(worktree, `burner: ${idea.title}`);
-      const reviewed = await this.reviewAgent(worktree, runId, idea.title, settings.baseBranch, author.threadId, settings);
+      const reviewed = await this.reviewAgent(worktree, runId, idea.title, base.ref, author.threadId, settings);
       lastMessage = reviewed.message;
       await this.updateAgent(runId, { lastMessage, authorThreadId: reviewed.threadId, reviewApproved: true });
-      if (await this.git.resolveRef(settings.baseBranch) !== baseCommit) throw new Error("The base branch moved during the review loop. Retry this idea so its author starts from the new main.");
+      if (await this.git.resolveRef(base.ref) !== baseCommit) throw new Error("The experiment base moved during the review loop. Retry this idea from the latest living line.");
       await this.updateAgent(runId, { status: "evaluating" });
       const afterRuns = await this.runEvaluations("agent", worktree, runId);
       const failedEvaluation = afterRuns.find((run) => run.status !== "completed" || run.score === undefined);
@@ -473,9 +617,21 @@ export class Orchestrator {
       const deltas = this.calculateDeltas(this.store.get(), baseline, afterRuns);
       const impact = this.calculateImpact(this.store.get(), deltas);
       await this.updateAgent(runId, { deltas, impact });
+      if (base.compositeId) {
+        const regressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
+        if (impact <= settings.compositeAbsorbThreshold || regressions.length) {
+          await this.updateAgent(runId, { status: "rejected", completedAt: now() });
+          await this.finishIdea(idea.id, "completed");
+          await this.store.addActivity({ type: "agent", message: `Experiment rejected: ${idea.title}`, detail: regressions.length ? `${regressions.length} evaluation regression${regressions.length === 1 ? "" : "s"}; living line unchanged.` : `Impact ${impact.toFixed(1)} did not clear the ${settings.compositeAbsorbThreshold.toFixed(1)} absorption threshold.` });
+          return;
+        }
+        await this.absorbExperiment(base.compositeId, runId, idea, worktree, branch, impact, settings);
+        await this.finishIdea(idea.id, "completed");
+        return;
+      }
       let pr: { url: string; number?: number } | undefined;
       if (settings.autoCreatePrs) {
-        if (await this.git.resolveRef(settings.baseBranch) !== baseCommit) throw new Error("The base branch moved during evaluation. Retry this idea to recalculate against the new main.");
+        if (await this.git.resolveRef(base.ref) !== baseCommit) throw new Error("The base branch moved during evaluation. Retry this idea to recalculate against the new main.");
         await this.updateAgent(runId, { status: "opening_pr" });
         if (!(await this.git.remoteExists(settings.remote))) throw new Error(`Git remote '${settings.remote}' does not exist.`);
         await this.git.push(worktree, settings.remote, branch);
@@ -519,6 +675,7 @@ export class Orchestrator {
       this.runtimeCache = undefined;
       this.events.emit("state", this.store.get());
       if (this.store.get().orchestrator.enabled) void this.schedule();
+      void this.scheduleComposites(true);
       void heldLocks;
     }
   }
@@ -534,7 +691,7 @@ export class Orchestrator {
       this.activeComposites.delete(next.id);
       this.runtimeCache = undefined;
       this.events.emit("state", this.store.get());
-      if (this.store.get().orchestrator.enabled) void this.scheduleComposites();
+      void this.scheduleComposites(true);
     });
   }
 
@@ -546,8 +703,9 @@ export class Orchestrator {
       let state = this.store.get();
       let composite = state.composites.find((item) => item.id === compositeId);
       if (!composite) throw new Error("Composite not found.");
-      if (composite.sources.length < 2) throw new Error("A composite requires at least two open source PRs.");
+      if (composite.sources.length < 2) throw new Error("A composite requires at least two constituent changes.");
       const settings = state.settings;
+      const incremental = rebuild && composite.rebuildMode === "incremental" && Boolean(composite.pendingExperimentRunIds?.length);
       const rootStatus = await this.git.status();
       if (!rootStatus.available || rootStatus.dirty) throw new Error("Composite builds require a clean git base checkout.");
       const baseCommit = await this.git.resolveRef(settings.baseBranch);
@@ -561,24 +719,32 @@ export class Orchestrator {
       if (!gitLock) throw new Error("Git metadata is busy; retry the composite shortly.");
       try {
         worktree = rebuild
-          ? await this.git.createRebuildWorktree(compositeId, composite.branch, settings.baseBranch)
+          ? incremental
+            ? await this.git.createExistingWorktree(compositeId, composite.branch)
+            : await this.git.createRebuildWorktree(compositeId, composite.branch, settings.baseBranch)
           : await this.git.createWorktree(compositeId, composite.branch, settings.baseBranch);
       } finally {
         await gitLock.release();
       }
       await this.updateComposite(compositeId, { worktree, updatedAt: now() });
 
-      for (const source of composite.sources) {
+      const checkpointSource: CompositeSource | undefined = rebuild && !incremental && composite.isLiving && composite.checkpointBranch
+        ? { agentRunId: `checkpoint-${composite.id}`, title: "Previous living-line checkpoint", branch: composite.checkpointBranch, kind: "experiment" }
+        : undefined;
+      const sourcesToMerge = incremental
+        ? composite.sources.filter((source) => composite!.pendingExperimentRunIds?.includes(source.agentRunId))
+        : checkpointSource ? [checkpointSource] : composite.sources;
+      for (const source of sourcesToMerge) {
         const sourceRef = await this.git.fetchBranch(settings.remote, source.branch);
         const merge = await this.git.mergeBranch(worktree, sourceRef);
         if (merge.conflict) {
           const resolver = await this.codex.integrateComposite(worktree, composite.title, [source.title], settings);
-          if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: resolve composite conflict for #${source.prNumber}`);
+          if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: resolve composite conflict for ${source.prNumber ? `#${source.prNumber}` : source.title}`);
           await this.updateComposite(compositeId, { authorThreadId: resolver.threadId, updatedAt: now() });
         }
       }
 
-      const author = await this.codex.integrateComposite(worktree, composite.title, composite.sources.map((source) => source.title), settings);
+      const author = await this.codex.integrateComposite(worktree, composite.title, sourcesToMerge.map((source) => source.title), settings);
       if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: integrate ${composite.title}`);
       await this.updateComposite(compositeId, { authorThreadId: author.threadId, updatedAt: now() });
       const reviewed = await this.reviewComposite(worktree, compositeId, composite.title, settings.baseBranch, author.threadId, settings);
@@ -615,7 +781,10 @@ export class Orchestrator {
         const pr = await this.git.openPr({ cwd: worktree, base: settings.baseBranch, branch: composite.branch, title: composite.title, body });
         await this.updateComposite(compositeId, { prUrl: pr.url, prNumber: pr.number, updatedAt: now() });
       }
-      await this.updateComposite(compositeId, { status: "open", deltas, impact, compositeScore, reviewApproved: true, error: undefined, updatedAt: now() });
+      const checkpointBranch = composite.checkpointBranch ?? `burner/checkpoint-${composite.id}`;
+      await this.git.pushCheckpoint(worktree, settings.remote, checkpointBranch);
+      await this.updateComposite(compositeId, { status: "open", deltas, impact, compositeScore, reviewApproved: true, rebuildMode: undefined, pendingExperimentRunIds: [], checkpointBranch, error: undefined, updatedAt: now() });
+      await this.ensureLivingComposite();
       await this.store.addActivity({ type: "pr", message: rebuild ? `Composite rebuilt: ${composite.title}` : `Composite opened: ${composite.title}`, detail: `Recalculated score ${compositeScore.toFixed(1)} (${impact >= 0 ? "+" : ""}${impact.toFixed(1)} impact).` });
       const cleanupLock = await this.locks.tryAcquire("git-metadata", `${compositeId}-cleanup`);
       if (cleanupLock) {
@@ -630,7 +799,8 @@ export class Orchestrator {
         }
       }
       const baseMoved = message.startsWith("BASE_CHANGED:");
-      await this.updateComposite(compositeId, { status: baseMoved ? "rebuilding" : "failed", error: message.replace("BASE_CHANGED: ", ""), updatedAt: now() });
+      const currentMode = this.store.get().composites.find((item) => item.id === compositeId)?.rebuildMode;
+      await this.updateComposite(compositeId, { status: baseMoved ? "rebuilding" : "failed", rebuildMode: baseMoved ? "from_base" : currentMode, error: message.replace("BASE_CHANGED: ", ""), updatedAt: now() });
       await this.store.addActivity({ type: baseMoved ? "system" : "error", message: baseMoved ? "Composite queued for a fresh base" : "Composite build failed", detail: message.replace("BASE_CHANGED: ", "") });
     } finally {
       await lease.release();

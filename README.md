@@ -23,6 +23,8 @@ burner
 - Re-runs every evaluation on a candidate branch, computes weighted before/after deltas, and stamps the exact table into the pull request body.
 - Runs an independent Codex reviewer against every candidate and resumes the original author session with feedback until the reviewer approves.
 - “Master cooks” multiple open PRs into a composite branch, reviews their integration, and recalculates every evaluation from the actual combined code.
+- Keeps one approved composite as a living virtual `main`: new ideas are planned from it, experiments branch from its latest commit, and regression-free wins are absorbed back into it.
+- Evolves the living line incrementally, so months or years of successful experiments accumulate in one significant feature PR without replaying all history on every iteration.
 - Detects merges from Burner or GitHub, fast-forwards the local base, closes source PRs consumed by a composite, and rebuilds other affected composites.
 - Ranks completed proposals by measured impact and queued ideas by predicted impact.
 
@@ -57,6 +59,10 @@ Each implementation author runs in a persistent Codex session. After the author 
 
 The **Master cook** view combines two or more open Burner PRs. Burner creates a worktree from the current base, merges the selected branches, asks an integration author to resolve conflicts and test the result, completes the same review loop, then runs every evaluation on that exact code state. Its composite score is therefore measured directly—not calculated by adding individual scores.
 
+The first composite becomes the **living line**, or you can promote another approved composite from the UI. From then on, planning inspects that branch rather than `main`, and implementation agents start from its latest evaluated commit. Experiments targeting the same line are serialized even when global concurrency is higher. An experiment is absorbed only when its weighted gain clears the configured threshold and no evaluation regresses. Burner then updates the existing composite branch incrementally, reviews the full feature branch again, reruns all evaluations, and updates the same PR. Rejected experiments leave the living line untouched.
+
+This makes the composite behave like a long-running feature program: it can accumulate a year of monotonic, reviewed iteration in one PR while `main` remains unchanged. Burner persists a hidden checkpoint branch after every successful composite update, preserving integration fixes as well as experiment commits. Full reconstruction from that checkpoint is reserved for real base-branch changes or reconciliation after another PR merges.
+
 When a composite merges, Burner closes its included source PRs. It fast-forwards the configured base branch so new agents start from the new main, invalidates the old baseline, and rebuilds every other affected composite after removing PRs that are now merged, closed, or superseded. This reconciliation also runs when a PR is merged from GitHub instead of the Burner dashboard.
 
 ## Safety and concurrency
@@ -64,6 +70,8 @@ When a composite merges, Burner closes its included source PRs. It fast-forwards
 Implementation agents receive explicit `workspace-write` access only inside their isolated worktree. Evaluators and the planner are read-only. Burner asks Codex not to push or open PRs; the orchestrator owns those state transitions.
 
 Each idea may declare resource locks. Locks are acquired atomically under `.burner/locks`, in sorted order, and held for the full agent run. If any requested resource is busy, the idea stays queued. Git worktree mutations use a separate short-lived metadata lock.
+
+Concurrency is configurable but defaults to **1**. This favors slower monotonic progress and prevents speculative agents from invalidating one another. Living-line experiments also take a composite-specific lock, so increasing global concurrency never allows two agents to mutate the same lineage simultaneously.
 
 ## Development
 

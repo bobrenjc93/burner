@@ -118,6 +118,14 @@ test("git service assembles source branches into an actual composite worktree", 
     assert.equal(await import("node:fs/promises").then((fs) => fs.readFile(join(worktree, "a.txt"), "utf8")), "a\n");
     assert.equal(await import("node:fs/promises").then((fs) => fs.readFile(join(worktree, "b.txt"), "utf8")), "b\n");
     await git.removeWorktree(worktree);
+    const experiment = await git.createWorktree("experiment", "burner/experiment-test", "burner/composite-test");
+    await writeFile(join(experiment, "experiment.txt"), "win\n");
+    await git.commit(experiment, "experiment");
+    await git.removeWorktree(experiment);
+    const evolving = await git.createExistingWorktree("evolving", "burner/composite-test");
+    assert.equal((await git.mergeBranch(evolving, "burner/experiment-test")).merged, true);
+    assert.equal(await import("node:fs/promises").then((fs) => fs.readFile(join(evolving, "experiment.txt"), "utf8")), "win\n");
+    await git.removeWorktree(evolving);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -144,7 +152,7 @@ test("Codex author sessions resume with reviewer feedback and reviewers stay str
   const previousPath = process.env.PATH;
   process.env.PATH = `${bin}:${previousPath}`;
   process.env.BURNER_TEST_ARGS = argsLog;
-  const settings = { parallelism: 1, evaluationIntervalMinutes: 30, orchestratorIntervalMinutes: 15, autoRun: false, autoCreatePrs: true, evaluatorModel: "", agentModel: "", baseBranch: "main", remote: "origin", defaultResources: [], maxReviewRounds: 8 };
+  const settings = { parallelism: 1, evaluationIntervalMinutes: 30, orchestratorIntervalMinutes: 15, autoRun: false, autoCreatePrs: true, evaluatorModel: "", agentModel: "", baseBranch: "main", remote: "origin", defaultResources: [], maxReviewRounds: 8, preferLivingComposite: true, compositeAbsorbThreshold: 0 };
   try {
     const codex = new CodexClient();
     const author = await codex.implement(root, { id: "idea", title: "Improve", description: "Do it", rationale: "Quality", predictedImpact: 20, evaluationIds: [], resources: [], status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "manual" }, [], settings);
@@ -176,9 +184,10 @@ test("merged composites supersede source PRs and queue overlapping composites fo
     await store.update((state) => {
       state.agentRuns.push(run("a", 1), run("b", 2), run("c", 3), run("d", 4));
       state.composites.push(
-        { id: "merged", title: "Merged composite", description: "", status: "open", branch: "composite-merged", worktree: "", sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a" }, { agentRunId: "b", prNumber: 2, title: "B", branch: "branch-b" }], deltas: [], reviewRounds: [], prNumber: 100, prUrl: "https://example.test/pull/100", createdAt: timestamp, updatedAt: timestamp },
-        { id: "overlap", title: "Overlap", description: "", status: "open", branch: "composite-overlap", worktree: "", sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a" }, { agentRunId: "c", prNumber: 3, title: "C", branch: "branch-c" }, { agentRunId: "d", prNumber: 4, title: "D", branch: "branch-d" }], deltas: [], reviewRounds: [], prNumber: 101, prUrl: "https://example.test/pull/101", createdAt: timestamp, updatedAt: timestamp },
+        { id: "merged", title: "Merged composite", description: "", status: "open", branch: "composite-merged", worktree: "", sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a", kind: "pull_request" }, { agentRunId: "b", prNumber: 2, title: "B", branch: "branch-b", kind: "pull_request" }], deltas: [], reviewRounds: [], prNumber: 100, prUrl: "https://example.test/pull/100", createdAt: timestamp, updatedAt: timestamp, isLiving: true },
+        { id: "overlap", title: "Overlap", description: "", status: "open", branch: "composite-overlap", worktree: "", sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a", kind: "pull_request" }, { agentRunId: "c", prNumber: 3, title: "C", branch: "branch-c", kind: "pull_request" }, { agentRunId: "d", prNumber: 4, title: "D", branch: "branch-d", kind: "pull_request" }], deltas: [], reviewRounds: [], prNumber: 101, prUrl: "https://example.test/pull/101", createdAt: timestamp, updatedAt: timestamp, isLiving: false },
       );
+      state.orchestrator.livingCompositeId = "merged";
     });
     const closed = [];
     const orchestrator = new Orchestrator(root, store, new EventHub());
@@ -208,6 +217,39 @@ test("merged composites supersede source PRs and queue overlapping composites fo
   }
 });
 
+test("successful experiments bind to and incrementally evolve the living composite", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-living-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const evaluation = store.get().evaluations[0];
+    await store.update((state) => {
+      state.orchestrator.livingCompositeId = "living";
+      state.composites.push({ id: "living", title: "Year-long line", description: "", status: "open", branch: "burner/living", worktree: "", sources: [{ agentRunId: "seed-a", prNumber: 1, title: "A", branch: "a", kind: "pull_request" }, { agentRunId: "seed-b", prNumber: 2, title: "B", branch: "b", kind: "pull_request" }], deltas: [], compositeScore: 80, reviewRounds: [], reviewApproved: true, prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: true, pendingExperimentRunIds: [] });
+      state.evaluationRuns.push({ id: "composite-eval", evaluationId: evaluation.id, score: 80, commit: "living-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "living" });
+      state.agentRuns.push({ id: "experiment", ideaId: "idea", status: "evaluating", branch: "burner/experiment", worktree: "/tmp/worktree", startedAt: timestamp, deltas: [], impact: 4, resources: [], reviewRounds: [], reviewApproved: true, baseRef: "burner/living", baseCommit: "living-head", parentCompositeId: "living" });
+    });
+    const pushed = [];
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { fetchBranch: async () => "origin/burner/living", resolveRef: async () => "living-head", push: async (_cwd, _remote, branch) => pushed.push(branch) };
+    const base = await orchestrator.resolveAgentBase({ id: "idea", title: "Experiment", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "manual", baseCompositeId: "living" }, store.get());
+    assert.equal(base.compositeId, "living");
+    assert.equal(base.baseline.get(evaluation.id).score, 80);
+    await orchestrator.absorbExperiment("living", "experiment", { id: "idea", title: "Experiment", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "running", createdAt: timestamp, updatedAt: timestamp, source: "manual" }, "/tmp/worktree", "burner/experiment", 4, store.get().settings);
+    const state = store.get();
+    const living = state.composites.find((item) => item.id === "living");
+    assert.equal(state.agentRuns.find((item) => item.id === "experiment").status, "absorbed");
+    assert.equal(living.status, "rebuilding");
+    assert.equal(living.rebuildMode, "incremental");
+    assert.deepEqual(living.pendingExperimentRunIds, ["experiment"]);
+    assert.equal(living.sources.at(-1).kind, "experiment");
+    assert.deepEqual(pushed, ["burner/experiment"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("state persists evaluation configuration and excludes candidate scores from baseline", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-store-test-"));
   try {
@@ -224,8 +266,9 @@ test("state persists evaluation configuration and excludes candidate scores from
     const reloaded = new StateStore(root);
     await reloaded.init();
     assert.equal(reloaded.get().projectName, root.split("/").at(-1));
-    assert.equal(reloaded.get().version, 2);
+    assert.equal(reloaded.get().version, 3);
     assert.equal(reloaded.get().settings.maxReviewRounds, 8);
+    assert.equal(reloaded.get().settings.parallelism, 1);
     assert.equal(reloaded.latestRuns().get(evaluation.id)?.score, 61);
     assert.deepEqual(validateEvaluation({ name: " UX ", prompt: " Score it ", weight: 2 }), { name: "UX", prompt: "Score it", weight: 2, enabled: true });
   } finally {

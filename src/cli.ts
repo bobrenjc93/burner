@@ -22,7 +22,7 @@ function parseArgs(argv: string[]) {
       console.log("Usage: burner [options] [directory]\n\nOptions:\n  -p, --port <port>  port to listen on (default: 4321)\n  --host <host>      host to bind (default: 127.0.0.1)\n  --no-open          do not open a browser\n  -V, --version      output the version number\n  -h, --help         display help");
       process.exit(0);
     }
-    if (arg === "--version" || arg === "-V") { console.log("0.2.0"); process.exit(0); }
+    if (arg === "--version" || arg === "-V") { console.log("0.3.0"); process.exit(0); }
     if (arg === "--no-open") { shouldOpen = false; continue; }
     if (arg === "--dev") continue;
     if (arg === "--host") { host = argv[++index] ?? host; continue; }

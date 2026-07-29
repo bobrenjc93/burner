@@ -8,10 +8,10 @@ type Listener = (state: BurnerState) => void;
 function initialState(root: string): BurnerState {
   const createdAt = now();
   return {
-    version: 2,
+    version: 3,
     projectName: basename(root),
     settings: {
-      parallelism: 2,
+      parallelism: 1,
       evaluationIntervalMinutes: 30,
       orchestratorIntervalMinutes: 15,
       autoRun: false,
@@ -22,6 +22,8 @@ function initialState(root: string): BurnerState {
       remote: "origin",
       defaultResources: [],
       maxReviewRounds: 8,
+      preferLivingComposite: true,
+      compositeAbsorbThreshold: 0,
     },
     evaluations: [
       {
@@ -154,6 +156,16 @@ export class StateStore {
     return latest;
   }
 
+  latestCompositeRuns(compositeId: string): Map<string, EvaluationRun> {
+    const latest = new Map<string, EvaluationRun>();
+    for (const run of this.state.evaluationRuns) {
+      if (run.context !== "composite" || run.compositeId !== compositeId || run.status !== "completed" || run.score === undefined) continue;
+      const current = latest.get(run.evaluationId);
+      if (!current || run.createdAt > current.createdAt) latest.set(run.evaluationId, run);
+    }
+    return latest;
+  }
+
   compositeScores(): { current?: number; previous?: number } {
     const byEvaluation = new Map<string, EvaluationRun[]>();
     for (const run of this.state.evaluationRuns) {
@@ -200,12 +212,21 @@ export class StateStore {
 
   private migrate(): void {
     const legacy = this.state as BurnerState & { version: number; composites?: BurnerState["composites"] };
-    legacy.version = 2;
+    legacy.version = 3;
     legacy.composites ??= [];
     legacy.settings.maxReviewRounds ??= 8;
+    legacy.settings.preferLivingComposite ??= true;
+    legacy.settings.compositeAbsorbThreshold ??= 0;
     for (const run of legacy.agentRuns ?? []) {
       run.reviewRounds ??= [];
       if (run.prUrl && !run.prState) run.prState = "open";
+    }
+    for (const composite of legacy.composites) {
+      composite.isLiving ??= legacy.orchestrator.livingCompositeId === composite.id;
+      for (const source of composite.sources) {
+        source.kind ??= "pull_request";
+      }
+      composite.pendingExperimentRunIds ??= [];
     }
   }
 }

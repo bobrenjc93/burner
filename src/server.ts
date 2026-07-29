@@ -57,6 +57,11 @@ function validateSettings(input: Record<string, unknown>): BurnerSettings {
     if (!value || value.length > 200) throw new Error(`${key} is required.`);
     return value;
   };
+  const number = (key: string, min: number, max: number) => {
+    const value = Number(input[key]);
+    if (!Number.isFinite(value) || value < min || value > max) throw new Error(`${key} must be between ${min} and ${max}.`);
+    return value;
+  };
   return {
     parallelism: integer("parallelism", 1, 12),
     evaluationIntervalMinutes: integer("evaluationIntervalMinutes", 1, 10_080),
@@ -69,6 +74,8 @@ function validateSettings(input: Record<string, unknown>): BurnerSettings {
     remote: text("remote"),
     defaultResources: Array.isArray(input.defaultResources) ? input.defaultResources.map(String).map((value) => value.trim()).filter(Boolean).slice(0, 20) : [],
     maxReviewRounds: integer("maxReviewRounds", 1, 50),
+    preferLivingComposite: Boolean(input.preferLivingComposite),
+    compositeAbsorbThreshold: number("compositeAbsorbThreshold", 0, 100),
   };
 }
 
@@ -141,6 +148,7 @@ export async function createBurnerServer(options: BurnerServerOptions) {
       const description = String(body.description ?? "").trim();
       if (!title || !description) throw new Error("Idea title and description are required.");
       const timestamp = now();
+      const currentState = store.get();
       const idea: Idea = {
         id: id("idea"), title: title.slice(0, 120), description,
         rationale: String(body.rationale ?? "Manually queued improvement").trim(),
@@ -148,6 +156,7 @@ export async function createBurnerServer(options: BurnerServerOptions) {
         evaluationIds: Array.isArray(body.evaluationIds) ? body.evaluationIds.map(String) : [],
         resources: Array.isArray(body.resources) ? body.resources.map(String) : [],
         status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "manual",
+        baseCompositeId: currentState.settings.preferLivingComposite ? currentState.orchestrator.livingCompositeId : undefined,
       };
       await store.update((state) => state.ideas.push(idea));
       await store.addActivity({ type: "idea", message: `Idea queued: ${idea.title}` });
@@ -178,6 +187,10 @@ export async function createBurnerServer(options: BurnerServerOptions) {
     route("POST", "/api/composites/:compositeId/retry", async (_request, response, params) => {
       await orchestrator.retryComposite(params.compositeId);
       json(response, 202, { accepted: true });
+    }),
+    route("POST", "/api/composites/:compositeId/living", async (_request, response, params) => {
+      await orchestrator.setLivingComposite(params.compositeId);
+      json(response, 200, { ok: true });
     }),
     route("POST", "/api/pull-requests/sync", async (_request, response) => {
       await orchestrator.syncPullRequests(true);

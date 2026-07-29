@@ -37,6 +37,7 @@ export type Idea = {
   updatedAt: string;
   source: "codex" | "manual";
   agentRunId?: string;
+  baseCompositeId?: string;
 };
 
 export type ScoreDelta = {
@@ -80,6 +81,8 @@ export type AgentRun = {
     | "evaluating"
     | "opening_pr"
     | "completed"
+    | "absorbed"
+    | "rejected"
     | "failed"
     | "no_changes";
   branch: string;
@@ -98,13 +101,20 @@ export type AgentRun = {
   authorThreadId?: string;
   reviewRounds: ReviewRound[];
   reviewApproved?: boolean;
+  baseRef?: string;
+  baseCommit?: string;
+  parentCompositeId?: string;
+  absorbedAt?: string;
 };
 
 export type CompositeSource = {
   agentRunId: string;
-  prNumber: number;
+  prNumber?: number;
   title: string;
   branch: string;
+  kind: "pull_request" | "experiment";
+  absorbedAt?: string;
+  impact?: number;
 };
 
 export type CompositePr = {
@@ -128,6 +138,10 @@ export type CompositePr = {
   createdAt: string;
   updatedAt: string;
   mergedAt?: string;
+  isLiving: boolean;
+  rebuildMode?: "incremental" | "from_base";
+  pendingExperimentRunIds?: string[];
+  checkpointBranch?: string;
 };
 
 export type Activity = {
@@ -150,10 +164,12 @@ export type BurnerSettings = {
   remote: string;
   defaultResources: string[];
   maxReviewRounds: number;
+  preferLivingComposite: boolean;
+  compositeAbsorbThreshold: number;
 };
 
 export type BurnerState = {
-  version: 2;
+  version: 3;
   projectName: string;
   settings: BurnerSettings;
   evaluations: Evaluation[];
@@ -167,6 +183,7 @@ export type BurnerState = {
     lastEvaluationAt?: string;
     lastPlanningAt?: string;
     baseSyncPending?: boolean;
+    livingCompositeId?: string;
   };
 };
 

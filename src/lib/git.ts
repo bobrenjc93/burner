@@ -48,6 +48,16 @@ export class GitService {
     return path;
   }
 
+  async createDetachedWorktree(runId: string, ref: string): Promise<string> {
+    const worktreesDir = join(this.dataDir, "worktrees");
+    const path = join(worktreesDir, runId);
+    await mkdir(worktreesDir, { recursive: true });
+    await rm(path, { recursive: true, force: true });
+    const result = await runCommand("git", ["worktree", "add", "--detach", path, ref], { cwd: this.root });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not create planning worktree at ${ref}`);
+    return path;
+  }
+
   async createRebuildWorktree(runId: string, branch: string, baseBranch: string): Promise<string> {
     const worktreesDir = join(this.dataDir, "worktrees");
     const path = join(worktreesDir, runId);
@@ -57,6 +67,16 @@ export class GitService {
     if (add.exitCode !== 0) throw new Error(add.stderr.trim() || "Could not recreate composite worktree");
     const reset = await runCommand("git", ["reset", "--hard", baseBranch], { cwd: path });
     if (reset.exitCode !== 0) throw new Error(reset.stderr.trim() || `Could not reset composite to ${baseBranch}`);
+    return path;
+  }
+
+  async createExistingWorktree(runId: string, branch: string): Promise<string> {
+    const worktreesDir = join(this.dataDir, "worktrees");
+    const path = join(worktreesDir, runId);
+    await mkdir(worktreesDir, { recursive: true });
+    await rm(path, { recursive: true, force: true });
+    const add = await runCommand("git", ["worktree", "add", path, branch], { cwd: this.root });
+    if (add.exitCode !== 0) throw new Error(add.stderr.trim() || "Could not check out the living composite worktree");
     return path;
   }
 
@@ -104,6 +124,11 @@ export class GitService {
   async forcePush(cwd: string, remote: string, branch: string): Promise<void> {
     const result = await runCommand("git", ["push", "--force-with-lease", "-u", remote, branch], { cwd, timeoutMs: 10 * 60 * 1000 });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not update composite branch");
+  }
+
+  async pushCheckpoint(cwd: string, remote: string, checkpointBranch: string): Promise<void> {
+    const result = await runCommand("git", ["push", "--force", remote, `HEAD:refs/heads/${checkpointBranch}`], { cwd, timeoutMs: 10 * 60 * 1000 });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not persist the living-line checkpoint");
   }
 
   async openPr(options: {
@@ -211,14 +236,17 @@ export function buildPrBody(description: string, lastMessage: string, deltas: Sc
 }
 
 export function buildCompositePrBody(options: { description: string; sources: CompositeSource[]; deltas: ScoreDelta[]; compositeScore: number; impact: number; reviewRounds: ReviewRound[] }): string {
+  const visibleSources = options.sources.slice(-100);
+  const omittedSources = options.sources.length - visibleSources.length;
   return [
     "## Master cook",
     "",
     options.description,
     "",
-    `This composite was built and evaluated from the actual combined code for ${options.sources.length} pull requests:`,
+    `This living composite was built and evaluated from the actual combined code for ${options.sources.length} constituent changes:`,
     "",
-    ...options.sources.map((source) => `- #${source.prNumber} — ${source.title}`),
+    ...(omittedSources ? [`- … ${omittedSources} earlier constituent changes retained in the living line`] : []),
+    ...visibleSources.map((source) => source.prNumber ? `- #${source.prNumber} — ${source.title}` : `- 🧪 ${source.title} — absorbed experiment${source.impact === undefined ? "" : ` (${source.impact >= 0 ? "+" : ""}${source.impact.toFixed(1)})`}`),
     "",
     ...reviewSection(options.reviewRounds),
     "## Recalculated composite evaluation",
@@ -229,7 +257,7 @@ export function buildCompositePrBody(options: { description: string; sources: Co
     "| --- | ---: | ---: | ---: |",
     evaluationRows(options.deltas),
     "",
-    "Merging this PR tells Burner to close the included source PRs and rebuild every other open composite against the new base.",
+    "Burner continuously updates this feature branch with approved, regression-free experiments. Merging it closes included source PRs and rebuilds every other open composite against the new base.",
     "",
     "<sub>Composite scores are recalculated from the combined worktree, never inferred by adding individual deltas.</sub>",
   ].join("\n");
