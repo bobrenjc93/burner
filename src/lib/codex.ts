@@ -81,6 +81,7 @@ export class CodexClient {
     settings: BurnerSettings,
     context: EvaluationRun["context"],
   ): Promise<EvaluationOutput> {
+    if (evaluation.command) return this.commandEvaluation(cwd, evaluation, context);
     const prompt = [
       "You are a rigorous repository evaluator. Inspect the current repository state and answer the evaluation below.",
       "Base the score on concrete evidence from code, tests, configuration, and user-facing behavior. Do not edit any files.",
@@ -90,6 +91,24 @@ export class CodexClient {
       `Context: ${context === "agent" || context === "composite" ? "This is a candidate branch; assess only its current state." : "This is the current project baseline."}`,
     ].join("\n\n");
     const output = await this.structured<EvaluationOutput>(cwd, prompt, evaluationSchema, settings.evaluatorModel, "read-only");
+    return this.normalizeEvaluation(output);
+  }
+
+  private async commandEvaluation(cwd: string, evaluation: Evaluation, context: EvaluationRun["context"]): Promise<EvaluationOutput> {
+    const result = await runCommand("/bin/sh", ["-lc", evaluation.command!], {
+      cwd,
+      env: { BURNER_EVALUATION_CONTEXT: context, BURNER_EVALUATION_NAME: evaluation.name },
+      timeoutMs: 60 * 60 * 1000,
+      onStderr: (line) => this.onProgress?.(line),
+    });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Evaluation command exited with ${result.exitCode}`);
+    return this.normalizeEvaluation(parseJsonObject<EvaluationOutput>(result.stdout));
+  }
+
+  private normalizeEvaluation(output: EvaluationOutput): EvaluationOutput {
+    if (!Number.isFinite(Number(output.score)) || typeof output.summary !== "string" || !Array.isArray(output.evidence) || !Array.isArray(output.suggestions)) {
+      throw new Error("Evaluation output must contain score, summary, evidence, and suggestions.");
+    }
     return {
       score: clampScore(output.score),
       summary: output.summary.trim(),
@@ -111,6 +130,7 @@ export class CodexClient {
         id: evaluation.id,
         name: evaluation.name,
         prompt: evaluation.prompt,
+        kind: evaluation.command ? "command" : "prompt",
         score: run?.score,
         summary: run?.summary,
         evidence: run?.evidence,

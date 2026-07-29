@@ -235,7 +235,9 @@ export function validateEvaluation(input: Partial<Evaluation>): Omit<Evaluation,
   const name = input.name?.trim();
   const prompt = input.prompt?.trim();
   if (!name || !prompt) throw new Error("Evaluation name and prompt are required.");
+  const command = input.command?.trim() || undefined;
+  if (command && command.length > 8_000) throw new Error("Evaluation command must be at most 8,000 characters.");
   const weight = Number(input.weight ?? 1);
   if (!Number.isFinite(weight) || weight <= 0 || weight > 10) throw new Error("Weight must be between 0 and 10.");
-  return { name, prompt, weight, enabled: input.enabled ?? true };
+  return { name, prompt, ...(command ? { command } : {}), weight, enabled: input.enabled ?? true };
 }

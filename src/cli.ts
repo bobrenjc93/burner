@@ -8,7 +8,7 @@ import { StateStore, validateEvaluation } from "./lib/store.js";
 import { errorMessage, id, now } from "./lib/utils.js";
 import type { BurnerSettings, Idea } from "./types.js";
 
-const VERSION = "0.4.2";
+const VERSION = "0.5.0";
 const colors = {
   fire: (value: string) => `\x1b[38;2;255;107;53m${value}\x1b[0m`,
   cyan: (value: string) => `\x1b[36m${value}\x1b[0m`,
@@ -20,7 +20,7 @@ const help = `Usage: burner [options] [directory]
        burner <command> [subcommand] -C <directory> [options]
 
 Commands:
-  eval add       Add an evaluation (--name, --prompt, [--weight])
+  eval add       Add an evaluation (--name, --prompt, [--command], [--weight])
   eval clear     Remove every evaluation (--yes is required)
   eval list      List evaluations and latest scores
   eval run       Run all enabled evaluations and wait for results
@@ -101,7 +101,7 @@ async function runHeadless(args: string[]): Promise<boolean> {
   if (command === "eval" && subcommand === "add") {
     const store = new StateStore(root);
     await store.init();
-    const input = validateEvaluation({ name: required(args, "--name"), prompt: required(args, "--prompt"), weight: numberOption(args, "--weight", 1, Number.EPSILON, 10), enabled: true });
+    const input = validateEvaluation({ name: required(args, "--name"), prompt: required(args, "--prompt"), command: option(args, "--command"), weight: numberOption(args, "--weight", 1, Number.EPSILON, 10), enabled: true });
     const evaluation = { ...input, id: id("eval"), createdAt: now() };
     await store.update((state) => state.evaluations.push(evaluation));
     print(evaluation);

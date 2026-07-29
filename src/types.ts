@@ -2,6 +2,7 @@ export type Evaluation = {
   id: string;
   name: string;
   prompt: string;
+  command?: string;
   weight: number;
   enabled: boolean;
   createdAt: string;

@@ -45,7 +45,7 @@ Usage: burner [options] [directory]
        burner <command> [subcommand] -C <directory> [options]
 
 Commands:
-  eval add       Add an evaluation (--name, --prompt, [--weight])
+  eval add       Add an evaluation (--name, --prompt, [--command], [--weight])
   eval clear     Remove every evaluation (--yes is required)
   eval list      List evaluations and latest scores
   eval run       Run all enabled evaluations and wait for results
@@ -65,6 +65,7 @@ The same workflow is scriptable. Commands emit JSON, and `-C` selects the target
 ```bash
 burner eval clear --yes -C ./my-project
 burner eval add -C ./my-project --name "Correctness" --prompt "Score correctness and test evidence out of 100"
+burner eval add -C ./my-project --name "Benchmark" --prompt "Deterministic benchmark score" --command './bench.sh --json'
 burner settings set -C ./my-project --parallelism 1 --max-review-rounds 8
 burner eval run -C ./my-project
 burner idea add -C ./my-project --title "Add crash recovery" --description "Implement and test WAL recovery" --impact 90
@@ -74,6 +75,8 @@ burner queue retry -C ./my-project --run agent_12345678
 ```
 
 `queue run-next` is deliberately bounded: it claims the highest-impact queued idea, waits through implementation, the reviewer/author loop, candidate evaluation, and PR delivery, then exits. This makes Burner usable from CI, cron, or a larger local automation script without enabling the continuous timer.
+
+An evaluation may optionally provide a local command. Burner runs it directly in each evaluated checkout and expects one JSON object on stdout with `score` (0–100), `summary`, `evidence`, and `suggestions`. Command evaluations are useful for deterministic benchmarks and test-derived metrics; they execute with the user's local permissions, so only configure commands you trust. Evaluations without a command continue to use a read-only Codex inspection.
 
 ## Review and composite workflow
 

@@ -60,6 +60,22 @@ test("headless CLI configures evaluations, ideas, and conservative settings as J
   }
 });
 
+test("command evaluations return deterministic structured scores without Codex", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-command-eval-test-"));
+  const evaluator = join(root, "evaluate");
+  try {
+    await writeFile(evaluator, `#!/bin/sh\nprintf '%s\\n' '{"score":42.25,"summary":"Measured locally","evidence":["same workload"],"suggestions":["go faster"]}'\n`);
+    await chmod(evaluator, 0o755);
+    const settings = { parallelism: 1, evaluationIntervalMinutes: 30, orchestratorIntervalMinutes: 15, autoRun: false, autoCreatePrs: true, evaluatorModel: "", agentModel: "", baseBranch: "main", remote: "origin", defaultResources: [], maxReviewRounds: 8, preferLivingComposite: true, compositeAbsorbThreshold: 0 };
+    const output = await new CodexClient().evaluate(root, { id: "bench", name: "Benchmark", prompt: "Measure it", command: evaluator, weight: 1, enabled: true, createdAt: new Date().toISOString() }, settings, "manual");
+    assert.equal(output.score, 42.3);
+    assert.equal(output.summary, "Measured locally");
+    assert.deepEqual(output.evidence, ["same workload"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("resource locks are exclusive and recover after release", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-lock-test-"));
   try {
