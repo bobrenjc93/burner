@@ -185,7 +185,7 @@ test("Codex author sessions resume with reviewer feedback and reviewers stay str
   await import("node:fs/promises").then((fs) => fs.mkdir(bin));
   const executable = join(bin, "codex");
   const argsLog = join(root, "args.jsonl");
-  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");const args=process.argv.slice(2);fs.appendFileSync(process.env.BURNER_TEST_ARGS,JSON.stringify(args)+"\\n");const i=args.indexOf("--output-last-message");const out=args[i+1];if(args.includes("--output-schema")){fs.writeFileSync(out,JSON.stringify({approved:true,summary:"Ready",findings:[]}));}else{fs.writeFileSync(out,"Author complete");console.log(JSON.stringify({type:"thread.started",thread_id:"thread-test"}));}\n`);
+  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");const args=process.argv.slice(2);fs.appendFileSync(process.env.BURNER_TEST_ARGS,JSON.stringify(args)+"\\n");const i=args.indexOf("--output-last-message");const out=args[i+1];if(args.includes("--output-schema")){process.exit(9);}else if(args.includes("read-only")){fs.writeFileSync(out,JSON.stringify({approved:true,summary:"Ready",findings:[]}));}else{fs.writeFileSync(out,"Author complete");console.log(JSON.stringify({type:"thread.started",thread_id:"thread-test"}));}\n`);
   await chmod(executable, 0o755);
   const previousPath = process.env.PATH;
   process.env.PATH = `${bin}:${previousPath}`;
@@ -203,8 +203,9 @@ test("Codex author sessions resume with reviewer feedback and reviewers stay str
     assert.ok(calls[0].includes("--json"));
     assert.ok(calls[1].includes("resume"));
     assert.ok(calls[1].includes("thread-test"));
-    assert.ok(calls[2].includes("read-only"));
     assert.ok(calls[2].includes("--output-schema"));
+    assert.ok(calls[3].includes("read-only"));
+    assert.ok(!calls[3].includes("--output-schema"));
   } finally {
     process.env.PATH = previousPath;
     delete process.env.BURNER_TEST_ARGS;

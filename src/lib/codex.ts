@@ -232,13 +232,24 @@ export class CodexClient {
       await writeFile(schemaPath, JSON.stringify(schema), "utf8");
       const args = this.args(cwd, model, sandbox);
       args.push("--output-schema", schemaPath, "--output-last-message", outputPath, "-");
-      const result = await runCommand("codex", args, {
+      let result = await runCommand("codex", args, {
         cwd,
         input: prompt,
         timeoutMs: 45 * 60 * 1000,
         onStderr: (line) => this.onProgress?.(line),
       });
-      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `codex exec exited with ${result.exitCode}`);
+      if (result.exitCode !== 0) {
+        await rm(outputPath, { force: true });
+        const fallbackArgs = this.args(cwd, model, sandbox);
+        fallbackArgs.push("--output-last-message", outputPath, "-");
+        result = await runCommand("codex", fallbackArgs, {
+          cwd,
+          input: this.schemaFallbackPrompt(prompt, schema),
+          timeoutMs: 45 * 60 * 1000,
+          onStderr: (line) => this.onProgress?.(line),
+        });
+      }
+      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || `codex exec exited with ${result.exitCode}`);
       const raw = await readFile(outputPath, "utf8").catch(() => result.stdout);
       return parseJsonObject<T>(raw);
     } catch (error) {
@@ -256,13 +267,24 @@ export class CodexClient {
       await writeFile(schemaPath, JSON.stringify(schema), "utf8");
       const args = this.args(cwd, model, "read-only");
       args.push("--output-schema", schemaPath, "--output-last-message", outputPath, "-");
-      const result = await runCommand("codex", args, {
+      let result = await runCommand("codex", args, {
         cwd,
         input: prompt,
         timeoutMs: 60 * 60 * 1000,
         onStderr: (line) => this.onProgress?.(line),
       });
-      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `codex reviewer exited with ${result.exitCode}`);
+      if (result.exitCode !== 0) {
+        await rm(outputPath, { force: true });
+        const fallbackArgs = this.args(cwd, model, "read-only");
+        fallbackArgs.push("--output-last-message", outputPath, "-");
+        result = await runCommand("codex", fallbackArgs, {
+          cwd,
+          input: this.schemaFallbackPrompt(prompt, schema),
+          timeoutMs: 60 * 60 * 1000,
+          onStderr: (line) => this.onProgress?.(line),
+        });
+      }
+      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || `codex reviewer exited with ${result.exitCode}`);
       return parseJsonObject<T>(await readFile(outputPath, "utf8").catch(() => result.stdout));
     } finally {
       await rm(tempDir, { recursive: true, force: true });
@@ -318,5 +340,9 @@ export class CodexClient {
     ];
     if (model.trim()) args.push("--model", model.trim());
     return args;
+  }
+
+  private schemaFallbackPrompt(prompt: string, schema: object): string {
+    return `${prompt}\n\nReturn only one JSON object matching this JSON Schema exactly. Do not use Markdown fences or add commentary.\n${JSON.stringify(schema)}`;
   }
 }
