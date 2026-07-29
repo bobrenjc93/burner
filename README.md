@@ -42,16 +42,34 @@ Burner never sends repository data through its own service. It invokes the local
 
 ```text
 Usage: burner [options] [directory]
+       burner <command> [subcommand] -C <directory> [options]
 
-Options:
-  -p, --port <port>  port to listen on (default: 4321)
-  --host <host>      host to bind (default: 127.0.0.1)
-  --no-open          do not open a browser
-  -V, --version      output the version number
-  -h, --help         display help
+Commands:
+  eval add       Add an evaluation (--name, --prompt, [--weight])
+  eval clear     Remove every evaluation (--yes is required)
+  eval list      List evaluations and latest scores
+  eval run       Run all enabled evaluations and wait for results
+  idea add       Queue an idea (--title, --description, [--impact])
+  idea list      List improvement ideas
+  queue run-next Run exactly one queued idea through review and delivery
+  settings set   Update automation settings
+  status         Print project state and runtime readiness as JSON
 ```
 
 Run `burner` from the repo you want to improve, configure evaluation prompts in the UI, and run a baseline. “Ignite” starts the continuous loop. Pausing stops new dispatches but lets already-running agents finish safely.
+
+The same workflow is scriptable. Commands emit JSON, and `-C` selects the target repository:
+
+```bash
+burner eval clear --yes -C ./my-project
+burner eval add -C ./my-project --name "Correctness" --prompt "Score correctness and test evidence out of 100"
+burner settings set -C ./my-project --parallelism 1 --max-review-rounds 8
+burner eval run -C ./my-project
+burner idea add -C ./my-project --title "Add crash recovery" --description "Implement and test WAL recovery" --impact 90
+burner queue run-next -C ./my-project
+```
+
+`queue run-next` is deliberately bounded: it claims the highest-impact queued idea, waits through implementation, the reviewer/author loop, candidate evaluation, and PR delivery, then exits. This makes Burner usable from CI, cron, or a larger local automation script without enabling the continuous timer.
 
 ## Review and composite workflow
 

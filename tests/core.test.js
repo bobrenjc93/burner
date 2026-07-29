@@ -38,6 +38,28 @@ test("structured output parser tolerates a fenced preamble", () => {
   assert.equal(slugify("Polish the first-run UX!"), "polish-the-first-run-ux");
 });
 
+test("headless CLI configures evaluations, ideas, and conservative settings as JSON", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-cli-test-"));
+  const cli = join(process.cwd(), "dist", "cli.js");
+  try {
+    assert.deepEqual(JSON.parse(await exec(root, "node", [cli, "eval", "clear", "--yes", "-C", root])), { removed: 3 });
+    const evaluation = JSON.parse(await exec(root, "node", [cli, "eval", "add", "-C", root, "--name", "Correctness", "--prompt", "Score correctness out of 100", "--weight", "2"]));
+    assert.equal(evaluation.name, "Correctness");
+    const listed = JSON.parse(await exec(root, "node", [cli, "eval", "list", "-C", root]));
+    assert.deepEqual(listed.map((item) => item.id), [evaluation.id]);
+    const idea = JSON.parse(await exec(root, "node", [cli, "idea", "add", "-C", root, "--title", "Build core", "--description", "Implement the core", "--impact", "90", "--eval", evaluation.id, "--resource", "cpu"]));
+    assert.equal(idea.predictedImpact, 90);
+    assert.deepEqual(idea.evaluationIds, [evaluation.id]);
+    assert.deepEqual(idea.resources, ["cpu"]);
+    const settings = JSON.parse(await exec(root, "node", [cli, "settings", "set", "-C", root, "--parallelism", "1", "--max-review-rounds", "4", "--auto-create-prs", "true"]));
+    assert.equal(settings.parallelism, 1);
+    assert.equal(settings.maxReviewRounds, 4);
+    assert.equal(settings.autoCreatePrs, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("resource locks are exclusive and recover after release", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-lock-test-"));
   try {

@@ -85,6 +85,23 @@ export class Orchestrator {
     await this.tick(true);
   }
 
+  async runNextIdea(): Promise<AgentRun> {
+    const state = this.store.get();
+    const idea = state.ideas.filter((item) => item.status === "queued").sort((a, b) => b.predictedImpact - a.predictedImpact)[0];
+    if (!idea) throw new Error("No queued ideas are available.");
+    const base = await this.resolveAgentBase(idea, state);
+    const resources = [...new Set([...state.settings.defaultResources, ...idea.resources, ...(base.compositeId ? [`living-${base.compositeId}`] : [])])];
+    const lease = await this.locks.tryAcquireAll(resources, idea.id);
+    if (!lease) throw new Error("A required resource is currently locked.");
+    this.activeAgents.add(idea.id);
+    await this.runIdea(idea, base, resources, lease.locks, lease.release);
+    const after = this.store.get();
+    const runId = after.ideas.find((item) => item.id === idea.id)?.agentRunId;
+    const completed = after.agentRuns.find((run) => run.id === runId);
+    if (!completed) throw new Error("The agent run did not produce a result.");
+    return completed;
+  }
+
   async runEvaluations(context: EvaluationRun["context"] = "manual", cwd = this.root, agentRunId?: string, compositeId?: string): Promise<EvaluationRun[]> {
     const state = this.store.get();
     const evaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
