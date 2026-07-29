@@ -86,6 +86,9 @@ main { min-width: 0; grid-column: 2; }
 
 .error-banner { margin: -16px 0 24px; padding: 11px 13px; display: grid; grid-template-columns: auto 1fr auto; gap: 9px; align-items: center; border: 1px solid rgba(231, 102, 102, .22); border-radius: 8px; color: #dca19d; background: rgba(138, 48, 48, .1); font-size: 11px; }
 .error-banner button { border: 0; background: none; color: inherit; cursor: pointer; }
+.security-banner { margin: -16px 0 24px; padding: 11px 13px; display: flex; gap: 9px; align-items: flex-start; border: 1px solid rgba(231, 160, 90, .24); border-radius: 8px; color: #d99b68; background: rgba(138, 83, 38, .1); font-size: 10px; line-height: 1.5; }
+.security-banner svg { flex: 0 0 auto; margin-top: 1px; }
+.security-banner strong { display: block; color: #edb07b; }
 .hero-row { min-height: 130px; margin-bottom: 30px; display: flex; justify-content: space-between; align-items: flex-end; gap: 30px; }
 .eyebrow, .section-kicker { color: #b36d50; font-size: 9px; font-weight: 750; letter-spacing: 1.25px; text-transform: uppercase; }
 .eyebrow { display: flex; align-items: center; gap: 7px; }
@@ -285,9 +288,9 @@ main { min-width: 0; grid-column: 2; }
 .toggle-row input:checked + i { background: rgba(255,100,56,.26); }
 .toggle-row input:checked + i::after { transform: translateX(16px); background: var(--fire-bright); }
 .toggle-field .toggle-row { margin-top: 21px; padding-top: 8px; border: 0; }
-.security-note { margin-top: 16px; padding: 11px; display: flex; gap: 9px; align-items: flex-start; border: 1px solid rgba(87,200,135,.1); border-radius: 7px; color: var(--green); background: rgba(87,200,135,.03); }
-.security-note span { color: #6c7e70; font-size: 8px; line-height: 1.45; }
-.security-note strong { display: block; margin-bottom: 2px; color: #83aa8f; }
+.security-note { margin-top: 16px; padding: 11px; display: flex; gap: 9px; align-items: flex-start; border: 1px solid rgba(231,160,90,.15); border-radius: 7px; color: #c88650; background: rgba(138,83,38,.04); }
+.security-note span { color: #846a56; font-size: 8px; line-height: 1.45; }
+.security-note strong { display: block; margin-bottom: 2px; color: #c7956d; }
 .settings-aside { min-width: 0; }
 .sticky-save { padding: 18px; position: sticky; top: 82px; }
 .sticky-save h3 { margin: 0 0 7px; font-family: Georgia, serif; font-size: 15px; font-weight: 500; }

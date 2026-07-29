@@ -154,6 +154,7 @@ export function App() {
         </header>
 
         <div className="page">
+          <div className="security-banner"><ShieldCheck size={17} /><span><strong>Unrestricted Codex agents</strong> Authors, revisions, reviewers, planners, prompt evaluators, and composite integrators can read and write anywhere and run commands as your user. Command-backed evaluations are separate direct local subprocesses.</span></div>
           {error && <div className="error-banner"><CircleDot size={16} /><span>{error}</span><button onClick={() => setError(undefined)}><X size={15} /></button></div>}
           {tab === "overview" && (
             <Overview dashboard={dashboard} busy={busy} action={action} onAddEvaluation={() => setEvaluationModal("new")} />
@@ -372,7 +373,7 @@ function Settings({ dashboard, onSaved, setError }: { dashboard: DashboardPayloa
         </SettingsSection>
         <SettingsSection icon={<Sparkles size={19} />} title="Codex" body="Leave model fields empty to inherit your local Codex configuration.">
           <div className="form-grid"><Field label="Evaluator model"><input value={form.evaluatorModel} placeholder="Use Codex default" onChange={(event) => change("evaluatorModel", event.target.value)} /></Field><Field label="Implementation model"><input value={form.agentModel} placeholder="Use Codex default" onChange={(event) => change("agentModel", event.target.value)} /></Field></div>
-          <div className="security-note"><ShieldCheck size={17} /><span><strong>Explicit sandboxing</strong> Evaluators and planning are read-only. Implementation agents can write only inside an isolated worktree.</span></div>
+          <div className="security-note"><ShieldCheck size={17} /><span><strong>Unrestricted agent access</strong> Every Codex role bypasses approvals and sandboxing. Agents can access the filesystem and run commands with your user permissions.</span></div>
         </SettingsSection>
         <SettingsSection icon={<Github size={19} />} title="GitHub delivery" body="Burner creates a branch, pushes it, and stamps measured impact into the PR.">
           <div className="form-grid"><Field label="Base branch"><input value={form.baseBranch} onChange={(event) => change("baseBranch", event.target.value)} /></Field><Field label="Git remote"><input value={form.remote} onChange={(event) => change("remote", event.target.value)} /></Field></div>

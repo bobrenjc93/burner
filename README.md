@@ -38,6 +38,9 @@ burner
 
 Burner never sends repository data through its own service. It invokes the locally installed Codex and GitHub CLIs using your existing authentication.
 
+> [!WARNING]
+> Burner deliberately launches every Codex agent with `--dangerously-bypass-approvals-and-sandbox`. Authors, revisions, reviewers, planners, prompt evaluators, and composite integrators have unrestricted filesystem and command access as your user—not just access to the target worktree. Use Burner only on repositories and machines where you accept that risk. Burner preflights this capability and fails clearly if the installed Codex CLI does not support it; it never silently falls back to restricted mode.
+
 ## Usage
 
 ```text
@@ -76,7 +79,7 @@ burner queue retry -C ./my-project --run agent_12345678
 
 `queue run-next` is deliberately bounded: it claims the highest-impact queued idea, waits through implementation, the reviewer/author loop, candidate evaluation, and PR delivery, then exits. This makes Burner usable from CI, cron, or a larger local automation script without enabling the continuous timer.
 
-An evaluation may optionally provide a local command. Burner runs it directly in each evaluated checkout and expects one JSON object on stdout with `score` (0–100), `summary`, `evidence`, and `suggestions`. Command evaluations are useful for deterministic benchmarks and test-derived metrics; they execute with the user's local permissions, so only configure commands you trust. Evaluations without a command continue to use a read-only Codex inspection.
+An evaluation may optionally provide a local command. Burner runs it directly in each evaluated checkout and expects one JSON object on stdout with `score` (0–100), `summary`, `evidence`, and `suggestions`. Command evaluations are useful for deterministic benchmarks and test-derived metrics; they are direct local subprocesses that inherit Burner's permissions and are not `codex exec` invocations, so only configure commands you trust. Evaluations without a command use an unrestricted Codex agent.
 
 ## Review and composite workflow
 
@@ -92,7 +95,9 @@ When a composite merges, Burner closes its included source PRs. It fast-forwards
 
 ## Safety and concurrency
 
-Implementation agents receive explicit `workspace-write` access only inside their isolated worktree. Evaluators and the planner are read-only. Burner asks Codex not to push or open PRs; the orchestrator owns those state transitions.
+Every `codex exec` invocation uses `--dangerously-bypass-approvals-and-sandbox`, including authors, revision sessions, reviewers, planners, prompt evaluators, and composite integrators. These agents have unrestricted filesystem and command access as your user. Burner still instructs agents not to push or open PRs because the orchestrator owns those state transitions, but that instruction is not a security boundary.
+
+Command-backed evaluations are different: Burner starts their configured command directly as a local subprocess. The Codex flag does not affect them; they already inherit Burner's local permissions.
 
 Each idea may declare resource locks. Locks are acquired atomically under `.burner/locks`, in sorted order, and held for the full agent run. If any requested resource is busy, the idea stays queued. Git worktree mutations use a separate short-lived metadata lock.
 

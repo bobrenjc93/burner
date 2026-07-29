@@ -2,8 +2,11 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BurnerSettings, Evaluation, EvaluationRun, Idea, ReviewFinding } from "../types.js";
-import { runCommand } from "./process.js";
+import { runCommand, type CommandResult } from "./process.js";
 import { clampScore, errorMessage, parseJsonObject } from "./utils.js";
+
+const UNRESTRICTED_FLAG = "--dangerously-bypass-approvals-and-sandbox";
+type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
 
 const evaluationSchema = {
   type: "object",
@@ -73,7 +76,14 @@ export type SessionResult = { message: string; threadId: string };
 export type ReviewResult = { approved: boolean; summary: string; findings: ReviewFinding[] };
 
 export class CodexClient {
+  private preflightPromise?: Promise<void>;
+
   constructor(private readonly onProgress?: (message: string) => void) {}
+
+  async preflight(cwd: string): Promise<void> {
+    this.preflightPromise ??= this.checkUnrestrictedMode(cwd);
+    return this.preflightPromise;
+  }
 
   async evaluate(
     cwd: string,
@@ -90,7 +100,7 @@ export class CodexClient {
       evaluation.prompt,
       `Context: ${context === "agent" || context === "composite" ? "This is a candidate branch; assess only its current state." : "This is the current project baseline."}`,
     ].join("\n\n");
-    const output = await this.structured<EvaluationOutput>(cwd, prompt, evaluationSchema, settings.evaluatorModel, "read-only");
+    const output = await this.structured<EvaluationOutput>(cwd, prompt, evaluationSchema, settings.evaluatorModel);
     return this.normalizeEvaluation(output);
   }
 
@@ -145,7 +155,7 @@ export class CodexClient {
       `Evaluations:\n${JSON.stringify(evaluationContext, null, 2)}`,
       `Existing ideas:\n${JSON.stringify(existingIdeas.slice(-30).map(({ title, description, status }) => ({ title, description, status })), null, 2)}`,
     ].join("\n\n");
-    const output = await this.structured<{ ideas: PlannedIdea[] }>(cwd, prompt, ideasSchema, settings.evaluatorModel, "read-only");
+    const output = await this.structured<{ ideas: PlannedIdea[] }>(cwd, prompt, ideasSchema, settings.evaluatorModel);
     const validIds = new Set(evaluations.map((evaluation) => evaluation.id));
     return output.ideas.map((idea) => ({
       title: String(idea.title).trim().slice(0, 120),
@@ -223,16 +233,15 @@ export class CodexClient {
     prompt: string,
     schema: object,
     model: string,
-    sandbox: "read-only" | "workspace-write",
   ): Promise<T> {
     const tempDir = await mkdtemp(join(tmpdir(), "burner-codex-"));
     const schemaPath = join(tempDir, "schema.json");
     const outputPath = join(tempDir, "output.json");
     try {
       await writeFile(schemaPath, JSON.stringify(schema), "utf8");
-      const args = this.args(cwd, model, sandbox);
+      const args = this.args(cwd, model);
       args.push("--output-schema", schemaPath, "--output-last-message", outputPath, "-");
-      let result = await runCommand("codex", args, {
+      let result = await this.runCodex(args, {
         cwd,
         input: prompt,
         timeoutMs: 45 * 60 * 1000,
@@ -240,9 +249,9 @@ export class CodexClient {
       });
       if (result.exitCode !== 0) {
         await rm(outputPath, { force: true });
-        const fallbackArgs = this.args(cwd, model, sandbox);
+        const fallbackArgs = this.args(cwd, model);
         fallbackArgs.push("--output-last-message", outputPath, "-");
-        result = await runCommand("codex", fallbackArgs, {
+        result = await this.runCodex(fallbackArgs, {
           cwd,
           input: this.schemaFallbackPrompt(prompt, schema),
           timeoutMs: 45 * 60 * 1000,
@@ -265,9 +274,9 @@ export class CodexClient {
     const outputPath = join(tempDir, "output.json");
     try {
       await writeFile(schemaPath, JSON.stringify(schema), "utf8");
-      const args = this.args(cwd, model, "read-only");
+      const args = this.args(cwd, model);
       args.push("--output-schema", schemaPath, "--output-last-message", outputPath, "-");
-      let result = await runCommand("codex", args, {
+      let result = await this.runCodex(args, {
         cwd,
         input: prompt,
         timeoutMs: 60 * 60 * 1000,
@@ -275,9 +284,9 @@ export class CodexClient {
       });
       if (result.exitCode !== 0) {
         await rm(outputPath, { force: true });
-        const fallbackArgs = this.args(cwd, model, "read-only");
+        const fallbackArgs = this.args(cwd, model);
         fallbackArgs.push("--output-last-message", outputPath, "-");
-        result = await runCommand("codex", fallbackArgs, {
+        result = await this.runCodex(fallbackArgs, {
           cwd,
           input: this.schemaFallbackPrompt(prompt, schema),
           timeoutMs: 60 * 60 * 1000,
@@ -301,13 +310,13 @@ export class CodexClient {
     const outputPath = join(tempDir, "output.md");
     try {
       const args = resumeThreadId
-        ? ["exec", "resume", "--json", "-c", 'approval_policy="never"', "-c", 'sandbox_mode="workspace-write"']
-        : ["exec", "--json", "--color", "never", "--sandbox", "workspace-write", "-c", 'approval_policy="never"', "-C", cwd];
+        ? ["exec", "resume", "--json"]
+        : ["exec", "--json", "--color", "never", "-C", cwd];
       if (model.trim()) args.push("--model", model.trim());
       args.push("--output-last-message", outputPath);
       if (resumeThreadId) args.push(resumeThreadId);
       args.push("-");
-      const result = await runCommand("codex", args, {
+      const result = await this.runCodex(args, {
         cwd,
         input: prompt,
         timeoutMs: 2 * 60 * 60 * 1000,
@@ -325,21 +334,39 @@ export class CodexClient {
     }
   }
 
-  private args(cwd: string, model: string, sandbox: "read-only" | "workspace-write"): string[] {
+  private args(cwd: string, model: string): string[] {
     const args = [
       "exec",
       "--ephemeral",
       "--color",
       "never",
-      "--sandbox",
-      sandbox,
-      "-c",
-      'approval_policy="never"',
       "-C",
       cwd,
     ];
     if (model.trim()) args.push("--model", model.trim());
     return args;
+  }
+
+  private async checkUnrestrictedMode(cwd: string): Promise<void> {
+    let result: CommandResult;
+    try {
+      result = await runCommand("codex", [UNRESTRICTED_FLAG, "exec", "--help"], { cwd, timeoutMs: 10_000 });
+    } catch (error) {
+      throw new Error(this.preflightError(errorMessage(error)));
+    }
+    const help = `${result.stdout}\n${result.stderr}`;
+    if (result.exitCode !== 0 || !help.includes(UNRESTRICTED_FLAG)) {
+      throw new Error(this.preflightError(help.trim() || `codex exited with ${result.exitCode}`));
+    }
+  }
+
+  private async runCodex(args: string[], options: CodexCommandOptions): Promise<CommandResult> {
+    await this.preflight(options.cwd);
+    return runCommand("codex", [UNRESTRICTED_FLAG, ...args], options);
+  }
+
+  private preflightError(detail: string): string {
+    return `Burner requires Codex unrestricted mode (${UNRESTRICTED_FLAG}), but the installed Codex CLI did not accept it. Upgrade Codex; Burner will not fall back to restricted mode.${detail ? ` Details: ${detail}` : ""}`;
   }
 
   private schemaFallbackPrompt(prompt: string, schema: object): string {

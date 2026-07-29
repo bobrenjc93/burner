@@ -42,6 +42,7 @@ test("headless CLI configures evaluations, ideas, and conservative settings as J
   const root = await mkdtemp(join(tmpdir(), "burner-cli-test-"));
   const cli = join(process.cwd(), "dist", "cli.js");
   try {
+    assert.match(await exec(root, "node", [cli, "--help"]), /Codex agents?[\s\S]*unrestricted filesystem and command access/);
     assert.deepEqual(JSON.parse(await exec(root, "node", [cli, "eval", "clear", "--yes", "-C", root])), { removed: 3 });
     const evaluation = JSON.parse(await exec(root, "node", [cli, "eval", "add", "-C", root, "--name", "Correctness", "--prompt", "Score correctness out of 100", "--weight", "2"]));
     assert.equal(evaluation.name, "Correctness");
@@ -179,13 +180,13 @@ test("PR bodies record review approval and recalculated composite scores", () =>
   assert.match(body, /never inferred by adding individual deltas/);
 });
 
-test("Codex author sessions resume with reviewer feedback and reviewers stay structured", async () => {
+test("every Codex role and structured fallback uses unrestricted mode with correct flag placement", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-codex-test-"));
   const bin = join(root, "bin");
   await import("node:fs/promises").then((fs) => fs.mkdir(bin));
   const executable = join(bin, "codex");
   const argsLog = join(root, "args.jsonl");
-  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");const args=process.argv.slice(2);fs.appendFileSync(process.env.BURNER_TEST_ARGS,JSON.stringify(args)+"\\n");const i=args.indexOf("--output-last-message");const out=args[i+1];if(args.includes("--output-schema")){process.exit(9);}else if(args.includes("read-only")){fs.writeFileSync(out,JSON.stringify({approved:true,summary:"Ready",findings:[]}));}else{fs.writeFileSync(out,"Author complete");console.log(JSON.stringify({type:"thread.started",thread_id:"thread-test"}));}\n`);
+  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");const args=process.argv.slice(2);const input=fs.readFileSync(0,"utf8");fs.appendFileSync(process.env.BURNER_TEST_ARGS,JSON.stringify({args,input})+"\\n");if(args.includes("--help")){console.log("  --dangerously-bypass-approvals-and-sandbox  unrestricted");process.exit(0);}const i=args.indexOf("--output-last-message");const out=args[i+1];if(args.includes("--output-schema")){process.exit(9);}if(input.includes("improvement planner")){fs.writeFileSync(out,JSON.stringify({ideas:[]}));}else if(input.includes("rigorous repository evaluator")){fs.writeFileSync(out,JSON.stringify({score:77,summary:"Measured",evidence:["code"],suggestions:["improve"]}));}else if(input.includes("independent, rigorous reviewer")){fs.writeFileSync(out,JSON.stringify({approved:true,summary:"Ready",findings:[]}));}else{fs.writeFileSync(out,"Author complete");console.log(JSON.stringify({type:"thread.started",thread_id:"thread-test"}));}\n`);
   await chmod(executable, 0o755);
   const previousPath = process.env.PATH;
   process.env.PATH = `${bin}:${previousPath}`;
@@ -193,22 +194,59 @@ test("Codex author sessions resume with reviewer feedback and reviewers stay str
   const settings = { parallelism: 1, evaluationIntervalMinutes: 30, orchestratorIntervalMinutes: 15, autoRun: false, autoCreatePrs: true, evaluatorModel: "", agentModel: "", baseBranch: "main", remote: "origin", defaultResources: [], maxReviewRounds: 8, preferLivingComposite: true, compositeAbsorbThreshold: 0 };
   try {
     const codex = new CodexClient();
+    const evaluation = { id: "quality", name: "Quality", prompt: "Score quality", weight: 1, enabled: true, createdAt: new Date().toISOString() };
+    assert.equal((await codex.evaluate(root, evaluation, settings, "manual")).score, 77);
+    assert.deepEqual(await codex.planIdeas(root, [evaluation], new Map(), [], settings), []);
     const author = await codex.implement(root, { id: "idea", title: "Improve", description: "Do it", rationale: "Quality", predictedImpact: 20, evaluationIds: [], resources: [], status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "manual" }, [], settings);
     assert.equal(author.threadId, "thread-test");
+    assert.equal((await codex.integrateComposite(root, "Combined", ["Improve"], settings)).message, "Author complete");
     const revision = await codex.revise(root, author.threadId, { approved: false, summary: "Fix it", findings: [{ severity: "high", title: "Bug", detail: "Resolve", file: "app.js" }] }, settings);
     assert.equal(revision.message, "Author complete");
     const review = await codex.review(root, "main", "Improve", settings);
     assert.equal(review.approved, true);
     const calls = (await readFile(argsLog, "utf8")).trim().split("\n").map(JSON.parse);
-    assert.ok(calls[0].includes("--json"));
-    assert.ok(calls[1].includes("resume"));
-    assert.ok(calls[1].includes("thread-test"));
-    assert.ok(calls[2].includes("--output-schema"));
-    assert.ok(calls[3].includes("read-only"));
-    assert.ok(!calls[3].includes("--output-schema"));
+    for (const { args } of calls) {
+      assert.equal(args[0], "--dangerously-bypass-approvals-and-sandbox");
+      assert.equal(args[1], "exec");
+      assert.ok(!args.includes("--sandbox"));
+      assert.ok(!args.includes("-s"));
+      assert.ok(!args.includes("--ask-for-approval"));
+      assert.ok(!args.includes("-a"));
+      assert.ok(!args.some((arg) => /sandbox_mode|approval_policy|read-only|workspace-write/.test(arg)));
+    }
+    assert.ok(calls.some(({ input }) => input.includes("rigorous repository evaluator")));
+    assert.ok(calls.some(({ input }) => input.includes("improvement planner")));
+    assert.ok(calls.some(({ input }) => input.includes("implementation agent")));
+    assert.ok(calls.some(({ input }) => input.includes("author/integrator")));
+    assert.ok(calls.some(({ input }) => input.includes("independent reviewer requested changes")));
+    const reviewerCalls = calls.filter(({ input }) => input.includes("independent, rigorous reviewer"));
+    assert.equal(reviewerCalls.length, 2);
+    assert.ok(reviewerCalls[0].args.includes("--output-schema"));
+    assert.ok(!reviewerCalls[1].args.includes("--output-schema"));
+    assert.ok(calls.some(({ args }) => args.includes("resume") && args.includes("thread-test")));
   } finally {
     process.env.PATH = previousPath;
     delete process.env.BURNER_TEST_ARGS;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex unrestricted-mode preflight fails clearly without a restricted fallback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-codex-preflight-test-"));
+  const bin = join(root, "bin");
+  await import("node:fs/promises").then((fs) => fs.mkdir(bin));
+  const executable = join(bin, "codex");
+  await writeFile(executable, `#!/usr/bin/env node\nconsole.error("error: unexpected argument '--dangerously-bypass-approvals-and-sandbox'");process.exit(2);\n`);
+  await chmod(executable, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath}`;
+  try {
+    await assert.rejects(
+      () => new CodexClient().preflight(root),
+      /requires Codex unrestricted mode.*will not fall back to restricted mode/s,
+    );
+  } finally {
+    process.env.PATH = previousPath;
     await rm(root, { recursive: true, force: true });
   }
 });

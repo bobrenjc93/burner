@@ -8,7 +8,7 @@ import { StateStore, validateEvaluation } from "./lib/store.js";
 import { errorMessage, id, now } from "./lib/utils.js";
 import type { BurnerSettings, Idea } from "./types.js";
 
-const VERSION = "0.5.1";
+const VERSION = "0.5.2";
 const colors = {
   fire: (value: string) => `\x1b[38;2;255;107;53m${value}\x1b[0m`,
   cyan: (value: string) => `\x1b[36m${value}\x1b[0m`,
@@ -18,6 +18,12 @@ const colors = {
 
 const help = `Usage: burner [options] [directory]
        burner <command> [subcommand] -C <directory> [options]
+
+SECURITY WARNING:
+  Every Codex agent runs with --dangerously-bypass-approvals-and-sandbox.
+  Authors, revisions, reviewers, planners, prompt evaluators, and composite
+  integrators have unrestricted filesystem and command access as your user.
+  Command-backed evaluations are separate direct local subprocesses.
 
 Commands:
   eval add       Add an evaluation (--name, --prompt, [--command], [--weight])
@@ -262,6 +268,7 @@ async function main(): Promise<void> {
   console.log(`\n${colors.fire("  ◉ BURNER")}\n${colors.dim("  Evaluation-driven repo improvement, running locally.")}\n`);
   console.log(`  ${colors.dim("Project")}  ${root}`);
   console.log(`  ${colors.dim("Control")}  ${colors.cyan(url)}\n`);
+  console.log(colors.red("  ⚠ Codex agents have unrestricted filesystem and command access as your user.\n"));
   console.log(colors.dim("  Press Ctrl+C to cool down.\n"));
   if (options.shouldOpen) openBrowser(url);
 

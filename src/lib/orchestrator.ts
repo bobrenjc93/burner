@@ -146,7 +146,7 @@ export class Orchestrator {
     const state = this.store.get();
     const evaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
     if (!evaluations.length) throw new Error("Add at least one enabled evaluation first.");
-    if (evaluations.some((evaluation) => !evaluation.command) && !(await commandExists("codex", this.root))) throw new Error("Codex CLI is not available. Install and authenticate Codex first.");
+    if (evaluations.some((evaluation) => !evaluation.command)) await this.codex.preflight(cwd);
     const commit = await this.git.head(cwd);
     this.runningEvaluations += evaluations.length;
     await this.store.addActivity({
