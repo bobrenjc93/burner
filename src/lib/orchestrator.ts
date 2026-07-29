@@ -345,6 +345,15 @@ export class Orchestrator {
     await this.syncPullRequests(true);
   }
 
+  async mergeAgent(runId: string): Promise<AgentRun> {
+    const run = this.store.get().agentRuns.find((item) => item.id === runId);
+    if (!run?.prNumber || run.status !== "completed" || run.prState !== "open") throw new Error("Only an open, completed agent pull request can be merged.");
+    await this.git.mergePr(this.root, run.prNumber);
+    await this.store.addActivity({ type: "pr", message: `Merge requested for PR #${run.prNumber}`, detail: "Synchronizing the base branch before any new agents start." });
+    await this.syncPullRequests(true);
+    return this.store.get().agentRuns.find((item) => item.id === runId)!;
+  }
+
   async retryComposite(compositeId: string): Promise<void> {
     let found = false;
     await this.store.update((state) => {

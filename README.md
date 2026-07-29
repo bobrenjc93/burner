@@ -53,6 +53,7 @@ Commands:
   idea list      List improvement ideas
   queue run-next Run exactly one queued idea through review and delivery
   queue retry    Resume a failed candidate (--run)
+  pr merge       Merge an open agent PR and synchronize the base (--run)
   settings set   Update automation settings
   status         Print project state and runtime readiness as JSON
 ```

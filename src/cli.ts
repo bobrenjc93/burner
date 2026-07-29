@@ -8,7 +8,7 @@ import { StateStore, validateEvaluation } from "./lib/store.js";
 import { errorMessage, id, now } from "./lib/utils.js";
 import type { BurnerSettings, Idea } from "./types.js";
 
-const VERSION = "0.4.1";
+const VERSION = "0.4.2";
 const colors = {
   fire: (value: string) => `\x1b[38;2;255;107;53m${value}\x1b[0m`,
   cyan: (value: string) => `\x1b[36m${value}\x1b[0m`,
@@ -28,6 +28,7 @@ Commands:
   idea list      List improvement ideas
   queue run-next Run exactly one queued idea through review and delivery
   queue retry    Resume a failed candidate (--run)
+  pr merge       Merge an open agent PR and synchronize the base (--run)
   settings set   Update automation settings
   status         Print project state and runtime readiness as JSON
 
@@ -94,7 +95,7 @@ async function withOrchestrator<T>(root: string, task: (orchestrator: Orchestrat
 
 async function runHeadless(args: string[]): Promise<boolean> {
   const [command, subcommand] = args;
-  if (!new Set(["eval", "idea", "queue", "settings", "status"]).has(command)) return false;
+  if (!new Set(["eval", "idea", "queue", "pr", "settings", "status"]).has(command)) return false;
   const root = commandRoot(args);
 
   if (command === "eval" && subcommand === "add") {
@@ -179,6 +180,11 @@ async function runHeadless(args: string[]): Promise<boolean> {
     const run = await withOrchestrator(root, (orchestrator) => orchestrator.retryAgent(required(args, "--run")));
     print(run);
     if (!["completed", "absorbed", "rejected", "no_changes"].includes(run.status)) process.exitCode = 2;
+    return true;
+  }
+
+  if (command === "pr" && subcommand === "merge") {
+    print(await withOrchestrator(root, (orchestrator) => orchestrator.mergeAgent(required(args, "--run"))));
     return true;
   }
 
