@@ -102,6 +102,46 @@ export class Orchestrator {
     return completed;
   }
 
+  async retryAgent(runId: string): Promise<AgentRun> {
+    const state = this.store.get();
+    const run = state.agentRuns.find((item) => item.id === runId);
+    const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
+    if (!run || run.status !== "failed" || !idea) throw new Error("Only a failed agent run can be retried.");
+    if (!run.worktree || !run.authorThreadId || !run.baseRef || !run.baseCommit) throw new Error("This run failed before it produced a resumable candidate.");
+    if (await this.git.resolveRef(run.baseRef) !== run.baseCommit) throw new Error("The candidate base has moved; queue a fresh idea against the latest base instead.");
+    await this.git.head(run.worktree);
+    const baseline = run.parentCompositeId ? this.store.latestCompositeRuns(run.parentCompositeId) : this.store.latestRuns();
+    const enabledEvaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
+    const missingBaseline = enabledEvaluations.find((evaluation) => baseline.get(evaluation.id)?.commit !== run.baseCommit);
+    if (missingBaseline) throw new Error(`Refresh '${missingBaseline.name}' at the candidate base before retrying.`);
+    const lease = await this.locks.tryAcquireAll(run.resources, `${run.id}-retry`);
+    if (!lease) throw new Error("A required resource is currently locked.");
+    const base: AgentBase = { ref: run.baseRef, commit: run.baseCommit, baseline, compositeId: run.parentCompositeId };
+    this.activeAgents.add(idea.id);
+    await this.store.update((draft) => {
+      const currentRun = draft.agentRuns.find((item) => item.id === run.id);
+      const currentIdea = draft.ideas.find((item) => item.id === idea.id);
+      if (currentRun) Object.assign(currentRun, { status: "reviewing", error: undefined, completedAt: undefined, reviewApproved: false, reviewRounds: [], deltas: [], impact: undefined });
+      if (currentIdea) Object.assign(currentIdea, { status: "running", updatedAt: now() });
+    });
+    await this.store.addActivity({ type: "agent", message: `Agent retry resumed: ${idea.title}`, detail: "Reusing the existing candidate and author session." });
+    try {
+      await this.reviewAndDeliverAgent(idea, base, run.id, run.worktree, run.branch, state.settings, run.authorThreadId, run.lastMessage ?? "");
+    } catch (error) {
+      const message = errorMessage(error);
+      await this.updateAgent(run.id, { status: "failed", error: message, completedAt: now() });
+      await this.finishIdea(idea.id, "failed");
+      await this.store.addActivity({ type: "error", message: `Agent retry failed: ${idea.title}`, detail: message });
+    } finally {
+      await lease.release();
+      this.activeAgents.delete(idea.id);
+      this.runtimeCache = undefined;
+      this.events.emit("state", this.store.get());
+      void this.scheduleComposites(true);
+    }
+    return this.store.get().agentRuns.find((item) => item.id === run.id)!;
+  }
+
   async runEvaluations(context: EvaluationRun["context"] = "manual", cwd = this.root, agentRunId?: string, compositeId?: string): Promise<EvaluationRun[]> {
     const state = this.store.get();
     const evaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
@@ -613,7 +653,7 @@ export class Orchestrator {
       const currentIdea = this.store.get().ideas.find((item) => item.id === idea.id) ?? idea;
       const authorStartCommit = await this.git.head(worktree);
       const author = await this.codex.implement(worktree, currentIdea, this.store.get().evaluations, settings);
-      let lastMessage = author.message;
+      const lastMessage = author.message;
       await this.updateAgent(runId, { lastMessage, authorThreadId: author.threadId });
       const hasUncommittedChanges = await this.git.hasChanges(worktree);
       if (!hasUncommittedChanges && await this.git.head(worktree) === authorStartCommit) {
@@ -623,63 +663,7 @@ export class Orchestrator {
         return;
       }
       if (hasUncommittedChanges) await this.git.commit(worktree, `burner: ${idea.title}`);
-      const reviewed = await this.reviewAgent(worktree, runId, idea.title, base.ref, author.threadId, settings);
-      lastMessage = reviewed.message;
-      await this.updateAgent(runId, { lastMessage, authorThreadId: reviewed.threadId, reviewApproved: true });
-      if (await this.git.resolveRef(base.ref) !== baseCommit) throw new Error("The experiment base moved during the review loop. Retry this idea from the latest living line.");
-      await this.updateAgent(runId, { status: "evaluating" });
-      const afterRuns = await this.runEvaluations("agent", worktree, runId);
-      const failedEvaluation = afterRuns.find((run) => run.status !== "completed" || run.score === undefined);
-      if (failedEvaluation) throw new Error("Candidate evaluation failed; Burner will not deliver a PR without complete before/after scores.");
-      const deltas = this.calculateDeltas(this.store.get(), baseline, afterRuns);
-      const impact = this.calculateImpact(this.store.get(), deltas);
-      await this.updateAgent(runId, { deltas, impact });
-      if (base.compositeId) {
-        const regressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
-        if (impact <= settings.compositeAbsorbThreshold || regressions.length) {
-          await this.updateAgent(runId, { status: "rejected", completedAt: now() });
-          await this.finishIdea(idea.id, "completed");
-          await this.store.addActivity({ type: "agent", message: `Experiment rejected: ${idea.title}`, detail: regressions.length ? `${regressions.length} evaluation regression${regressions.length === 1 ? "" : "s"}; living line unchanged.` : `Impact ${impact.toFixed(1)} did not clear the ${settings.compositeAbsorbThreshold.toFixed(1)} absorption threshold.` });
-          return;
-        }
-        await this.absorbExperiment(base.compositeId, runId, idea, worktree, branch, impact, settings);
-        await this.finishIdea(idea.id, "completed");
-        return;
-      }
-      let pr: { url: string; number?: number } | undefined;
-      if (settings.autoCreatePrs) {
-        if (await this.git.resolveRef(base.ref) !== baseCommit) throw new Error("The base branch moved during evaluation. Retry this idea to recalculate against the new main.");
-        await this.updateAgent(runId, { status: "opening_pr" });
-        if (!(await this.git.remoteExists(settings.remote))) throw new Error(`Git remote '${settings.remote}' does not exist.`);
-        await this.git.push(worktree, settings.remote, branch);
-        pr = await this.git.openPr({
-          cwd: worktree,
-          base: settings.baseBranch,
-          branch,
-          title: idea.title,
-          body: buildPrBody(idea.description, lastMessage, deltas, impact, this.store.get().agentRuns.find((run) => run.id === runId)?.reviewRounds ?? []),
-        });
-      }
-      await this.updateAgent(runId, {
-        status: "completed",
-        completedAt: now(),
-        prUrl: pr?.url,
-        prNumber: pr?.number,
-        prState: pr ? "open" : undefined,
-      });
-      await this.finishIdea(idea.id, "completed");
-      await this.store.addActivity({
-        type: pr ? "pr" : "agent",
-        message: pr ? `PR opened: ${idea.title}` : `Agent completed: ${idea.title}`,
-        detail: pr?.url ?? `Measured impact: ${impact >= 0 ? "+" : ""}${impact.toFixed(1)}`,
-      });
-      if (pr) {
-        const cleanupLock = await this.locks.tryAcquire("git-metadata", `${runId}-cleanup`);
-        if (cleanupLock) {
-          try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
-        }
-      }
-      this.events.emit("agent", { runId, status: "completed", prUrl: pr?.url, impact });
+      await this.reviewAndDeliverAgent(idea, base, runId, worktree, branch, settings, author.threadId, lastMessage);
     } catch (error) {
       const message = errorMessage(error);
       await this.updateAgent(runId, { status: "failed", error: message, completedAt: now() });
@@ -695,6 +679,65 @@ export class Orchestrator {
       void this.scheduleComposites(true);
       void heldLocks;
     }
+  }
+
+  private async reviewAndDeliverAgent(
+    idea: Idea,
+    base: AgentBase,
+    runId: string,
+    worktree: string,
+    branch: string,
+    settings: BurnerState["settings"],
+    authorThreadId: string,
+    initialMessage: string,
+  ): Promise<void> {
+    const reviewed = await this.reviewAgent(worktree, runId, idea.title, base.ref, authorThreadId, settings);
+    const lastMessage = reviewed.message || initialMessage;
+    await this.updateAgent(runId, { lastMessage, authorThreadId: reviewed.threadId, reviewApproved: true });
+    if (await this.git.resolveRef(base.ref) !== base.commit) throw new Error("The experiment base moved during the review loop. Retry this idea from the latest living line.");
+    await this.updateAgent(runId, { status: "evaluating" });
+    const afterRuns = await this.runEvaluations("agent", worktree, runId);
+    const failedEvaluation = afterRuns.find((run) => run.status !== "completed" || run.score === undefined);
+    if (failedEvaluation) throw new Error("Candidate evaluation failed; Burner will not deliver a PR without complete before/after scores.");
+    const deltas = this.calculateDeltas(this.store.get(), base.baseline, afterRuns);
+    const impact = this.calculateImpact(this.store.get(), deltas);
+    await this.updateAgent(runId, { deltas, impact });
+    if (base.compositeId) {
+      const regressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
+      if (impact <= settings.compositeAbsorbThreshold || regressions.length) {
+        await this.updateAgent(runId, { status: "rejected", completedAt: now() });
+        await this.finishIdea(idea.id, "completed");
+        await this.store.addActivity({ type: "agent", message: `Experiment rejected: ${idea.title}`, detail: regressions.length ? `${regressions.length} evaluation regression${regressions.length === 1 ? "" : "s"}; living line unchanged.` : `Impact ${impact.toFixed(1)} did not clear the ${settings.compositeAbsorbThreshold.toFixed(1)} absorption threshold.` });
+        return;
+      }
+      await this.absorbExperiment(base.compositeId, runId, idea, worktree, branch, impact, settings);
+      await this.finishIdea(idea.id, "completed");
+      return;
+    }
+    let pr: { url: string; number?: number } | undefined;
+    if (settings.autoCreatePrs) {
+      if (await this.git.resolveRef(base.ref) !== base.commit) throw new Error("The base branch moved during evaluation. Retry this idea to recalculate against the new main.");
+      await this.updateAgent(runId, { status: "opening_pr" });
+      if (!(await this.git.remoteExists(settings.remote))) throw new Error(`Git remote '${settings.remote}' does not exist.`);
+      await this.git.push(worktree, settings.remote, branch);
+      pr = await this.git.openPr({
+        cwd: worktree,
+        base: settings.baseBranch,
+        branch,
+        title: idea.title,
+        body: buildPrBody(idea.description, lastMessage, deltas, impact, this.store.get().agentRuns.find((run) => run.id === runId)?.reviewRounds ?? []),
+      });
+    }
+    await this.updateAgent(runId, { status: "completed", completedAt: now(), prUrl: pr?.url, prNumber: pr?.number, prState: pr ? "open" : undefined });
+    await this.finishIdea(idea.id, "completed");
+    await this.store.addActivity({ type: pr ? "pr" : "agent", message: pr ? `PR opened: ${idea.title}` : `Agent completed: ${idea.title}`, detail: pr?.url ?? `Measured impact: ${impact >= 0 ? "+" : ""}${impact.toFixed(1)}` });
+    if (pr) {
+      const cleanupLock = await this.locks.tryAcquire("git-metadata", `${runId}-cleanup`);
+      if (cleanupLock) {
+        try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
+      }
+    }
+    this.events.emit("agent", { runId, status: "completed", prUrl: pr?.url, impact });
   }
 
   private async scheduleComposites(force = false): Promise<void> {

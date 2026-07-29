@@ -52,6 +52,7 @@ Commands:
   idea add       Queue an idea (--title, --description, [--impact])
   idea list      List improvement ideas
   queue run-next Run exactly one queued idea through review and delivery
+  queue retry    Resume a failed candidate (--run)
   settings set   Update automation settings
   status         Print project state and runtime readiness as JSON
 ```
@@ -67,6 +68,8 @@ burner settings set -C ./my-project --parallelism 1 --max-review-rounds 8
 burner eval run -C ./my-project
 burner idea add -C ./my-project --title "Add crash recovery" --description "Implement and test WAL recovery" --impact 90
 burner queue run-next -C ./my-project
+# If an external service interrupted a candidate after the author committed:
+burner queue retry -C ./my-project --run agent_12345678
 ```
 
 `queue run-next` is deliberately bounded: it claims the highest-impact queued idea, waits through implementation, the reviewer/author loop, candidate evaluation, and PR delivery, then exits. This makes Burner usable from CI, cron, or a larger local automation script without enabling the continuous timer.

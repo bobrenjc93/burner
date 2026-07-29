@@ -8,7 +8,7 @@ import { StateStore, validateEvaluation } from "./lib/store.js";
 import { errorMessage, id, now } from "./lib/utils.js";
 import type { BurnerSettings, Idea } from "./types.js";
 
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 const colors = {
   fire: (value: string) => `\x1b[38;2;255;107;53m${value}\x1b[0m`,
   cyan: (value: string) => `\x1b[36m${value}\x1b[0m`,
@@ -27,6 +27,7 @@ Commands:
   idea add       Queue an idea (--title, --description, [--impact])
   idea list      List improvement ideas
   queue run-next Run exactly one queued idea through review and delivery
+  queue retry    Resume a failed candidate (--run)
   settings set   Update automation settings
   status         Print project state and runtime readiness as JSON
 
@@ -169,6 +170,13 @@ async function runHeadless(args: string[]): Promise<boolean> {
 
   if (command === "queue" && subcommand === "run-next") {
     const run = await withOrchestrator(root, (orchestrator) => orchestrator.runNextIdea());
+    print(run);
+    if (!["completed", "absorbed", "rejected", "no_changes"].includes(run.status)) process.exitCode = 2;
+    return true;
+  }
+
+  if (command === "queue" && subcommand === "retry") {
+    const run = await withOrchestrator(root, (orchestrator) => orchestrator.retryAgent(required(args, "--run")));
     print(run);
     if (!["completed", "absorbed", "rejected", "no_changes"].includes(run.status)) process.exitCode = 2;
     return true;

@@ -188,6 +188,7 @@ export class CodexClient {
       "Approve only when there are no material correctness, security, regression, race, lifecycle, or missing-test issues that should block merge.",
       "Do not edit files. Keep findings concrete and actionable. Approval must be false whenever any finding requires an author change.",
       `Change under review: ${title}`,
+      `Base branch: ${baseBranch}. Inspect the complete diff from this base to HEAD before deciding.`,
     ].join("\n\n");
     const result = await this.reviewStructured<ReviewResult>(cwd, baseBranch, prompt, reviewSchema, settings.agentModel);
     return {
@@ -233,8 +234,7 @@ export class CodexClient {
     const outputPath = join(tempDir, "output.json");
     try {
       await writeFile(schemaPath, JSON.stringify(schema), "utf8");
-      const args = ["exec", "review", "--ephemeral", "-c", 'approval_policy="never"', "--base", baseBranch];
-      if (model.trim()) args.push("--model", model.trim());
+      const args = this.args(cwd, model, "read-only");
       args.push("--output-schema", schemaPath, "--output-last-message", outputPath, "-");
       const result = await runCommand("codex", args, {
         cwd,
@@ -242,7 +242,7 @@ export class CodexClient {
         timeoutMs: 60 * 60 * 1000,
         onStderr: (line) => this.onProgress?.(line),
       });
-      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `codex exec review exited with ${result.exitCode}`);
+      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `codex reviewer exited with ${result.exitCode}`);
       return parseJsonObject<T>(await readFile(outputPath, "utf8").catch(() => result.stdout));
     } finally {
       await rm(tempDir, { recursive: true, force: true });
