@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import type { AgentRun, BurnerState, CompositePr, CompositeSource, EvaluationRun, Idea, ReviewRound, RuntimeStatus, ScoreDelta } from "../types.js";
+import type { AgentRun, BurnerState, CompositePr, CompositeSource, Evaluation, EvaluationRun, Idea, ReviewRound, RuntimeStatus, ScoreDelta } from "../types.js";
 import { CodexClient, type ReviewResult, type SessionResult } from "./codex.js";
 import { EventHub } from "./events.js";
 import { buildCompositePrBody, buildPrBody, GitService } from "./git.js";
@@ -309,6 +309,15 @@ export class Orchestrator {
   }
 
   async runEvaluations(context: EvaluationRun["context"] = "manual", cwd = this.root, agentRunId?: string, compositeId?: string): Promise<EvaluationRun[]> {
+    const suiteLock = await this.locks.acquire("evaluation-suite", id("evalsuite"), { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
+    try {
+      return await this.runEvaluationSuite(context, cwd, agentRunId, compositeId);
+    } finally {
+      await suiteLock.release();
+    }
+  }
+
+  private async runEvaluationSuite(context: EvaluationRun["context"], cwd: string, agentRunId?: string, compositeId?: string): Promise<EvaluationRun[]> {
     const state = this.store.get();
     const evaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
     if (!evaluations.length) throw new Error("Add at least one enabled evaluation first.");
@@ -321,7 +330,7 @@ export class Orchestrator {
       detail: context === "agent" || context === "composite" ? "Measuring the candidate branch." : `At commit ${commit.slice(0, 8)}.`,
     });
     try {
-      const runs = await mapLimit(evaluations, Math.min(state.settings.parallelism, 3), async (evaluation) => {
+      const evaluateOne = async (evaluation: Evaluation): Promise<EvaluationRun> => {
         const run: EvaluationRun = {
           id: id("evalrun"),
           evaluationId: evaluation.id,
@@ -359,7 +368,10 @@ export class Orchestrator {
           await commandLock?.release();
         }
         return run;
-      });
+      };
+      const commandRuns = await mapLimit(evaluations.filter((evaluation) => evaluation.command), 1, evaluateOne);
+      const promptRuns = await mapLimit(evaluations.filter((evaluation) => !evaluation.command), Math.min(state.settings.parallelism, 3), evaluateOne);
+      const runs = [...commandRuns, ...promptRuns];
       const succeeded = runs.filter((run) => run.status === "completed").length;
       await this.store.addActivity({
         type: succeeded === runs.length ? "evaluation" : "error",

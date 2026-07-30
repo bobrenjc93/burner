@@ -330,6 +330,50 @@ test("command-backed evaluations are serialized across concurrent candidates", a
   }
 });
 
+test("evaluation suites do not overlap and run command checks before prompt checks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-evaluation-suite-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.settings.parallelism = 5;
+      state.evaluations = [
+        { id: "prompt", name: "Prompt", prompt: "Inspect", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "command", name: "Command", prompt: "Measure", command: "./benchmark", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+    });
+    const order = [];
+    let activeSuite;
+    let overlapped = false;
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { head: async () => "commit" };
+    orchestrator.codex = {
+      preflight: async () => undefined,
+      evaluate: async (cwd, evaluation) => {
+        if (activeSuite && activeSuite !== cwd) overlapped = true;
+        activeSuite = cwd;
+        order.push(`${cwd}:${evaluation.id}`);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        activeSuite = undefined;
+        return { score: 50, summary: "measured", evidence: [], suggestions: [] };
+      },
+    };
+    await orchestrator.locks.init();
+    await Promise.all([
+      orchestrator.runEvaluations("agent", "suite-a", "agent-a"),
+      orchestrator.runEvaluations("agent", "suite-b", "agent-b"),
+    ]);
+    assert.equal(overlapped, false);
+    assert.ok(
+      JSON.stringify(order) === JSON.stringify(["suite-a:command", "suite-a:prompt", "suite-b:command", "suite-b:prompt"]) ||
+      JSON.stringify(order) === JSON.stringify(["suite-b:command", "suite-b:prompt", "suite-a:command", "suite-a:prompt"]),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("every Codex role and structured fallback uses unrestricted mode with correct flag placement", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-codex-test-"));
   const bin = join(root, "bin");
