@@ -104,6 +104,49 @@ test("resource locks are exclusive and recover after release", async () => {
   }
 });
 
+test("restart recovery makes every interrupted agent phase resumable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-agent-recovery-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const interrupted = ["starting", "running", "reviewing", "revising", "evaluating", "opening_pr"];
+    await store.update((state) => {
+      state.agentRuns = interrupted.map((status, index) => ({
+        id: `agent-${index}`,
+        ideaId: `idea-${index}`,
+        status,
+        branch: `branch-${index}`,
+        worktree: root,
+        startedAt: timestamp,
+        deltas: [],
+        resources: [],
+        reviewRounds: [],
+      }));
+      state.ideas = interrupted.map((_status, index) => ({
+        id: `idea-${index}`,
+        title: `Idea ${index}`,
+        description: "Recover me",
+        rationale: "Test",
+        predictedImpact: 1,
+        evaluationIds: [],
+        resources: [],
+        status: "running",
+        source: "manual",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }));
+    });
+    const recovered = new StateStore(root);
+    await recovered.init();
+    assert.deepEqual(recovered.get().agentRuns.map((run) => run.status), interrupted.map(() => "failed"));
+    assert.ok(recovered.get().agentRuns.every((run) => run.error === "Burner stopped before this run completed."));
+    assert.ok(recovered.get().ideas.every((idea) => idea.status === "failed"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("compiled server serves the API and closes connected event streams", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-server-test-"));
   const burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0 });

@@ -87,7 +87,7 @@ export class StateStore {
       this.migrate();
       this.state.orchestrator.enabled = false;
       for (const run of this.state.agentRuns) {
-        if (["starting", "running", "evaluating", "opening_pr"].includes(run.status)) {
+        if (["starting", "running", "reviewing", "revising", "evaluating", "opening_pr"].includes(run.status)) {
           run.status = "failed";
           run.error = "Burner stopped before this run completed.";
           run.completedAt = now();
