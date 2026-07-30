@@ -8,7 +8,7 @@ import { StateStore, validateEvaluation } from "./lib/store.js";
 import { errorMessage, id, now } from "./lib/utils.js";
 import type { BurnerSettings, Idea } from "./types.js";
 
-const VERSION = "0.5.2";
+const VERSION = "0.6.0";
 const colors = {
   fire: (value: string) => `\x1b[38;2;255;107;53m${value}\x1b[0m`,
   cyan: (value: string) => `\x1b[36m${value}\x1b[0m`,
@@ -42,6 +42,7 @@ Server options:
   -p, --port <port>       port to listen on (default: 4321)
   --host <host>           host to bind (default: 127.0.0.1)
   --no-open               do not open a browser
+  --yolo                  autonomously run, open, and merge monotonic PRs
 
 Command options:
   -C, --directory <path>  target repository (default: current directory)
@@ -231,16 +232,18 @@ function parseServerArgs(argv: string[]) {
   let host = "127.0.0.1";
   let port = "4321";
   let shouldOpen = true;
+  let yolo = false;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--no-open") { shouldOpen = false; continue; }
+    if (arg === "--yolo") { yolo = true; continue; }
     if (arg === "--dev") continue;
     if (arg === "--host") { host = argv[++index] ?? host; continue; }
     if (arg === "--port" || arg === "-p") { port = argv[++index] ?? port; continue; }
     if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
     directory = arg;
   }
-  return { directory, host, port, shouldOpen };
+  return { directory, host, port, shouldOpen, yolo };
 }
 
 function openBrowser(url: string): void {
@@ -263,12 +266,13 @@ async function main(): Promise<void> {
   if (!new Set(["127.0.0.1", "localhost", "::1"]).has(options.host)) throw new Error("Burner only binds to the local machine. Use 127.0.0.1, localhost, or ::1.");
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Port must be an integer between 1 and 65535.");
 
-  const burner = await createBurnerServer({ root, host: options.host, port });
+  const burner = await createBurnerServer({ root, host: options.host, port, yolo: options.yolo });
   const url = `http://${options.host}:${port}`;
   console.log(`\n${colors.fire("  ◉ BURNER")}\n${colors.dim("  Evaluation-driven repo improvement, running locally.")}\n`);
   console.log(`  ${colors.dim("Project")}  ${root}`);
   console.log(`  ${colors.dim("Control")}  ${colors.cyan(url)}\n`);
   console.log(colors.red("  ⚠ Codex agents have unrestricted filesystem and command access as your user.\n"));
+  if (options.yolo) console.log(colors.red("  ⚠ YOLO autopilot is active: Burner may open and merge approved, monotonic PRs.\n"));
   console.log(colors.dim("  Press Ctrl+C to cool down.\n"));
   if (options.shouldOpen) openBrowser(url);
 

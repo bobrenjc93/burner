@@ -131,6 +131,7 @@ export function App() {
           ))}
         </nav>
         <div className="sidebar-bottom">
+          {dashboard.runtime.yolo && <div className="health-line"><span className="health-dot warn" /> YOLO auto-merge active</div>}
           <div className="health-line"><span className={dashboard.runtime.codex.available ? "health-dot on" : "health-dot"} /> Codex {dashboard.runtime.codex.available ? "connected" : "missing"}</div>
           <div className="health-line"><span className={dashboard.runtime.gh.authenticated ? "health-dot on" : "health-dot warn"} /> GitHub {dashboard.runtime.gh.authenticated ? "ready" : "not authenticated"}</div>
           <p>Burner stays on this machine.</p>
@@ -142,6 +143,7 @@ export function App() {
           <button className="icon-btn mobile-only" onClick={() => setSidebar(true)}><Menu size={19} /></button>
           <div className="breadcrumb"><span>Burner</span><ChevronRight size={14} /><strong>{nav.find((item) => item.id === tab)?.label}</strong></div>
           <div className="top-actions">
+            {dashboard.runtime.yolo && <span className="yolo-pill"><Zap size={13} /> YOLO auto-merge</span>}
             {dashboard.runtime.runningAgents > 0 && <span className="running-pill"><LoaderCircle size={13} className="spin" /> {dashboard.runtime.runningAgents} agent{dashboard.runtime.runningAgents === 1 ? "" : "s"}</span>}
             <button
               className={running ? "button button-quiet" : "button button-fire"}
@@ -154,6 +156,7 @@ export function App() {
         </header>
 
         <div className="page">
+          {dashboard.runtime.yolo && <div className="yolo-banner"><Zap size={17} /><span><strong>YOLO autopilot is active</strong> Burner may autonomously open and merge one current-base PR at a time after reviewer approval, complete evaluation coverage, positive weighted impact, and zero regressions.</span></div>}
           <div className="security-banner"><ShieldCheck size={17} /><span><strong>Unrestricted Codex agents</strong> Authors, revisions, reviewers, planners, prompt evaluators, and composite integrators can read and write anywhere and run commands as your user. Command-backed evaluations are separate direct local subprocesses.</span></div>
           {error && <div className="error-banner"><CircleDot size={16} /><span>{error}</span><button onClick={() => setError(undefined)}><X size={15} /></button></div>}
           {tab === "overview" && (
@@ -370,6 +373,7 @@ function Settings({ dashboard, onSaved, setError }: { dashboard: DashboardPayloa
           <div className="form-grid"><Field label="Parallel agents" hint="Defaults to 1 for slow, monotonic progress"><input type="number" min={1} max={12} value={form.parallelism} onChange={(event) => change("parallelism", Number(event.target.value))} /></Field><Field label="Review safety limit" hint="Maximum author/reviewer rounds before stopping"><input type="number" min={1} max={50} value={form.maxReviewRounds} onChange={(event) => change("maxReviewRounds", Number(event.target.value))} /></Field><Field label="Planning interval" hint="Minutes between orchestrator planning passes"><input type="number" min={1} value={form.orchestratorIntervalMinutes} onChange={(event) => change("orchestratorIntervalMinutes", Number(event.target.value))} /></Field><Field label="Evaluation interval" hint="Minutes between repo baseline refreshes"><input type="number" min={1} value={form.evaluationIntervalMinutes} onChange={(event) => change("evaluationIntervalMinutes", Number(event.target.value))} /></Field><Field label="Absorption threshold" hint="Minimum weighted gain required for a living-line experiment"><input type="number" min={0} max={100} step={0.1} value={form.compositeAbsorbThreshold} onChange={(event) => change("compositeAbsorbThreshold", Number(event.target.value))} /></Field><Field label="Default resource locks" hint="Comma-separated; every agent acquires these"><input value={form.defaultResources.join(", ")} placeholder="e.g. gpu, simulator" onChange={(event) => change("defaultResources", event.target.value.split(",").map((value) => value.trim()).filter(Boolean))} /></Field></div>
           <Toggle checked={form.preferLivingComposite} onChange={(value) => change("preferLivingComposite", value)} label="Evolve the living composite" body="Plan and run new experiments from the selected composite instead of main." />
           <Toggle checked={form.autoRun} onChange={(value) => change("autoRun", value)} label="Ignite automatically on launch" body="Resume the continuous loop whenever Burner starts." />
+          <p className="settings-hint">Start Burner with <code>burner --yolo</code> to ignite immediately and let the orchestrator merge only reviewed, fully evaluated, monotonic PRs.</p>
         </SettingsSection>
         <SettingsSection icon={<Sparkles size={19} />} title="Codex" body="Leave model fields empty to inherit your local Codex configuration.">
           <div className="form-grid"><Field label="Evaluator model"><input value={form.evaluatorModel} placeholder="Use Codex default" onChange={(event) => change("evaluatorModel", event.target.value)} /></Field><Field label="Implementation model"><input value={form.agentModel} placeholder="Use Codex default" onChange={(event) => change("agentModel", event.target.value)} /></Field></div>

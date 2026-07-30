@@ -10,6 +10,9 @@ npm link
 cd /path/to/your/repo
 burner
 # ◉ BURNER → http://127.0.0.1:4321
+
+# Fully autonomous planning, PR creation, and guarded merging:
+burner --yolo
 ```
 
 ## What it does
@@ -78,6 +81,20 @@ burner queue retry -C ./my-project --run agent_12345678
 ```
 
 `queue run-next` is deliberately bounded: it claims the highest-impact queued idea, waits through implementation, the reviewer/author loop, candidate evaluation, and PR delivery, then exits. This makes Burner usable from CI, cron, or a larger local automation script without enabling the continuous timer.
+
+### YOLO autopilot
+
+`burner --yolo` ignites the orchestrator immediately and lets Burner autonomously create and merge pull requests. This is distinct from the unrestricted flag used for Codex agents: Burner always launches Codex without approvals or sandboxing, while the Burner `--yolo` option additionally authorizes the orchestrator to merge on GitHub.
+
+YOLO mode merges at most one candidate at a time, then synchronizes and reevaluates `main` before new work proceeds. A PR is eligible only when it:
+
+- was approved by the final independent review round;
+- has a completed delta for every currently enabled evaluation;
+- has positive weighted impact above the configured absorption threshold;
+- has no evaluation regression; and
+- was built and evaluated from the current base commit.
+
+Approved composites are preferred over their constituent PRs. PRs that fail these gates remain open for inspection; Burner does not quietly weaken the policy. YOLO startup fails unless the root checkout is clean and on the configured base branch, the configured remote exists, Codex supports unrestricted mode, and GitHub CLI authentication is ready.
 
 An evaluation may optionally provide a local command. Burner runs it directly in each evaluated checkout and expects one JSON object on stdout with `score` (0–100), `summary`, `evidence`, and `suggestions`. Command evaluations are useful for deterministic benchmarks and test-derived metrics; they are direct local subprocesses that inherit Burner's permissions and are not `codex exec` invocations, so only configure commands you trust. Evaluations without a command use an unrestricted Codex agent.
 

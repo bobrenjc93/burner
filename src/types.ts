@@ -192,6 +192,7 @@ export type RuntimeStatus = {
   codex: { available: boolean; version?: string };
   git: { available: boolean; branch?: string; commit?: string; dirty?: boolean };
   gh: { available: boolean; authenticated: boolean };
+  yolo: boolean;
   runningEvaluations: number;
   runningAgents: number;
   runningComposites: number;

@@ -8,7 +8,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { Orchestrator } from "../dist/lib/orchestrator.js";
+import { Orchestrator, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
 import { buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
 import { createBurnerServer } from "../dist/server.js";
 import { StateStore, validateEvaluation } from "../dist/lib/store.js";
@@ -42,7 +42,9 @@ test("headless CLI configures evaluations, ideas, and conservative settings as J
   const root = await mkdtemp(join(tmpdir(), "burner-cli-test-"));
   const cli = join(process.cwd(), "dist", "cli.js");
   try {
-    assert.match(await exec(root, "node", [cli, "--help"]), /Codex agents?[\s\S]*unrestricted filesystem and command access/);
+    const help = await exec(root, "node", [cli, "--help"]);
+    assert.match(help, /Codex agents?[\s\S]*unrestricted filesystem and command access/);
+    assert.match(help, /--yolo\s+autonomously run, open, and merge monotonic PRs/);
     assert.deepEqual(JSON.parse(await exec(root, "node", [cli, "eval", "clear", "--yes", "-C", root])), { removed: 3 });
     const evaluation = JSON.parse(await exec(root, "node", [cli, "eval", "add", "-C", root, "--name", "Correctness", "--prompt", "Score correctness out of 100", "--weight", "2"]));
     assert.equal(evaluation.name, "Correctness");
@@ -105,6 +107,8 @@ test("compiled server serves the API and closes connected event streams", async 
     const base = `http://127.0.0.1:${address.port}`;
     const health = await (await fetch(`${base}/api/health`)).json();
     assert.deepEqual(health, { ok: true, project: root.split("/").at(-1) });
+    const dashboard = await (await fetch(`${base}/api/dashboard`)).json();
+    assert.equal(dashboard.runtime.yolo, false);
 
     const created = await fetch(`${base}/api/evaluations`, {
       method: "POST",
@@ -178,6 +182,28 @@ test("PR bodies record review approval and recalculated composite scores", () =>
   assert.match(body, /Composite score: 82\.0 \/ 100/);
   assert.match(body, /#12/);
   assert.match(body, /never inferred by adding individual deltas/);
+});
+
+test("YOLO merge selection prefers reviewed composites and rejects stale or regressing work", () => {
+  const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
+  const deltas = [
+    { evaluationId: "quality", name: "Quality", before: 70, after: 72, delta: 2 },
+    { evaluationId: "speed", name: "Speed", before: 80, after: 80, delta: 0 },
+  ];
+  const state = {
+    settings: { compositeAbsorbThreshold: 0 },
+    evaluations: [{ id: "quality", enabled: true }, { id: "speed", enabled: true }],
+    composites: [{ id: "composite", status: "open", prNumber: 20, baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], deltas, impact: 1, sources: [{ agentRunId: "agent", kind: "pull_request" }] }],
+    agentRuns: [{ id: "agent", status: "completed", prState: "open", prNumber: 10, baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], deltas, impact: 5 }],
+  };
+  assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "composite", id: "composite", prNumber: 20, impact: 1 });
+  state.composites[0].status = "closed";
+  assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "agent", prNumber: 10, impact: 5 });
+  assert.equal(selectYoloMergeCandidate(state, "new-base"), undefined);
+  state.agentRuns[0].deltas = [{ ...deltas[0], delta: -0.1 }, deltas[1]];
+  assert.equal(selectYoloMergeCandidate(state, "base"), undefined);
+  state.agentRuns[0].deltas = [deltas[0]];
+  assert.equal(selectYoloMergeCandidate(state, "base"), undefined);
 });
 
 test("every Codex role and structured fallback uses unrestricted mode with correct flag placement", async () => {

@@ -16,6 +16,54 @@ type AgentBase = {
   compositeId?: string;
 };
 
+export type YoloMergeCandidate = { kind: "agent" | "composite"; id: string; prNumber: number; impact: number };
+
+function isMonotonicCandidate(
+  deltas: ScoreDelta[],
+  impact: number | undefined,
+  enabledEvaluationIds: Set<string>,
+  threshold: number,
+): impact is number {
+  if (!Number.isFinite(impact) || impact! <= threshold) return false;
+  const byEvaluation = new Map(deltas.map((delta) => [delta.evaluationId, delta]));
+  return [...enabledEvaluationIds].every((evaluationId) => {
+    const delta = byEvaluation.get(evaluationId)?.delta;
+    return Number.isFinite(delta) && delta! >= 0;
+  });
+}
+
+export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string): YoloMergeCandidate | undefined {
+  const enabledEvaluationIds = new Set(state.evaluations.filter((evaluation) => evaluation.enabled).map((evaluation) => evaluation.id));
+  if (!enabledEvaluationIds.size) return undefined;
+  const threshold = state.settings.compositeAbsorbThreshold;
+  const approved = (reviewApproved: boolean | undefined, rounds: ReviewRound[]) => reviewApproved === true && rounds.at(-1)?.approved === true;
+  const composites = state.composites
+    .filter((composite) =>
+      composite.status === "open" &&
+      composite.prNumber !== undefined &&
+      composite.baseCommit === baseCommit &&
+      approved(composite.reviewApproved, composite.reviewRounds) &&
+      isMonotonicCandidate(composite.deltas, composite.impact, enabledEvaluationIds, threshold))
+    .map((composite) => ({ kind: "composite" as const, id: composite.id, prNumber: composite.prNumber!, impact: composite.impact! }))
+    .sort((a, b) => b.impact - a.impact);
+  if (composites[0]) return composites[0];
+
+  const compositeSourceIds = new Set(state.composites
+    .filter((composite) => !["merged", "closed", "failed"].includes(composite.status))
+    .flatMap((composite) => composite.sources.map((source) => source.agentRunId)));
+  return state.agentRuns
+    .filter((run) =>
+      run.status === "completed" &&
+      run.prState === "open" &&
+      run.prNumber !== undefined &&
+      run.baseCommit === baseCommit &&
+      !compositeSourceIds.has(run.id) &&
+      approved(run.reviewApproved, run.reviewRounds) &&
+      isMonotonicCandidate(run.deltas, run.impact, enabledEvaluationIds, threshold))
+    .map((run) => ({ kind: "agent" as const, id: run.id, prNumber: run.prNumber!, impact: run.impact! }))
+    .sort((a, b) => b.impact - a.impact)[0];
+}
+
 export class Orchestrator {
   private readonly git: GitService;
   private readonly locks: LockManager;
@@ -27,12 +75,15 @@ export class Orchestrator {
   private runningEvaluations = 0;
   private lastPrSyncAt = 0;
   private runtimeCache?: { value: RuntimeStatus; expires: number };
+  private readonly yolo: boolean;
 
   constructor(
     private readonly root: string,
     private readonly store: StateStore,
     private readonly events: EventHub,
+    options: { yolo?: boolean } = {},
   ) {
+    this.yolo = Boolean(options.yolo);
     this.git = new GitService(root, store.dataDir);
     this.locks = new LockManager(join(store.dataDir, "locks"));
     this.codex = new CodexClient((message) => {
@@ -56,9 +107,10 @@ export class Orchestrator {
         });
       }
     }
+    if (this.yolo) await this.preflightYolo();
     this.timer = setInterval(() => void this.tick(), 5_000);
     this.timer.unref();
-    if (this.store.get().settings.autoRun) await this.setEnabled(true);
+    if (this.store.get().settings.autoRun || this.yolo) await this.setEnabled(true);
   }
 
   async close(): Promise<void> {
@@ -75,10 +127,45 @@ export class Orchestrator {
     await this.store.addActivity({
       type: "system",
       message: enabled ? "Orchestrator ignited" : "Orchestrator paused",
-      detail: enabled ? "Burner is watching evaluations and dispatching queued work." : "Running agents will finish; new work will not start.",
+      detail: enabled
+        ? this.yolo ? "YOLO autopilot is evaluating, dispatching, opening, and autonomously merging monotonic work." : "Burner is watching evaluations and dispatching queued work."
+        : "Running agents will finish; new work will not start.",
     });
     this.events.emit("state", this.store.get());
     if (enabled) void this.tick(true);
+  }
+
+  private async preflightYolo(): Promise<void> {
+    const settings = this.store.get().settings;
+    const status = await this.git.status();
+    if (!status.available || !status.commit) throw new Error("Burner --yolo requires a git repository with at least one commit.");
+    if (status.branch !== settings.baseBranch) throw new Error(`Burner --yolo requires the root checkout on '${settings.baseBranch}' so merged work can be synchronized.`);
+    if (status.dirty) throw new Error("Burner --yolo requires a clean root checkout.");
+    if (!(await this.git.remoteExists(settings.remote))) throw new Error(`Burner --yolo requires git remote '${settings.remote}'.`);
+    if (!(await commandExists("gh", this.root))) throw new Error("Burner --yolo requires the GitHub CLI.");
+    const ghAuth = await runCommand("gh", ["auth", "status"], { cwd: this.root, timeoutMs: 8_000 });
+    if (ghAuth.exitCode !== 0) throw new Error("Burner --yolo requires an authenticated GitHub CLI.");
+    await this.codex.preflight(this.root);
+    await this.store.addActivity({
+      type: "system",
+      message: "YOLO autopilot enabled",
+      detail: "Burner will merge one current-base PR at a time only after reviewer approval, complete evaluations, positive weighted impact, and zero evaluation regressions.",
+    });
+  }
+
+  private async autoMergeNext(): Promise<boolean> {
+    const state = this.store.get();
+    const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
+    const candidate = selectYoloMergeCandidate(state, baseCommit);
+    if (!candidate) return false;
+    await this.store.addActivity({
+      type: "pr",
+      message: `YOLO approved PR #${candidate.prNumber} for merge`,
+      detail: `Reviewer approved; all enabled evaluations completed without regression; weighted impact +${candidate.impact.toFixed(1)}.`,
+    });
+    if (candidate.kind === "composite") await this.mergeComposite(candidate.id);
+    else await this.mergeAgent(candidate.id);
+    return true;
   }
 
   async runCycle(): Promise<void> {
@@ -137,7 +224,8 @@ export class Orchestrator {
       this.activeAgents.delete(idea.id);
       this.runtimeCache = undefined;
       this.events.emit("state", this.store.get());
-      void this.scheduleComposites(true);
+      if (this.yolo && this.store.get().orchestrator.enabled) void this.tick(true);
+      else void this.scheduleComposites(true);
     }
     return this.store.get().agentRuns.find((item) => item.id === run.id)!;
   }
@@ -276,6 +364,7 @@ export class Orchestrator {
       codex: { available: codexAvailable, version: codexVersion },
       git,
       gh: { available: ghAvailable, authenticated: ghAuthenticated },
+      yolo: this.yolo,
       runningEvaluations: this.runningEvaluations,
       runningAgents: this.activeAgents.size,
       runningComposites: this.activeComposites.size,
@@ -483,6 +572,7 @@ export class Orchestrator {
       await this.syncPullRequests();
       const initial = this.store.get();
       if (!initial.orchestrator.enabled && !force) return;
+      if (this.yolo && this.runningEvaluations === 0 && this.activeAgents.size === 0 && this.activeComposites.size === 0 && await this.autoMergeNext()) return;
       const settings = initial.settings;
       const evaluationDue =
         force ||
@@ -684,8 +774,11 @@ export class Orchestrator {
       this.activeAgents.delete(idea.id);
       this.runtimeCache = undefined;
       this.events.emit("state", this.store.get());
-      if (this.store.get().orchestrator.enabled) void this.schedule();
-      void this.scheduleComposites(true);
+      if (this.store.get().orchestrator.enabled) {
+        if (this.yolo) void this.tick(true);
+        else void this.schedule();
+      }
+      if (!this.yolo || !this.store.get().orchestrator.enabled) void this.scheduleComposites(true);
       void heldLocks;
     }
   }
@@ -724,7 +817,7 @@ export class Orchestrator {
       return;
     }
     let pr: { url: string; number?: number } | undefined;
-    if (settings.autoCreatePrs) {
+    if (settings.autoCreatePrs || this.yolo) {
       if (await this.git.resolveRef(base.ref) !== base.commit) throw new Error("The base branch moved during evaluation. Retry this idea to recalculate against the new main.");
       await this.updateAgent(runId, { status: "opening_pr" });
       if (!(await this.git.remoteExists(settings.remote))) throw new Error(`Git remote '${settings.remote}' does not exist.`);
@@ -760,7 +853,8 @@ export class Orchestrator {
       this.activeComposites.delete(next.id);
       this.runtimeCache = undefined;
       this.events.emit("state", this.store.get());
-      void this.scheduleComposites(true);
+      if (this.yolo && this.store.get().orchestrator.enabled) void this.tick(true);
+      else void this.scheduleComposites(true);
     });
   }
 
