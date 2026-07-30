@@ -43,6 +43,13 @@ function yoloEvaluationSets(state: BurnerState): { enabled: Set<string>; command
   };
 }
 
+export function inferIdeaResources(idea: Pick<Idea, "title" | "description" | "rationale">): string[] {
+  const text = `${idea.title} ${idea.description} ${idea.rationale}`;
+  return /\b(?:benchmarks?|performance|profil(?:e|er|ing)|load[ -]?tests?|stress[ -]?tests?)\b/i.test(text)
+    ? ["cpu-heavy"]
+    : [];
+}
+
 function reservedCompositeSourceIds(state: BurnerState): Set<string> {
   return new Set(state.composites
     .filter((composite) => !["merged", "closed"].includes(composite.status))
@@ -255,7 +262,7 @@ export class Orchestrator {
     const idea = state.ideas.filter((item) => item.status === "queued").sort((a, b) => b.predictedImpact - a.predictedImpact)[0];
     if (!idea) throw new Error("No queued ideas are available.");
     const base = await this.resolveAgentBase(idea, state);
-    const resources = [...new Set([...state.settings.defaultResources, ...idea.resources, ...(base.compositeId ? [`living-${base.compositeId}`] : [])])];
+    const resources = [...new Set([...state.settings.defaultResources, ...idea.resources, ...inferIdeaResources(idea), ...(base.compositeId ? [`living-${base.compositeId}`] : [])])];
     const lease = await this.locks.tryAcquireAll(resources, idea.id);
     if (!lease) throw new Error("A required resource is currently locked.");
     this.activeAgents.add(idea.id);
@@ -860,7 +867,7 @@ export class Orchestrator {
       if (started >= capacity) break;
       let base: AgentBase;
       try { base = await this.resolveAgentBase(idea, state); } catch { continue; }
-      const resources = [...new Set([...state.settings.defaultResources, ...idea.resources, ...(base.compositeId ? [`living-${base.compositeId}`] : [])])];
+      const resources = [...new Set([...state.settings.defaultResources, ...idea.resources, ...inferIdeaResources(idea), ...(base.compositeId ? [`living-${base.compositeId}`] : [])])];
       const lease = await this.locks.tryAcquireAll(resources, idea.id);
       if (!lease) continue;
       started += 1;

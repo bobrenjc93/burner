@@ -8,7 +8,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { Orchestrator, selectYoloLeafBatch, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
+import { inferIdeaResources, Orchestrator, selectYoloLeafBatch, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
 import { buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
 import { createBurnerServer } from "../dist/server.js";
 import { StateStore, validateEvaluation } from "../dist/lib/store.js";
@@ -31,6 +31,12 @@ test("score helpers clamp and weight enabled evaluations", () => {
     { id: "paused", weight: 10, enabled: false },
   ];
   assert.equal(weightedScore(evaluations, new Map([["quality", 80], ["speed", 50], ["paused", 0]])), 70);
+});
+
+test("benchmark-oriented ideas conservatively infer the shared CPU resource", () => {
+  assert.deepEqual(inferIdeaResources({ title: "Emit benchmark evidence", description: "Prove results", rationale: "Integrity" }), ["cpu-heavy"]);
+  assert.deepEqual(inferIdeaResources({ title: "Profile grouped queries", description: "Find hot paths", rationale: "Speed" }), ["cpu-heavy"]);
+  assert.deepEqual(inferIdeaResources({ title: "Improve SQL docs", description: "Add examples", rationale: "Clarity" }), []);
 });
 
 test("structured output parser tolerates a fenced preamble", () => {
