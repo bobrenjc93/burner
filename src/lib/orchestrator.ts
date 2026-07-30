@@ -110,6 +110,7 @@ export class Orchestrator {
   private runtimeCache?: { value: RuntimeStatus; expires: number };
   private readonly yolo: boolean;
   private readonly yoloBatchSize: number;
+  private portfolioDraining = false;
 
   constructor(
     private readonly root: string,
@@ -223,7 +224,26 @@ export class Orchestrator {
       `Automatically master-cooked from ${leafIds.length} independently authored, reviewed, and evaluated leaf pull requests on ${state.settings.baseBranch.slice(0, 80)}.`,
       { makeLiving: false },
     );
+    this.portfolioDraining = false;
     return true;
+  }
+
+  private async shouldDrainForPortfolio(): Promise<boolean> {
+    if (!this.yolo || this.yoloBatchSize < 2 || this.activeAgents.size === 0 || this.activeComposites.size > 0) return false;
+    const state = this.store.get();
+    const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
+    const ready = selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize).length === this.yoloBatchSize;
+    if (ready && !this.portfolioDraining) {
+      this.portfolioDraining = true;
+      await this.store.addActivity({
+        type: "pr",
+        message: "Portfolio batch ready; draining active agents",
+        detail: `${this.yoloBatchSize} eligible leaves are reserved for the next composite. No replacement agents will start until the current ${this.activeAgents.size} finish.`,
+      });
+    } else if (!ready) {
+      this.portfolioDraining = false;
+    }
+    return ready;
   }
 
   async runCycle(): Promise<void> {
@@ -316,7 +336,11 @@ export class Orchestrator {
         const started = Date.now();
         await this.store.update((draft) => draft.evaluationRuns.push(run));
         this.events.emit("evaluation", { id: run.id, status: "running", evaluationId: evaluation.id });
+        let commandLock: HeldLock | undefined;
         try {
+          if (evaluation.command) {
+            commandLock = await this.locks.acquire(`command-evaluation-${evaluation.id}`, run.id, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
+          }
           const output = await this.codex.evaluate(cwd, evaluation, state.settings, context);
           Object.assign(run, output, { status: "completed" as const, durationMs: Date.now() - started });
           await this.store.update((draft) => {
@@ -331,6 +355,8 @@ export class Orchestrator {
             if (current) Object.assign(current, run);
           });
           this.events.emit("evaluation", { id: run.id, status: "failed", error: run.error });
+        } finally {
+          await commandLock?.release();
         }
         return run;
       });
@@ -365,8 +391,7 @@ export class Orchestrator {
     let planningWorktree = "";
     if (living) {
       const planningRef = await this.git.fetchBranch(state.settings.remote, living.branch);
-      const gitLock = await this.locks.tryAcquire("git-metadata", `plan-${living.id}`);
-      if (!gitLock) throw new Error("Git metadata is busy; retry planning shortly.");
+      const gitLock = await this.locks.acquire("git-metadata", `plan-${living.id}`);
       try {
         planningWorktree = await this.git.createDetachedWorktree(id("planning"), planningRef);
         planningCwd = planningWorktree;
@@ -379,10 +404,8 @@ export class Orchestrator {
       planned = await this.codex.planIdeas(planningCwd, evaluations, latest, state.ideas, state.settings);
     } finally {
       if (planningWorktree) {
-        const cleanupLock = await this.locks.tryAcquire("git-metadata", `plan-cleanup-${living?.id}`);
-        if (cleanupLock) {
-          try { await this.git.removeWorktree(planningWorktree); } finally { await cleanupLock.release(); }
-        }
+        const cleanupLock = await this.locks.acquire("git-metadata", `plan-cleanup-${living?.id}`);
+        try { await this.git.removeWorktree(planningWorktree); } finally { await cleanupLock.release(); }
       }
     }
     const created: Idea[] = planned
@@ -685,6 +708,7 @@ export class Orchestrator {
         if (await this.autoMergeNext()) return;
         if (await this.autoCookNext()) return;
       }
+      if (await this.shouldDrainForPortfolio()) return;
       const settings = initial.settings;
       const evaluationDue =
         force ||
@@ -798,6 +822,7 @@ export class Orchestrator {
   private async schedule(): Promise<void> {
     const state = this.store.get();
     if (!state.orchestrator.enabled) return;
+    if (await this.shouldDrainForPortfolio()) return;
     if (this.yolo && this.yoloBatchSize > 1 && state.composites.some((composite) => ["queued", "building", "reviewing", "revising", "evaluating", "rebuilding"].includes(composite.status))) return;
     const configuredLiving = state.orchestrator.livingCompositeId ? state.composites.find((item) => item.id === state.orchestrator.livingCompositeId) : undefined;
     if (!(this.yolo && this.yoloBatchSize > 1) && state.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") return;
@@ -861,8 +886,7 @@ export class Orchestrator {
       const enabledEvaluations = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
       const missingBaseline = enabledEvaluations.find((evaluation) => baseline.get(evaluation.id)?.commit !== baseCommit);
       if (missingBaseline) throw new Error(`Refresh evaluations at ${base.ref} before dispatching; '${missingBaseline.name}' is missing a comparable score.`);
-      const gitLock = await this.locks.tryAcquire("git-metadata", runId);
-      if (!gitLock) throw new Error("Git metadata is busy; retry this idea in a moment.");
+      const gitLock = await this.locks.acquire("git-metadata", runId);
       try {
         worktree = await this.git.createWorktree(runId, branch, base.ref);
       } finally {
@@ -954,10 +978,8 @@ export class Orchestrator {
     await this.finishIdea(idea.id, "completed");
     await this.store.addActivity({ type: pr ? "pr" : "agent", message: pr ? `PR opened: ${idea.title}` : `Agent completed: ${idea.title}`, detail: pr?.url ?? `Measured impact: ${impact >= 0 ? "+" : ""}${impact.toFixed(1)}` });
     if (pr) {
-      const cleanupLock = await this.locks.tryAcquire("git-metadata", `${runId}-cleanup`);
-      if (cleanupLock) {
-        try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
-      }
+      const cleanupLock = await this.locks.acquire("git-metadata", `${runId}-cleanup`);
+      try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
     }
     this.events.emit("agent", { runId, status: "completed", prUrl: pr?.url, impact });
   }
@@ -998,8 +1020,7 @@ export class Orchestrator {
       if (missing) throw new Error(`Run a clean baseline at ${settings.baseBranch} before building the composite; '${missing.name}' is stale.`);
       await this.updateComposite(compositeId, { status: rebuild ? "rebuilding" : "building", baseCommit, error: undefined, updatedAt: now() });
 
-      const gitLock = await this.locks.tryAcquire("git-metadata", `${compositeId}-create`);
-      if (!gitLock) throw new Error("Git metadata is busy; retry the composite shortly.");
+      const gitLock = await this.locks.acquire("git-metadata", `${compositeId}-create`);
       try {
         worktree = rebuild
           ? incremental
@@ -1069,17 +1090,13 @@ export class Orchestrator {
       await this.updateComposite(compositeId, { status: "open", deltas, impact, compositeScore, reviewApproved: true, rebuildMode: undefined, pendingExperimentRunIds: [], checkpointBranch, error: undefined, updatedAt: now() });
       await this.ensureLivingComposite();
       await this.store.addActivity({ type: "pr", message: rebuild ? `Composite rebuilt: ${composite.title}` : `Composite opened: ${composite.title}`, detail: `Recalculated score ${compositeScore.toFixed(1)} (${impact >= 0 ? "+" : ""}${impact.toFixed(1)} impact).` });
-      const cleanupLock = await this.locks.tryAcquire("git-metadata", `${compositeId}-cleanup`);
-      if (cleanupLock) {
-        try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
-      }
+      const cleanupLock = await this.locks.acquire("git-metadata", `${compositeId}-cleanup`);
+      try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
     } catch (error) {
       const message = errorMessage(error);
       if (worktree) {
-        const cleanupLock = await this.locks.tryAcquire("git-metadata", `${compositeId}-failed-cleanup`);
-        if (cleanupLock) {
-          try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
-        }
+        const cleanupLock = await this.locks.acquire("git-metadata", `${compositeId}-failed-cleanup`);
+        try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
       }
       const baseMoved = message.startsWith("BASE_CHANGED:");
       const currentMode = this.store.get().composites.find((item) => item.id === compositeId)?.rebuildMode;

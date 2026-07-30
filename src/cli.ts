@@ -8,7 +8,7 @@ import { StateStore, validateEvaluation } from "./lib/store.js";
 import { errorMessage, id, now } from "./lib/utils.js";
 import type { BurnerSettings, Idea } from "./types.js";
 
-const VERSION = "0.7.0";
+const VERSION = "0.7.1";
 const colors = {
   fire: (value: string) => `\x1b[38;2;255;107;53m${value}\x1b[0m`,
   cyan: (value: string) => `\x1b[36m${value}\x1b[0m`,

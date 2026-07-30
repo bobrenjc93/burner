@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { errorMessage, now } from "./utils.js";
 
 export type HeldLock = { name: string; release: () => Promise<void> };
+export type AcquireOptions = { timeoutMs?: number; pollMs?: number };
 
 export class LockManager {
   constructor(private readonly lockDir: string, private readonly staleMs = 6 * 60 * 60 * 1000) {}
@@ -42,6 +43,18 @@ export class LockManager {
         }
       }
       return undefined;
+    }
+  }
+
+  async acquire(name: string, owner: string, options: AcquireOptions = {}): Promise<HeldLock> {
+    const timeoutMs = options.timeoutMs ?? 2 * 60 * 1000;
+    const pollMs = Math.max(10, options.pollMs ?? 100);
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const lock = await this.tryAcquire(name, owner);
+      if (lock) return lock;
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for resource lock '${name}'.`);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(1, deadline - Date.now()))));
     }
   }
 

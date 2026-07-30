@@ -89,8 +89,12 @@ test("resource locks are exclusive and recover after release", async () => {
     assert.ok(first);
     assert.equal(await locks.tryAcquire("gpu", "agent-two"), undefined);
     assert.deepEqual(await locks.list(), ["gpu"]);
+    let waiterSettled = false;
+    const waiting = locks.acquire("gpu", "agent-two", { timeoutMs: 1_000, pollMs: 10 }).then((lock) => { waiterSettled = true; return lock; });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(waiterSettled, false);
     await first.release();
-    const second = await locks.tryAcquire("gpu", "agent-two");
+    const second = await waiting;
     assert.ok(second);
     await second.release();
     await writeFile(join(root, "orphan.lock"), JSON.stringify({ pid: 2_147_483_647, createdAt: new Date().toISOString() }));
@@ -257,6 +261,71 @@ test("YOLO portfolio automatically cooks a complete batch without creating a liv
     assert.deepEqual(request[3], { makeLiving: false });
     assert.equal(store.get().orchestrator.livingCompositeId, undefined);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("YOLO portfolio drains active agents instead of refilling slots when a batch is ready", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-drain-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    const leaf = (id, number) => ({ id, ideaId: `idea-${id}`, status: "completed", branch: `branch-${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp, prUrl: `https://example.test/pull/${number}`, prNumber: number, prState: "open", baseCommit: "base", deltas: [{ evaluationId: "speed", name: "Speed", before: 80, after: 81, delta: 1 }], impact: 1, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
+    await store.update((state) => {
+      state.settings.parallelism = 5;
+      state.orchestrator.enabled = true;
+      state.evaluations = [{ id: "speed", name: "Speed", prompt: "Measure speed", command: "./benchmark", weight: 1, enabled: true, createdAt: timestamp }];
+      state.agentRuns = [leaf("a", 1), leaf("b", 2)];
+      state.ideas.push({ id: "queued", title: "Do more", description: "More work", rationale: "Improve", predictedImpact: 10, evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "manual" });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    orchestrator.activeAgents.add("already-running");
+    let dispatched = false;
+    orchestrator.runIdea = async () => { dispatched = true; };
+    await orchestrator.schedule();
+    assert.equal(dispatched, false);
+    assert.equal(orchestrator.portfolioDraining, true);
+    assert.match(store.get().activity[0].message, /batch ready; draining active agents/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("command-backed evaluations are serialized across concurrent candidates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-command-serialization-test-"));
+  const evaluator = join(root, "evaluate");
+  const mutex = join(root, "command-running");
+  const overlap = join(root, "overlap-detected");
+  try {
+    await exec(root, "git", ["init", "-b", "main"]);
+    await writeFile(join(root, "README.md"), "test\n");
+    await exec(root, "git", ["add", "README.md"]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "base"]);
+    await writeFile(evaluator, `#!/bin/sh\nif ! mkdir "$BURNER_TEST_EVAL_MUTEX" 2>/dev/null; then\n  printf overlap > "$BURNER_TEST_EVAL_OVERLAP"\n  exit 9\nfi\ntrap 'rmdir "$BURNER_TEST_EVAL_MUTEX" 2>/dev/null || true' EXIT\nsleep 0.3\nprintf '%s\\n' '{"score":50,"summary":"serialized","evidence":[],"suggestions":[]}'\n`);
+    await chmod(evaluator, 0o755);
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.settings.parallelism = 5;
+      state.evaluations = [{ id: "benchmark", name: "Benchmark", prompt: "Measure", command: evaluator, weight: 1, enabled: true, createdAt: timestamp }];
+    });
+    process.env.BURNER_TEST_EVAL_MUTEX = mutex;
+    process.env.BURNER_TEST_EVAL_OVERLAP = overlap;
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    await orchestrator.locks.init();
+    const [first, second] = await Promise.all([
+      orchestrator.runEvaluations("agent", root, "agent-a"),
+      orchestrator.runEvaluations("agent", root, "agent-b"),
+    ]);
+    assert.deepEqual([...first, ...second].map((run) => run.status), ["completed", "completed"]);
+    await assert.rejects(() => readFile(overlap, "utf8"), /ENOENT/);
+  } finally {
+    delete process.env.BURNER_TEST_EVAL_MUTEX;
+    delete process.env.BURNER_TEST_EVAL_OVERLAP;
     await rm(root, { recursive: true, force: true });
   }
 });
