@@ -179,7 +179,7 @@ export class Orchestrator {
         : "Running agents will finish; new work will not start.",
     });
     this.events.emit("state", this.store.get());
-    if (enabled) void this.tick(true);
+    if (enabled) void this.tick(false);
   }
 
   private async preflightYolo(): Promise<void> {

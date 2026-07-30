@@ -45,6 +45,22 @@ test("benchmark-oriented ideas conservatively infer the shared CPU resource", ()
   assert.deepEqual(inferIdeaResources({ title: "Improve SQL docs", description: "Add examples", rationale: "Clarity" }), []);
 });
 
+test("resuming the orchestrator does not force a redundant fresh baseline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-resume-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    const forced = [];
+    orchestrator.tick = async (force) => { forced.push(force); };
+    await orchestrator.setEnabled(true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(forced, [false]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("structured output parser tolerates a fenced preamble", () => {
   assert.deepEqual(parseJsonObject("result follows\n{\"score\": 88}\nthanks"), { score: 88 });
   assert.equal(slugify("Polish the first-run UX!"), "polish-the-first-run-ux");
