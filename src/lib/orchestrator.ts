@@ -18,22 +18,25 @@ type AgentBase = {
 
 export type YoloMergeCandidate = { kind: "agent" | "composite"; id: string; prNumber: number; impact: number };
 
-function isMonotonicCandidate(
+function isYoloCandidate(
   deltas: ScoreDelta[],
   impact: number | undefined,
   enabledEvaluationIds: Set<string>,
+  commandEvaluationIds: Set<string>,
   threshold: number,
 ): impact is number {
   if (!Number.isFinite(impact) || impact! <= threshold) return false;
   const byEvaluation = new Map(deltas.map((delta) => [delta.evaluationId, delta]));
-  return [...enabledEvaluationIds].every((evaluationId) => {
+  const complete = [...enabledEvaluationIds].every((evaluationId) => {
     const delta = byEvaluation.get(evaluationId)?.delta;
-    return Number.isFinite(delta) && delta! >= 0;
+    return Number.isFinite(delta);
   });
+  return complete && [...commandEvaluationIds].every((evaluationId) => byEvaluation.get(evaluationId)!.delta! >= 0);
 }
 
 export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string): YoloMergeCandidate | undefined {
   const enabledEvaluationIds = new Set(state.evaluations.filter((evaluation) => evaluation.enabled).map((evaluation) => evaluation.id));
+  const commandEvaluationIds = new Set(state.evaluations.filter((evaluation) => evaluation.enabled && evaluation.command).map((evaluation) => evaluation.id));
   if (!enabledEvaluationIds.size) return undefined;
   const threshold = state.settings.compositeAbsorbThreshold;
   const approved = (reviewApproved: boolean | undefined, rounds: ReviewRound[]) => reviewApproved === true && rounds.at(-1)?.approved === true;
@@ -43,7 +46,7 @@ export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string)
       composite.prNumber !== undefined &&
       composite.baseCommit === baseCommit &&
       approved(composite.reviewApproved, composite.reviewRounds) &&
-      isMonotonicCandidate(composite.deltas, composite.impact, enabledEvaluationIds, threshold))
+      isYoloCandidate(composite.deltas, composite.impact, enabledEvaluationIds, commandEvaluationIds, threshold))
     .map((composite) => ({ kind: "composite" as const, id: composite.id, prNumber: composite.prNumber!, impact: composite.impact! }))
     .sort((a, b) => b.impact - a.impact);
   if (composites[0]) return composites[0];
@@ -59,7 +62,7 @@ export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string)
       run.baseCommit === baseCommit &&
       !compositeSourceIds.has(run.id) &&
       approved(run.reviewApproved, run.reviewRounds) &&
-      isMonotonicCandidate(run.deltas, run.impact, enabledEvaluationIds, threshold))
+      isYoloCandidate(run.deltas, run.impact, enabledEvaluationIds, commandEvaluationIds, threshold))
     .map((run) => ({ kind: "agent" as const, id: run.id, prNumber: run.prNumber!, impact: run.impact! }))
     .sort((a, b) => b.impact - a.impact)[0];
 }
@@ -149,7 +152,7 @@ export class Orchestrator {
     await this.store.addActivity({
       type: "system",
       message: "YOLO autopilot enabled",
-      detail: "Burner will merge one current-base PR at a time only after reviewer approval, complete evaluations, positive weighted impact, and zero evaluation regressions.",
+      detail: "Burner will merge one current-base PR at a time only after reviewer approval, complete evaluations, positive weighted impact, and no deterministic command-evaluation regression.",
     });
   }
 
@@ -161,7 +164,7 @@ export class Orchestrator {
     await this.store.addActivity({
       type: "pr",
       message: `YOLO approved PR #${candidate.prNumber} for merge`,
-      detail: `Reviewer approved; all enabled evaluations completed without regression; weighted impact +${candidate.impact.toFixed(1)}.`,
+      detail: `Reviewer approved; all enabled evaluations completed, deterministic checks did not regress, and weighted impact is +${candidate.impact.toFixed(1)}.`,
     });
     if (candidate.kind === "composite") await this.mergeComposite(candidate.id);
     else await this.mergeAgent(candidate.id);
@@ -348,7 +351,7 @@ export class Orchestrator {
     const [git, heldLocks, codexAvailable, ghAvailable] = await Promise.all([
       this.git.status(),
       this.locks.list(),
-      commandExists("codex", this.root),
+      this.codex.available(this.root),
       commandExists("gh", this.root),
     ]);
     let codexVersion: string | undefined;

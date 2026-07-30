@@ -184,7 +184,7 @@ test("PR bodies record review approval and recalculated composite scores", () =>
   assert.match(body, /never inferred by adding individual deltas/);
 });
 
-test("YOLO merge selection prefers reviewed composites and rejects stale or regressing work", () => {
+test("YOLO merge selection prefers reviewed composites and rejects stale or deterministic regressions", () => {
   const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
   const deltas = [
     { evaluationId: "quality", name: "Quality", before: 70, after: 72, delta: 2 },
@@ -192,7 +192,7 @@ test("YOLO merge selection prefers reviewed composites and rejects stale or regr
   ];
   const state = {
     settings: { compositeAbsorbThreshold: 0 },
-    evaluations: [{ id: "quality", enabled: true }, { id: "speed", enabled: true }],
+    evaluations: [{ id: "quality", enabled: true }, { id: "speed", enabled: true, command: "./benchmark" }],
     composites: [{ id: "composite", status: "open", prNumber: 20, baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], deltas, impact: 1, sources: [{ agentRunId: "agent", kind: "pull_request" }] }],
     agentRuns: [{ id: "agent", status: "completed", prState: "open", prNumber: 10, baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], deltas, impact: 5 }],
   };
@@ -201,6 +201,8 @@ test("YOLO merge selection prefers reviewed composites and rejects stale or regr
   assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "agent", prNumber: 10, impact: 5 });
   assert.equal(selectYoloMergeCandidate(state, "new-base"), undefined);
   state.agentRuns[0].deltas = [{ ...deltas[0], delta: -0.1 }, deltas[1]];
+  assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "agent", prNumber: 10, impact: 5 });
+  state.agentRuns[0].deltas = [deltas[0], { ...deltas[1], delta: -0.1 }];
   assert.equal(selectYoloMergeCandidate(state, "base"), undefined);
   state.agentRuns[0].deltas = [deltas[0]];
   assert.equal(selectYoloMergeCandidate(state, "base"), undefined);

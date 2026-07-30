@@ -93,10 +93,10 @@ YOLO mode merges at most one candidate at a time, then synchronizes and reevalua
 - was approved by the final independent review round;
 - has a completed delta for every currently enabled evaluation;
 - has positive weighted impact above the configured absorption threshold;
-- has no evaluation regression; and
+- has no command-backed evaluation regression (prompt scores still contribute to weighted impact); and
 - was built and evaluated from the current base commit.
 
-Approved composites are preferred over their constituent PRs. PRs that fail these gates remain open for inspection; Burner does not quietly weaken the policy. YOLO startup fails unless the root checkout is clean and on the configured base branch, the configured remote exists, Codex supports unrestricted mode, and GitHub CLI authentication is ready.
+Approved composites are preferred over their constituent PRs. Prompt evaluations are intentionally treated as noisy signals rather than hard vetoes; a PR must still have positive weighted impact across all evaluations, while deterministic command-backed regressions always block merging. PRs that fail these gates remain open for inspection. YOLO startup fails unless the root checkout is clean and on the configured base branch, the configured remote exists, Codex supports unrestricted mode, and GitHub CLI authentication is ready.
 
 An evaluation may optionally provide a local command. Burner runs it directly in each evaluated checkout and expects one JSON object on stdout with `score` (0–100), `summary`, `evidence`, and `suggestions`. Command evaluations are useful for deterministic benchmarks and test-derived metrics; they are direct local subprocesses that inherit Burner's permissions and are not `codex exec` invocations, so only configure commands you trust. Evaluations without a command use an unrestricted Codex agent.
 

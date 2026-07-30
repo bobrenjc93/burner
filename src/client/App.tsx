@@ -156,7 +156,7 @@ export function App() {
         </header>
 
         <div className="page">
-          {dashboard.runtime.yolo && <div className="yolo-banner"><Zap size={17} /><span><strong>YOLO autopilot is active</strong> Burner may autonomously open and merge one current-base PR at a time after reviewer approval, complete evaluation coverage, positive weighted impact, and zero regressions.</span></div>}
+          {dashboard.runtime.yolo && <div className="yolo-banner"><Zap size={17} /><span><strong>YOLO autopilot is active</strong> Burner may autonomously open and merge one current-base PR at a time after reviewer approval, complete evaluation coverage, positive weighted impact, and no deterministic command-evaluation regression.</span></div>}
           <div className="security-banner"><ShieldCheck size={17} /><span><strong>Unrestricted Codex agents</strong> Authors, revisions, reviewers, planners, prompt evaluators, and composite integrators can read and write anywhere and run commands as your user. Command-backed evaluations are separate direct local subprocesses.</span></div>
           {error && <div className="error-banner"><CircleDot size={16} /><span>{error}</span><button onClick={() => setError(undefined)}><X size={15} /></button></div>}
           {tab === "overview" && (

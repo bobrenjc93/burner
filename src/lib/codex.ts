@@ -85,6 +85,15 @@ export class CodexClient {
     await this.unrestrictedArgs(cwd);
   }
 
+  async available(cwd: string): Promise<boolean> {
+    try {
+      await this.preflight(cwd);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async evaluate(
     cwd: string,
     evaluation: Evaluation,
