@@ -3,7 +3,11 @@ import { join } from "node:path";
 import type { CompositeSource, ReviewRound, ScoreDelta } from "../types.js";
 import { runCommand } from "./process.js";
 
+export type PullRequestDisposition = "merged" | "unmerged";
+
 export class GitService {
+  private dispositionLabelsReady = false;
+
   constructor(readonly root: string, private readonly dataDir: string) {}
 
   async status(): Promise<{ available: boolean; branch?: string; commit?: string; dirty?: boolean }> {
@@ -146,7 +150,9 @@ export class GitService {
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not open pull request");
     const url = result.stdout.trim().split("\n").at(-1) ?? "";
     const match = url.match(/\/pull\/(\d+)/);
-    return { url, number: match ? Number(match[1]) : undefined };
+    const number = match ? Number(match[1]) : undefined;
+    if (number) await this.markPrDisposition(options.cwd, number, "unmerged").catch(() => undefined);
+    return { url, number };
   }
 
   async removeWorktree(path: string): Promise<void> {
@@ -158,14 +164,45 @@ export class GitService {
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not update PR #${number}`);
   }
 
-  async closePr(cwd: string, number: number, comment: string): Promise<void> {
+  async closePr(cwd: string, number: number, comment: string, disposition: PullRequestDisposition = "unmerged"): Promise<void> {
     const result = await runCommand("gh", ["pr", "close", String(number), "--comment", comment], { cwd, timeoutMs: 5 * 60 * 1000 });
     if (result.exitCode !== 0 && !result.stderr.includes("already closed")) throw new Error(result.stderr.trim() || `Could not close PR #${number}`);
+    await this.markPrDisposition(cwd, number, disposition).catch(() => undefined);
   }
 
   async mergePr(cwd: string, number: number): Promise<void> {
     const result = await runCommand("gh", ["pr", "merge", String(number), "--merge"], { cwd, timeoutMs: 10 * 60 * 1000 });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not merge PR #${number}`);
+    await this.markPrDisposition(cwd, number, "merged").catch(() => undefined);
+  }
+
+  async markPrDisposition(cwd: string, number: number, disposition: PullRequestDisposition): Promise<void> {
+    await this.ensureDispositionLabels(cwd);
+    const desired = `burner-${disposition}`;
+    const opposite = disposition === "merged" ? "burner-unmerged" : "burner-merged";
+    const result = await runCommand(
+      "gh",
+      ["pr", "edit", String(number), "--add-label", desired, "--remove-label", opposite],
+      { cwd, timeoutMs: 2 * 60 * 1000 },
+    );
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not label PR #${number} as ${disposition}`);
+  }
+
+  private async ensureDispositionLabels(cwd: string): Promise<void> {
+    if (this.dispositionLabelsReady) return;
+    const labels = [
+      ["burner-merged", "1f883d", "Merged directly or included through a merged Burner composite"],
+      ["burner-unmerged", "d97706", "Open or closed without inclusion in main"],
+    ] as const;
+    for (const [name, color, description] of labels) {
+      const result = await runCommand(
+        "gh",
+        ["label", "create", name, "--color", color, "--description", description, "--force"],
+        { cwd, timeoutMs: 2 * 60 * 1000 },
+      );
+      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not create GitHub label '${name}'`);
+    }
+    this.dispositionLabelsReady = true;
   }
 
   async listPullRequests(cwd = this.root): Promise<Array<{ number: number; state: "OPEN" | "CLOSED" | "MERGED"; headRefName: string; url: string }>> {

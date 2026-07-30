@@ -594,6 +594,7 @@ export class Orchestrator {
     const byNumber = new Map(pullRequests.map((pr) => [pr.number, pr]));
     const newlyMergedCompositeIds: string[] = [];
     const changedRunIds = new Set<string>();
+    const dispositionUpdates: Array<{ number: number; disposition: "merged" | "unmerged" }> = [];
     let baseChanged = Boolean(state.orchestrator.baseSyncPending);
     let syncedBaseCommit: string | undefined;
     await this.store.update((draft) => {
@@ -606,6 +607,7 @@ export class Orchestrator {
           if (next === "merged") { baseChanged = true; draft.orchestrator.baseSyncPending = true; }
           run.prState = next;
           changedRunIds.add(run.id);
+          dispositionUpdates.push({ number: run.prNumber, disposition: next === "merged" ? "merged" : "unmerged" });
         }
       }
       for (const composite of draft.composites) {
@@ -621,17 +623,24 @@ export class Orchestrator {
           draft.orchestrator.baseSyncPending = true;
           composite.isLiving = false;
           if (draft.orchestrator.livingCompositeId === composite.id) draft.orchestrator.livingCompositeId = undefined;
+          dispositionUpdates.push({ number: composite.prNumber, disposition: "merged" });
         } else if (remote.state === "CLOSED" && composite.status !== "merged" && composite.status !== "closed") {
           composite.status = "closed";
           composite.updatedAt = now();
           composite.isLiving = false;
           if (draft.orchestrator.livingCompositeId === composite.id) draft.orchestrator.livingCompositeId = undefined;
+          dispositionUpdates.push({ number: composite.prNumber, disposition: "unmerged" });
         } else if (remote.state === "OPEN" && composite.status === "closed") {
           composite.status = "open";
           composite.updatedAt = now();
+          dispositionUpdates.push({ number: composite.prNumber, disposition: "unmerged" });
         }
       }
     });
+
+    for (const update of new Map(dispositionUpdates.map((item) => [item.number, item])).values()) {
+      await this.git.markPrDisposition(this.root, update.number, update.disposition).catch(() => undefined);
+    }
 
     for (const compositeId of newlyMergedCompositeIds) {
       const composite = this.store.get().composites.find((item) => item.id === compositeId);
@@ -639,7 +648,7 @@ export class Orchestrator {
       for (const source of composite.sources) {
         const run = this.store.get().agentRuns.find((item) => item.id === source.agentRunId);
         if (source.prNumber && run?.prState === "open") {
-          await this.git.closePr(this.root, source.prNumber, `Superseded by merged composite PR #${composite.prNumber}.`);
+          await this.git.closePr(this.root, source.prNumber, `Superseded by merged composite PR #${composite.prNumber}.`, "merged");
           await this.store.update((draft) => {
             const current = draft.agentRuns.find((item) => item.id === source.agentRunId);
             if (current) { current.prState = "superseded"; current.supersededByCompositeId = compositeId; }

@@ -231,6 +231,32 @@ test("git service assembles source branches into an actual composite worktree", 
   }
 });
 
+test("GitHub PR disposition labels are mutually exclusive and initialized once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-label-test-"));
+  const bin = join(root, "bin");
+  const argsLog = join(root, "gh-args.jsonl");
+  await import("node:fs/promises").then((fs) => fs.mkdir(bin));
+  const executable = join(bin, "gh");
+  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");fs.appendFileSync(process.env.BURNER_TEST_GH_ARGS,JSON.stringify(process.argv.slice(2))+"\\n");\n`);
+  await chmod(executable, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath}`;
+  process.env.BURNER_TEST_GH_ARGS = argsLog;
+  try {
+    const git = new GitService(root, join(root, ".burner"));
+    await git.markPrDisposition(root, 42, "unmerged");
+    await git.markPrDisposition(root, 42, "merged");
+    const calls = (await readFile(argsLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(calls.filter((args) => args[0] === "label" && args[1] === "create").length, 2);
+    assert.deepEqual(calls.at(-2), ["pr", "edit", "42", "--add-label", "burner-unmerged", "--remove-label", "burner-merged"]);
+    assert.deepEqual(calls.at(-1), ["pr", "edit", "42", "--add-label", "burner-merged", "--remove-label", "burner-unmerged"]);
+  } finally {
+    process.env.PATH = previousPath;
+    delete process.env.BURNER_TEST_GH_ARGS;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("PR bodies record review approval and recalculated composite scores", () => {
   const rounds = [{ id: "r1", round: 1, commit: "abc", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() }];
   const deltas = [{ evaluationId: "quality", name: "Quality", before: 70, after: 82, delta: 12 }];
@@ -576,6 +602,7 @@ test("merged composites supersede source PRs and queue overlapping composites fo
       state.orchestrator.livingCompositeId = "merged";
     });
     const closed = [];
+    const labeled = [];
     const orchestrator = new Orchestrator(root, store, new EventHub());
     orchestrator.git = {
       remoteExists: async () => true,
@@ -584,7 +611,8 @@ test("merged composites supersede source PRs and queue overlapping composites fo
         { number: 3, state: "OPEN", headRefName: "branch-c", url: "" }, { number: 4, state: "OPEN", headRefName: "branch-d", url: "" },
         { number: 100, state: "MERGED", headRefName: "composite-merged", url: "" }, { number: 101, state: "OPEN", headRefName: "composite-overlap", url: "" },
       ],
-      closePr: async (_cwd, number) => { closed.push(number); },
+      closePr: async (_cwd, number, _comment, disposition) => { closed.push([number, disposition]); },
+      markPrDisposition: async (_cwd, number, disposition) => { labeled.push([number, disposition]); },
       syncBase: async () => "abcdef1234567890",
     };
     await orchestrator.syncPullRequests(true);
@@ -595,7 +623,8 @@ test("merged composites supersede source PRs and queue overlapping composites fo
     const overlap = state.composites.find((item) => item.id === "overlap");
     assert.equal(overlap.status, "rebuilding");
     assert.deepEqual(overlap.sources.map((source) => source.agentRunId), ["c", "d"]);
-    assert.deepEqual(closed.sort(), [1, 2]);
+    assert.deepEqual(closed.sort(), [[1, "merged"], [2, "merged"]]);
+    assert.deepEqual(labeled, [[100, "merged"]]);
     assert.equal(state.orchestrator.baseSyncPending, false);
     assert.equal(state.orchestrator.lastEvaluationAt, undefined);
   } finally {
