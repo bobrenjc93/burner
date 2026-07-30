@@ -124,6 +124,8 @@ test("compiled server serves the API and closes connected event streams", async 
     assert.equal(created.status, 201);
     const invalidComposite = await fetch(`${base}/api/composites`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ agentRunIds: [] }) });
     assert.equal(invalidComposite.status, 400);
+    const missingRetry = await fetch(`${base}/api/agents/missing/retry`, { method: "POST" });
+    assert.equal(missingRetry.status, 404);
 
     await new Promise((resolve, reject) => {
       const request = get(`${base}/api/events`, (response) => {
