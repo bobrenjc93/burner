@@ -374,6 +374,44 @@ test("evaluation suites do not overlap and run command checks before prompt chec
   }
 });
 
+test("evaluation suites share cpu-heavy without deadlocking the owning agent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-evaluation-resource-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [{ id: "command", name: "Command", prompt: "Measure", command: "./benchmark", weight: 1, enabled: true, createdAt: timestamp }];
+      state.agentRuns.push({ id: "cpu-agent", resources: ["cpu-heavy"] });
+    });
+    const order = [];
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { head: async () => "commit" };
+    orchestrator.codex = {
+      evaluate: async (cwd) => {
+        order.push(cwd);
+        const held = await orchestrator.locks.list();
+        assert.ok(held.includes("cpu-heavy"));
+        assert.ok(held.includes("evaluation-suite"));
+        return { score: 50, summary: "measured", evidence: [], suggestions: [] };
+      },
+    };
+    await orchestrator.locks.init();
+    const agentLease = await orchestrator.locks.acquire("cpu-heavy", "cpu-agent");
+    let plainFinished = false;
+    const plain = orchestrator.runEvaluations("agent", "plain-suite", "plain-agent").then(() => { plainFinished = true; });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(plainFinished, false);
+    await orchestrator.runEvaluations("agent", "owned-suite", "cpu-agent");
+    assert.deepEqual(order, ["owned-suite"]);
+    await agentLease.release();
+    await plain;
+    assert.deepEqual(order, ["owned-suite", "plain-suite"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("every Codex role and structured fallback uses unrestricted mode with correct flag placement", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-codex-test-"));
   const bin = join(root, "bin");

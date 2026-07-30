@@ -309,11 +309,23 @@ export class Orchestrator {
   }
 
   async runEvaluations(context: EvaluationRun["context"] = "manual", cwd = this.root, agentRunId?: string, compositeId?: string): Promise<EvaluationRun[]> {
-    const suiteLock = await this.locks.acquire("evaluation-suite", id("evalsuite"), { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
+    const owner = id("evalsuite");
+    const callerOwnsCpuLock = Boolean(
+      agentRunId && this.store.get().agentRuns.find((run) => run.id === agentRunId)?.resources.includes("cpu-heavy"),
+    );
+    // Acquire the scarce CPU resource before the suite lock. Otherwise a normal
+    // candidate could hold evaluation-suite while waiting for a cpu-heavy agent,
+    // and that agent could deadlock waiting to evaluate before releasing its lease.
+    const cpuLock = callerOwnsCpuLock
+      ? undefined
+      : await this.locks.acquire("cpu-heavy", owner, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
+    let suiteLock: HeldLock | undefined;
     try {
+      suiteLock = await this.locks.acquire("evaluation-suite", owner, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
       return await this.runEvaluationSuite(context, cwd, agentRunId, compositeId);
     } finally {
-      await suiteLock.release();
+      await suiteLock?.release();
+      await cpuLock?.release();
     }
   }
 
