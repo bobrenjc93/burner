@@ -21,6 +21,12 @@ const exec = (cwd, command, args) => new Promise((resolve, reject) => {
   });
 });
 
+test("CLI version matches the package version", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  const output = await exec(process.cwd(), process.execPath, ["dist/cli.js", "--version"]);
+  assert.equal(output.trim(), packageJson.version);
+});
+
 test("score helpers clamp and weight enabled evaluations", () => {
   assert.equal(clampScore(105), 100);
   assert.equal(clampScore(-4), 0);

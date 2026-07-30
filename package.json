@@ -1,6 +1,6 @@
 {
   "name": "burner",
-  "version": "0.7.6",
+  "version": "0.7.7",
   "description": "A local control room for autonomous, evaluation-driven repo improvement.",
   "type": "module",
   "bin": {

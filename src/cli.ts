@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { createBurnerServer } from "./server.js";
 import { EventHub } from "./lib/events.js";
@@ -8,7 +9,7 @@ import { StateStore, validateEvaluation } from "./lib/store.js";
 import { errorMessage, id, now } from "./lib/utils.js";
 import type { BurnerSettings, Idea } from "./types.js";
 
-const VERSION = "0.7.2";
+const VERSION = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 const colors = {
   fire: (value: string) => `\x1b[38;2;255;107;53m${value}\x1b[0m`,
   cyan: (value: string) => `\x1b[36m${value}\x1b[0m`,
