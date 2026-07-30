@@ -44,6 +44,8 @@ Burner never sends repository data through its own service. It invokes the local
 > [!WARNING]
 > Burner deliberately launches every Codex agent with `--dangerously-bypass-approvals-and-sandbox`. Authors, revisions, reviewers, planners, prompt evaluators, and composite integrators have unrestricted filesystem and command access as your user—not just access to the target worktree. Use Burner only on repositories and machines where you accept that risk. Burner preflights this capability and fails clearly if the installed Codex CLI does not support it; it never silently falls back to restricted mode.
 
+Meta's wrapped Codex distribution may additionally require its launcher-level `--dangerously-disable-osx-sandbox` flag. Burner detects that unrestricted form during preflight and uses it consistently without a PTY or compatibility shim.
+
 ## Usage
 
 ```text

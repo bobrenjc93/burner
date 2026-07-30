@@ -6,6 +6,7 @@ import { runCommand, type CommandResult } from "./process.js";
 import { clampScore, errorMessage, parseJsonObject } from "./utils.js";
 
 const UNRESTRICTED_FLAG = "--dangerously-bypass-approvals-and-sandbox";
+const META_DISABLE_SANDBOX_FLAG = "--dangerously-disable-osx-sandbox";
 type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
 
 const evaluationSchema = {
@@ -76,13 +77,12 @@ export type SessionResult = { message: string; threadId: string };
 export type ReviewResult = { approved: boolean; summary: string; findings: ReviewFinding[] };
 
 export class CodexClient {
-  private preflightPromise?: Promise<void>;
+  private unrestrictedArgsPromise?: Promise<string[]>;
 
   constructor(private readonly onProgress?: (message: string) => void) {}
 
   async preflight(cwd: string): Promise<void> {
-    this.preflightPromise ??= this.checkUnrestrictedMode(cwd);
-    return this.preflightPromise;
+    await this.unrestrictedArgs(cwd);
   }
 
   async evaluate(
@@ -347,22 +347,30 @@ export class CodexClient {
     return args;
   }
 
-  private async checkUnrestrictedMode(cwd: string): Promise<void> {
-    let result: CommandResult;
-    try {
-      result = await runCommand("codex", [UNRESTRICTED_FLAG, "exec", "--help"], { cwd, timeoutMs: 10_000 });
-    } catch (error) {
-      throw new Error(this.preflightError(errorMessage(error)));
+  private async unrestrictedArgs(cwd: string): Promise<string[]> {
+    this.unrestrictedArgsPromise ??= this.detectUnrestrictedArgs(cwd);
+    return this.unrestrictedArgsPromise;
+  }
+
+  private async detectUnrestrictedArgs(cwd: string): Promise<string[]> {
+    const candidates = [[UNRESTRICTED_FLAG], [META_DISABLE_SANDBOX_FLAG, UNRESTRICTED_FLAG]];
+    const failures: string[] = [];
+    for (const flags of candidates) {
+      try {
+        const result = await runCommand("codex", [...flags, "exec", "--help"], { cwd, timeoutMs: 10_000 });
+        const help = `${result.stdout}\n${result.stderr}`;
+        if (result.exitCode === 0 && help.includes(UNRESTRICTED_FLAG)) return flags;
+        failures.push(help.trim() || `codex exited with ${result.exitCode}`);
+      } catch (error) {
+        failures.push(errorMessage(error));
+      }
     }
-    const help = `${result.stdout}\n${result.stderr}`;
-    if (result.exitCode !== 0 || !help.includes(UNRESTRICTED_FLAG)) {
-      throw new Error(this.preflightError(help.trim() || `codex exited with ${result.exitCode}`));
-    }
+    throw new Error(this.preflightError(failures.at(-1) ?? "Codex preflight failed."));
   }
 
   private async runCodex(args: string[], options: CodexCommandOptions): Promise<CommandResult> {
-    await this.preflight(options.cwd);
-    return runCommand("codex", [UNRESTRICTED_FLAG, ...args], options);
+    const unrestrictedArgs = await this.unrestrictedArgs(options.cwd);
+    return runCommand("codex", [...unrestrictedArgs, ...args], options);
   }
 
   private preflightError(detail: string): string {

@@ -277,6 +277,32 @@ test("Codex unrestricted-mode preflight fails clearly without a restricted fallb
   }
 });
 
+test("Codex preflight supports Meta's launcher-level sandbox bypass without a PTY shim", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-codex-meta-preflight-test-"));
+  const bin = join(root, "bin");
+  await import("node:fs/promises").then((fs) => fs.mkdir(bin));
+  const executable = join(bin, "codex");
+  const argsLog = join(root, "args.jsonl");
+  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");const args=process.argv.slice(2);fs.appendFileSync(process.env.BURNER_TEST_ARGS,JSON.stringify(args)+"\\n");if(!args.includes("--dangerously-disable-osx-sandbox")){console.error("sandbox_apply: Operation not permitted");process.exit(2);}if(args.includes("--help")){console.log("--dangerously-bypass-approvals-and-sandbox");process.exit(0);}const out=args[args.indexOf("--output-last-message")+1];fs.writeFileSync(out,JSON.stringify({score:88,summary:"ok",evidence:[],suggestions:[]}));\n`);
+  await chmod(executable, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath}`;
+  process.env.BURNER_TEST_ARGS = argsLog;
+  const settings = { parallelism: 1, evaluationIntervalMinutes: 30, orchestratorIntervalMinutes: 15, autoRun: false, autoCreatePrs: true, evaluatorModel: "", agentModel: "", baseBranch: "main", remote: "origin", defaultResources: [], maxReviewRounds: 8, preferLivingComposite: true, compositeAbsorbThreshold: 0 };
+  try {
+    const output = await new CodexClient().evaluate(root, { id: "quality", name: "Quality", prompt: "Score it", weight: 1, enabled: true, createdAt: new Date().toISOString() }, settings, "manual");
+    assert.equal(output.score, 88);
+    const calls = (await readFile(argsLog, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.deepEqual(calls[0].slice(0, 2), ["--dangerously-bypass-approvals-and-sandbox", "exec"]);
+    assert.deepEqual(calls[1].slice(0, 3), ["--dangerously-disable-osx-sandbox", "--dangerously-bypass-approvals-and-sandbox", "exec"]);
+    assert.deepEqual(calls[2].slice(0, 3), ["--dangerously-disable-osx-sandbox", "--dangerously-bypass-approvals-and-sandbox", "exec"]);
+  } finally {
+    process.env.PATH = previousPath;
+    delete process.env.BURNER_TEST_ARGS;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("merged composites supersede source PRs and queue overlapping composites for rebuild", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-reconcile-test-"));
   try {
