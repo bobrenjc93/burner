@@ -18,6 +18,8 @@ type AgentBase = {
 
 export type YoloMergeCandidate = { kind: "agent" | "composite"; id: string; prNumber: number; impact: number };
 
+const finalReviewApproved = (reviewApproved: boolean | undefined, rounds: ReviewRound[]) => reviewApproved === true && rounds.at(-1)?.approved === true;
+
 function isYoloCandidate(
   deltas: ScoreDelta[],
   impact: number | undefined,
@@ -34,26 +36,54 @@ function isYoloCandidate(
   return complete && [...commandEvaluationIds].every((evaluationId) => byEvaluation.get(evaluationId)!.delta! >= 0);
 }
 
-export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string): YoloMergeCandidate | undefined {
-  const enabledEvaluationIds = new Set(state.evaluations.filter((evaluation) => evaluation.enabled).map((evaluation) => evaluation.id));
-  const commandEvaluationIds = new Set(state.evaluations.filter((evaluation) => evaluation.enabled && evaluation.command).map((evaluation) => evaluation.id));
+function yoloEvaluationSets(state: BurnerState): { enabled: Set<string>; commands: Set<string> } {
+  return {
+    enabled: new Set(state.evaluations.filter((evaluation) => evaluation.enabled).map((evaluation) => evaluation.id)),
+    commands: new Set(state.evaluations.filter((evaluation) => evaluation.enabled && evaluation.command).map((evaluation) => evaluation.id)),
+  };
+}
+
+function reservedCompositeSourceIds(state: BurnerState): Set<string> {
+  return new Set(state.composites
+    .filter((composite) => !["merged", "closed"].includes(composite.status))
+    .flatMap((composite) => composite.sources.map((source) => source.agentRunId)));
+}
+
+export function selectYoloLeafBatch(state: BurnerState, baseCommit: string, batchSize: number): string[] {
+  if (batchSize < 2) return [];
+  const { enabled, commands } = yoloEvaluationSets(state);
+  if (!enabled.size) return [];
+  const reserved = reservedCompositeSourceIds(state);
+  const eligible = state.agentRuns
+    .filter((run) =>
+      run.status === "completed" &&
+      run.prState === "open" &&
+      run.prNumber !== undefined &&
+      run.baseCommit === baseCommit &&
+      !reserved.has(run.id) &&
+      finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
+      isYoloCandidate(run.deltas, run.impact, enabled, commands, state.settings.compositeAbsorbThreshold))
+    .sort((a, b) => (b.impact ?? -Infinity) - (a.impact ?? -Infinity));
+  return eligible.length >= batchSize ? eligible.slice(0, batchSize).map((run) => run.id) : [];
+}
+
+export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string, includeAgents = true): YoloMergeCandidate | undefined {
+  const { enabled: enabledEvaluationIds, commands: commandEvaluationIds } = yoloEvaluationSets(state);
   if (!enabledEvaluationIds.size) return undefined;
   const threshold = state.settings.compositeAbsorbThreshold;
-  const approved = (reviewApproved: boolean | undefined, rounds: ReviewRound[]) => reviewApproved === true && rounds.at(-1)?.approved === true;
   const composites = state.composites
     .filter((composite) =>
       composite.status === "open" &&
       composite.prNumber !== undefined &&
       composite.baseCommit === baseCommit &&
-      approved(composite.reviewApproved, composite.reviewRounds) &&
+      finalReviewApproved(composite.reviewApproved, composite.reviewRounds) &&
       isYoloCandidate(composite.deltas, composite.impact, enabledEvaluationIds, commandEvaluationIds, threshold))
     .map((composite) => ({ kind: "composite" as const, id: composite.id, prNumber: composite.prNumber!, impact: composite.impact! }))
     .sort((a, b) => b.impact - a.impact);
   if (composites[0]) return composites[0];
+  if (!includeAgents) return undefined;
 
-  const compositeSourceIds = new Set(state.composites
-    .filter((composite) => !["merged", "closed", "failed"].includes(composite.status))
-    .flatMap((composite) => composite.sources.map((source) => source.agentRunId)));
+  const compositeSourceIds = reservedCompositeSourceIds(state);
   return state.agentRuns
     .filter((run) =>
       run.status === "completed" &&
@@ -61,7 +91,7 @@ export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string)
       run.prNumber !== undefined &&
       run.baseCommit === baseCommit &&
       !compositeSourceIds.has(run.id) &&
-      approved(run.reviewApproved, run.reviewRounds) &&
+      finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
       isYoloCandidate(run.deltas, run.impact, enabledEvaluationIds, commandEvaluationIds, threshold))
     .map((run) => ({ kind: "agent" as const, id: run.id, prNumber: run.prNumber!, impact: run.impact! }))
     .sort((a, b) => b.impact - a.impact)[0];
@@ -79,14 +109,16 @@ export class Orchestrator {
   private lastPrSyncAt = 0;
   private runtimeCache?: { value: RuntimeStatus; expires: number };
   private readonly yolo: boolean;
+  private readonly yoloBatchSize: number;
 
   constructor(
     private readonly root: string,
     private readonly store: StateStore,
     private readonly events: EventHub,
-    options: { yolo?: boolean } = {},
+    options: { yolo?: boolean; yoloBatchSize?: number } = {},
   ) {
     this.yolo = Boolean(options.yolo);
+    this.yoloBatchSize = Math.max(1, Math.min(100, Math.floor(options.yoloBatchSize ?? 10)));
     this.git = new GitService(root, store.dataDir);
     this.locks = new LockManager(join(store.dataDir, "locks"));
     this.codex = new CodexClient((message) => {
@@ -131,7 +163,11 @@ export class Orchestrator {
       type: "system",
       message: enabled ? "Orchestrator ignited" : "Orchestrator paused",
       detail: enabled
-        ? this.yolo ? "YOLO autopilot is evaluating, dispatching, opening, and autonomously merging monotonic work." : "Burner is watching evaluations and dispatching queued work."
+        ? this.yolo
+          ? this.yoloBatchSize > 1
+            ? `YOLO portfolio is accumulating reviewed leaf PRs and master-cooking them in batches of ${this.yoloBatchSize}.`
+            : "YOLO autopilot is evaluating, dispatching, opening, and autonomously merging monotonic leaf work."
+          : "Burner is watching evaluations and dispatching queued work."
         : "Running agents will finish; new work will not start.",
     });
     this.events.emit("state", this.store.get());
@@ -151,15 +187,18 @@ export class Orchestrator {
     await this.codex.preflight(this.root);
     await this.store.addActivity({
       type: "system",
-      message: "YOLO autopilot enabled",
-      detail: "Burner will merge one current-base PR at a time only after reviewer approval, complete evaluations, positive weighted impact, and no deterministic command-evaluation regression.",
+      message: this.yoloBatchSize > 1 ? "YOLO portfolio enabled" : "YOLO autopilot enabled",
+      detail: this.yoloBatchSize > 1
+        ? `Burner will retain approved leaves, cook ${this.yoloBatchSize} current-base leaves into each composite, and merge only qualifying composites.`
+        : "Burner will merge one current-base leaf PR at a time only after reviewer approval, complete evaluations, positive weighted impact, and no deterministic command-evaluation regression.",
     });
+    if (this.yoloBatchSize > 1) await this.ensureLivingComposite();
   }
 
   private async autoMergeNext(): Promise<boolean> {
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
-    const candidate = selectYoloMergeCandidate(state, baseCommit);
+    const candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1);
     if (!candidate) return false;
     await this.store.addActivity({
       type: "pr",
@@ -168,6 +207,22 @@ export class Orchestrator {
     });
     if (candidate.kind === "composite") await this.mergeComposite(candidate.id);
     else await this.mergeAgent(candidate.id);
+    return true;
+  }
+
+  private async autoCookNext(): Promise<boolean> {
+    if (this.yoloBatchSize < 2) return false;
+    const state = this.store.get();
+    const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
+    const leafIds = selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize);
+    if (!leafIds.length) return false;
+    const generation = state.composites.length + 1;
+    await this.createComposite(
+      leafIds,
+      `YOLO generation ${generation}: ${leafIds.length} reviewed improvements`,
+      `Automatically master-cooked from ${leafIds.length} independently authored, reviewed, and evaluated leaf pull requests on ${state.settings.baseBranch.slice(0, 80)}.`,
+      { makeLiving: false },
+    );
     return true;
   }
 
@@ -368,6 +423,7 @@ export class Orchestrator {
       git,
       gh: { available: ghAvailable, authenticated: ghAuthenticated },
       yolo: this.yolo,
+      yoloBatchSize: this.yolo ? this.yoloBatchSize : undefined,
       runningEvaluations: this.runningEvaluations,
       runningAgents: this.activeAgents.size,
       runningComposites: this.activeComposites.size,
@@ -377,7 +433,7 @@ export class Orchestrator {
     return value;
   }
 
-  async createComposite(agentRunIds: string[], title?: string, description?: string): Promise<CompositePr> {
+  async createComposite(agentRunIds: string[], title?: string, description?: string, options: { makeLiving?: boolean } = {}): Promise<CompositePr> {
     const uniqueIds = [...new Set(agentRunIds)];
     const state = this.store.get();
     const sources: CompositeSource[] = uniqueIds.map((runId) => {
@@ -390,7 +446,7 @@ export class Orchestrator {
     const compositeId = id("composite");
     const timestamp = now();
     const currentLiving = state.orchestrator.livingCompositeId ? state.composites.find((item) => item.id === state.orchestrator.livingCompositeId) : undefined;
-    const makeLiving = !currentLiving || ["merged", "closed"].includes(currentLiving.status);
+    const makeLiving = options.makeLiving ?? (!currentLiving || ["merged", "closed"].includes(currentLiving.status));
     const composite: CompositePr = {
       id: compositeId,
       title: title?.trim().slice(0, 120) || `Composite: ${sources.map((source) => `#${source.prNumber}`).join(" + ")}`,
@@ -410,7 +466,13 @@ export class Orchestrator {
       draft.composites.push(composite);
       if (makeLiving) draft.orchestrator.livingCompositeId = composite.id;
     });
-    await this.store.addActivity({ type: "pr", message: `Composite queued: ${composite.title}`, detail: `${sources.length} source PRs will seed a continuously evaluated living line.` });
+    await this.store.addActivity({
+      type: "pr",
+      message: `Composite queued: ${composite.title}`,
+      detail: makeLiving
+        ? `${sources.length} source PRs will seed a continuously evaluated living line.`
+        : `${sources.length} reviewed leaf PRs are reserved for this independently rebuilt and recalculated portfolio generation.`,
+    });
     this.events.emit("state", this.store.get());
     void this.scheduleComposites(true);
     return composite;
@@ -479,6 +541,7 @@ export class Orchestrator {
     const newlyMergedCompositeIds: string[] = [];
     const changedRunIds = new Set<string>();
     let baseChanged = Boolean(state.orchestrator.baseSyncPending);
+    let syncedBaseCommit: string | undefined;
     await this.store.update((draft) => {
       for (const run of draft.agentRuns) {
         if (!run.prNumber) continue;
@@ -535,12 +598,55 @@ export class Orchestrator {
 
     if (baseChanged) {
       const commit = await this.git.syncBase(state.settings.remote, state.settings.baseBranch);
+      syncedBaseCommit = commit;
       await this.store.update((draft) => {
         draft.orchestrator.lastEvaluationAt = undefined;
         draft.orchestrator.lastPlanningAt = undefined;
         draft.orchestrator.baseSyncPending = false;
       });
       await this.store.addActivity({ type: "system", message: `Base updated to ${commit.slice(0, 8)}`, detail: "New agents will branch from the merged main; baseline and composites are being recalculated." });
+    }
+
+    if (syncedBaseCommit && this.yolo && this.yoloBatchSize > 1) {
+      const beforeCleanup = this.store.get();
+      const staleFailedComposites = beforeCleanup.composites.filter((composite) =>
+        composite.status === "failed" && composite.baseCommit !== syncedBaseCommit);
+      for (const composite of staleFailedComposites) {
+        if (composite.prNumber) {
+          await this.git.closePr(this.root, composite.prNumber, `Burner retired this failed portfolio generation because ${state.settings.baseBranch} advanced to ${syncedBaseCommit.slice(0, 8)}.`);
+        }
+      }
+      if (staleFailedComposites.length) {
+        const staleCompositeIds = new Set(staleFailedComposites.map((composite) => composite.id));
+        await this.store.update((draft) => {
+          for (const composite of draft.composites) {
+            if (!staleCompositeIds.has(composite.id)) continue;
+            composite.status = "closed";
+            composite.isLiving = false;
+            composite.updatedAt = now();
+          }
+        });
+      }
+      const current = this.store.get();
+      const reserved = reservedCompositeSourceIds(current);
+      const staleLeaves = current.agentRuns.filter((run) =>
+        run.prState === "open" &&
+        run.prNumber !== undefined &&
+        run.baseCommit !== syncedBaseCommit &&
+        !reserved.has(run.id));
+      for (const run of staleLeaves) {
+        await this.git.closePr(this.root, run.prNumber!, `Burner closed this unbatched leaf because the YOLO portfolio advanced ${state.settings.baseBranch}; a fresh experiment will be planned from ${syncedBaseCommit.slice(0, 8)}.`);
+      }
+      if (staleLeaves.length) {
+        const staleIds = new Set(staleLeaves.map((run) => run.id));
+        await this.store.update((draft) => {
+          for (const run of draft.agentRuns) if (staleIds.has(run.id)) run.prState = "closed";
+        });
+        await this.store.addActivity({ type: "pr", message: `${staleLeaves.length} stale leaf PR${staleLeaves.length === 1 ? "" : "s"} closed`, detail: "The next portfolio generation will branch from the newly merged base." });
+      }
+      if (staleFailedComposites.length) {
+        await this.store.addActivity({ type: "pr", message: `${staleFailedComposites.length} failed portfolio generation${staleFailedComposites.length === 1 ? "" : "s"} retired`, detail: "Their obsolete leaf PRs were released for stale-branch cleanup." });
+      }
     }
 
     const after = this.store.get();
@@ -575,7 +681,10 @@ export class Orchestrator {
       await this.syncPullRequests();
       const initial = this.store.get();
       if (!initial.orchestrator.enabled && !force) return;
-      if (this.yolo && this.runningEvaluations === 0 && this.activeAgents.size === 0 && this.activeComposites.size === 0 && await this.autoMergeNext()) return;
+      if (this.yolo && this.runningEvaluations === 0 && this.activeAgents.size === 0 && this.activeComposites.size === 0) {
+        if (await this.autoMergeNext()) return;
+        if (await this.autoCookNext()) return;
+      }
       const settings = initial.settings;
       const evaluationDue =
         force ||
@@ -586,7 +695,7 @@ export class Orchestrator {
       }
       const refreshed = this.store.get();
       const configuredLiving = refreshed.orchestrator.livingCompositeId ? refreshed.composites.find((item) => item.id === refreshed.orchestrator.livingCompositeId) : undefined;
-      if (refreshed.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") {
+      if (!(this.yolo && this.yoloBatchSize > 1) && refreshed.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") {
         await this.scheduleComposites();
         return;
       }
@@ -608,6 +717,7 @@ export class Orchestrator {
   }
 
   private findLivingComposite(state: BurnerState): CompositePr | undefined {
+    if (this.yolo && this.yoloBatchSize > 1) return undefined;
     if (!state.settings.preferLivingComposite || !state.orchestrator.livingCompositeId) return undefined;
     const composite = state.composites.find((item) => item.id === state.orchestrator.livingCompositeId);
     return composite?.status === "open" && composite.reviewApproved ? composite : undefined;
@@ -615,6 +725,11 @@ export class Orchestrator {
 
   private async ensureLivingComposite(): Promise<void> {
     await this.store.update((state) => {
+      if (this.yolo && this.yoloBatchSize > 1) {
+        state.orchestrator.livingCompositeId = undefined;
+        for (const item of state.composites) item.isLiving = false;
+        return;
+      }
       if (!state.settings.preferLivingComposite) return;
       const current = state.orchestrator.livingCompositeId ? state.composites.find((item) => item.id === state.orchestrator.livingCompositeId) : undefined;
       if (current && !["merged", "closed"].includes(current.status)) {
@@ -630,8 +745,9 @@ export class Orchestrator {
   }
 
   private async resolveAgentBase(idea: Idea, state: BurnerState): Promise<AgentBase> {
+    const portfolioMode = this.yolo && this.yoloBatchSize > 1;
     const living = this.findLivingComposite(state);
-    const requested = idea.baseCompositeId ? state.composites.find((item) => item.id === idea.baseCompositeId) : undefined;
+    const requested = !portfolioMode && idea.baseCompositeId ? state.composites.find((item) => item.id === idea.baseCompositeId) : undefined;
     const composite = requested?.status === "open" && requested.reviewApproved ? requested : living;
     if (composite && state.settings.preferLivingComposite) {
       const ref = await this.git.fetchBranch(state.settings.remote, composite.branch);
@@ -682,8 +798,9 @@ export class Orchestrator {
   private async schedule(): Promise<void> {
     const state = this.store.get();
     if (!state.orchestrator.enabled) return;
+    if (this.yolo && this.yoloBatchSize > 1 && state.composites.some((composite) => ["queued", "building", "reviewing", "revising", "evaluating", "rebuilding"].includes(composite.status))) return;
     const configuredLiving = state.orchestrator.livingCompositeId ? state.composites.find((item) => item.id === state.orchestrator.livingCompositeId) : undefined;
-    if (state.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") return;
+    if (!(this.yolo && this.yoloBatchSize > 1) && state.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") return;
     const capacity = Math.max(0, state.settings.parallelism - this.activeAgents.size - this.activeComposites.size);
     if (!capacity) return;
     const queue = state.ideas

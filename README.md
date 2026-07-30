@@ -84,11 +84,13 @@ burner queue retry -C ./my-project --run agent_12345678
 
 `queue run-next` is deliberately bounded: it claims the highest-impact queued idea, waits through implementation, the reviewer/author loop, candidate evaluation, and PR delivery, then exits. This makes Burner usable from CI, cron, or a larger local automation script without enabling the continuous timer.
 
-### YOLO autopilot
+### YOLO portfolio
 
-`burner --yolo` ignites the orchestrator immediately and lets Burner autonomously create and merge pull requests. This is distinct from the unrestricted flag used for Codex agents: Burner always launches Codex without approvals or sandboxing, while the Burner `--yolo` option additionally authorizes the orchestrator to merge on GitHub.
+`burner --yolo` ignites the orchestrator immediately and runs an autonomous PR portfolio. By default Burner retains ten independently authored leaf PRs, then master-cooks those exact leaves into a composite PR. The composite gets its own integration author, reviewer loop, and complete recalculation from the actual combined checkout. Qualifying composites—not individual leaves—are merged.
 
-YOLO mode merges at most one candidate at a time, then synchronizes and reevaluates `main` before new work proceeds. A PR is eligible only when it:
+Use `--yolo-batch-size <n>` to choose a generation size from 1 to 100. A value of `1` opts into the old direct-leaf merge behavior. The default of `10` is intended to produce the long public history of leaf experiments and composite decisions that sustained campaigns need.
+
+Each leaf selected for a portfolio generation, and each composite eligible for merging:
 
 - was approved by the final independent review round;
 - has a completed delta for every currently enabled evaluation;
@@ -96,7 +98,9 @@ YOLO mode merges at most one candidate at a time, then synchronizes and reevalua
 - has no command-backed evaluation regression (prompt scores still contribute to weighted impact); and
 - was built and evaluated from the current base commit.
 
-Approved composites are preferred over their constituent PRs. Prompt evaluations are intentionally treated as noisy signals rather than hard vetoes; a PR must still have positive weighted impact across all evaluations, while deterministic command-backed regressions always block merging. PRs that fail these gates remain open for inspection. YOLO startup fails unless the root checkout is clean and on the configured base branch, the configured remote exists, Codex supports unrestricted mode, and GitHub CLI authentication is ready.
+Burner merges at most one composite at a time, closes its constituent leaf PRs as superseded, synchronizes `main`, and refreshes the full baseline before beginning the next generation. Other open composites are rebuilt against the new base; unbatched leaves from an obsolete base are closed with an explanation so stale results cannot leak into a later generation. Failed generations remain inspectable, but are retired when the base advances so they cannot reserve obsolete leaves forever. Portfolio mode deliberately does not promote a living composite, so new leaves continue to be visible PRs from the current `main`.
+
+Prompt evaluations are intentionally treated as noisy signals rather than hard vetoes; a candidate must still have positive weighted impact across all evaluations, while deterministic command-backed regressions always block selection. Composites that fail review, integration, or merge gates remain visible for inspection and do not cause their leaves to merge independently. YOLO startup fails unless the root checkout is clean and on the configured base branch, the configured remote exists, Codex supports unrestricted mode, and GitHub CLI authentication is ready. This is distinct from unrestricted Codex execution: Burner always launches Codex without approvals or sandboxing, while `burner --yolo` additionally authorizes GitHub portfolio mutations and merges.
 
 An evaluation may optionally provide a local command. Burner runs it directly in each evaluated checkout and expects one JSON object on stdout with `score` (0–100), `summary`, `evidence`, and `suggestions`. Command evaluations are useful for deterministic benchmarks and test-derived metrics; they are direct local subprocesses that inherit Burner's permissions and are not `codex exec` invocations, so only configure commands you trust. Evaluations without a command use an unrestricted Codex agent.
 

@@ -193,6 +193,7 @@ export type RuntimeStatus = {
   git: { available: boolean; branch?: string; commit?: string; dirty?: boolean };
   gh: { available: boolean; authenticated: boolean };
   yolo: boolean;
+  yoloBatchSize?: number;
   runningEvaluations: number;
   runningAgents: number;
   runningComposites: number;

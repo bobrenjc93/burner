@@ -8,7 +8,7 @@ import { StateStore, validateEvaluation } from "./lib/store.js";
 import { errorMessage, id, now } from "./lib/utils.js";
 import type { BurnerSettings, Idea } from "./types.js";
 
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 const colors = {
   fire: (value: string) => `\x1b[38;2;255;107;53m${value}\x1b[0m`,
   cyan: (value: string) => `\x1b[36m${value}\x1b[0m`,
@@ -42,7 +42,8 @@ Server options:
   -p, --port <port>       port to listen on (default: 4321)
   --host <host>           host to bind (default: 127.0.0.1)
   --no-open               do not open a browser
-  --yolo                  autonomously run, open, and merge monotonic PRs
+  --yolo                  autonomously run and master-cook leaf PRs
+  --yolo-batch-size <n>   leaf PRs per composite (default: 10; 1 merges leaves)
 
 Command options:
   -C, --directory <path>  target repository (default: current directory)
@@ -233,17 +234,24 @@ function parseServerArgs(argv: string[]) {
   let port = "4321";
   let shouldOpen = true;
   let yolo = false;
+  let yoloBatchSize = 10;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--no-open") { shouldOpen = false; continue; }
     if (arg === "--yolo") { yolo = true; continue; }
+    if (arg === "--yolo-batch-size") {
+      const value = Number(argv[++index]);
+      if (!Number.isInteger(value) || value < 1 || value > 100) throw new Error("--yolo-batch-size must be an integer between 1 and 100.");
+      yoloBatchSize = value;
+      continue;
+    }
     if (arg === "--dev") continue;
     if (arg === "--host") { host = argv[++index] ?? host; continue; }
     if (arg === "--port" || arg === "-p") { port = argv[++index] ?? port; continue; }
     if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
     directory = arg;
   }
-  return { directory, host, port, shouldOpen, yolo };
+  return { directory, host, port, shouldOpen, yolo, yoloBatchSize };
 }
 
 function openBrowser(url: string): void {
@@ -266,13 +274,15 @@ async function main(): Promise<void> {
   if (!new Set(["127.0.0.1", "localhost", "::1"]).has(options.host)) throw new Error("Burner only binds to the local machine. Use 127.0.0.1, localhost, or ::1.");
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Port must be an integer between 1 and 65535.");
 
-  const burner = await createBurnerServer({ root, host: options.host, port, yolo: options.yolo });
+  const burner = await createBurnerServer({ root, host: options.host, port, yolo: options.yolo, yoloBatchSize: options.yoloBatchSize });
   const url = `http://${options.host}:${port}`;
   console.log(`\n${colors.fire("  ◉ BURNER")}\n${colors.dim("  Evaluation-driven repo improvement, running locally.")}\n`);
   console.log(`  ${colors.dim("Project")}  ${root}`);
   console.log(`  ${colors.dim("Control")}  ${colors.cyan(url)}\n`);
   console.log(colors.red("  ⚠ Codex agents have unrestricted filesystem and command access as your user.\n"));
-  if (options.yolo) console.log(colors.red("  ⚠ YOLO autopilot is active: Burner may open and merge approved, monotonic PRs.\n"));
+  if (options.yolo) console.log(colors.red(options.yoloBatchSize === 1
+    ? "  ⚠ YOLO autopilot is active: Burner may open and merge approved leaf PRs.\n"
+    : `  ⚠ YOLO portfolio is active: Burner will cook batches of ${options.yoloBatchSize} leaf PRs into composites.\n`));
   console.log(colors.dim("  Press Ctrl+C to cool down.\n"));
   if (options.shouldOpen) openBrowser(url);
 

@@ -8,7 +8,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { Orchestrator, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
+import { Orchestrator, selectYoloLeafBatch, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
 import { buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
 import { createBurnerServer } from "../dist/server.js";
 import { StateStore, validateEvaluation } from "../dist/lib/store.js";
@@ -44,7 +44,9 @@ test("headless CLI configures evaluations, ideas, and conservative settings as J
   try {
     const help = await exec(root, "node", [cli, "--help"]);
     assert.match(help, /Codex agents?[\s\S]*unrestricted filesystem and command access/);
-    assert.match(help, /--yolo\s+autonomously run, open, and merge monotonic PRs/);
+    assert.match(help, /--yolo\s+autonomously run and master-cook leaf PRs/);
+    assert.match(help, /--yolo-batch-size <n>\s+leaf PRs per composite/);
+    await assert.rejects(() => exec(root, "node", [cli, "--no-open", "--yolo-batch-size", "0"]), /integer between 1 and 100/);
     assert.deepEqual(JSON.parse(await exec(root, "node", [cli, "eval", "clear", "--yes", "-C", root])), { removed: 3 });
     const evaluation = JSON.parse(await exec(root, "node", [cli, "eval", "add", "-C", root, "--name", "Correctness", "--prompt", "Score correctness out of 100", "--weight", "2"]));
     assert.equal(evaluation.name, "Correctness");
@@ -198,6 +200,7 @@ test("YOLO merge selection prefers reviewed composites and rejects stale or dete
   };
   assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "composite", id: "composite", prNumber: 20, impact: 1 });
   state.composites[0].status = "closed";
+  assert.equal(selectYoloMergeCandidate(state, "base", false), undefined);
   assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "agent", prNumber: 10, impact: 5 });
   assert.equal(selectYoloMergeCandidate(state, "new-base"), undefined);
   state.agentRuns[0].deltas = [{ ...deltas[0], delta: -0.1 }, deltas[1]];
@@ -206,6 +209,56 @@ test("YOLO merge selection prefers reviewed composites and rejects stale or dete
   assert.equal(selectYoloMergeCandidate(state, "base"), undefined);
   state.agentRuns[0].deltas = [deltas[0]];
   assert.equal(selectYoloMergeCandidate(state, "base"), undefined);
+});
+
+test("YOLO portfolio waits for a full leaf batch, ranks impact, and reserves composite sources", () => {
+  const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
+  const deltas = [{ evaluationId: "speed", name: "Speed", before: 80, after: 81, delta: 1 }];
+  const leaf = (id, impact) => ({ id, status: "completed", prState: "open", prNumber: Number(id.slice(1)), baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], deltas, impact });
+  const state = {
+    settings: { compositeAbsorbThreshold: 0 },
+    evaluations: [{ id: "speed", enabled: true, command: "./benchmark" }],
+    composites: [],
+    agentRuns: [leaf("a1", 1), leaf("a2", 8), leaf("a3", 5)],
+  };
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 4), []);
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 3), ["a2", "a3", "a1"]);
+  state.composites.push({ id: "composite", status: "queued", sources: [{ agentRunId: "a2" }] });
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 3), []);
+  state.agentRuns.push(leaf("a4", 4));
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 3), ["a3", "a4", "a1"]);
+  state.agentRuns[2].baseCommit = "old-base";
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 3), []);
+});
+
+test("YOLO portfolio automatically cooks a complete batch without creating a living line", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-portfolio-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    const leaf = (id, number, impact) => ({ id, ideaId: `idea-${id}`, status: "completed", branch: `branch-${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp, prUrl: `https://example.test/pull/${number}`, prNumber: number, prState: "open", baseCommit: "base", deltas: [{ evaluationId: "speed", name: "Speed", before: 80, after: 81, delta: 1 }], impact, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
+    await store.update((state) => {
+      state.evaluations = [{ id: "speed", name: "Speed", prompt: "Measure speed", command: "./benchmark", weight: 1, enabled: true, createdAt: timestamp }];
+      state.agentRuns = [leaf("slow", 1, 2), leaf("fast", 2, 7)];
+      state.ideas.push(
+        { id: "idea-slow", title: "Slow win", description: "", rationale: "", predictedImpact: 2, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "slow" },
+        { id: "idea-fast", title: "Fast win", description: "", rationale: "", predictedImpact: 7, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "fast" },
+      );
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    let request;
+    orchestrator.createComposite = async (...args) => { request = args; return {}; };
+    assert.equal(await orchestrator.autoCookNext(), true);
+    assert.deepEqual(request[0], ["fast", "slow"]);
+    assert.match(request[1], /YOLO generation 1/);
+    assert.deepEqual(request[3], { makeLiving: false });
+    assert.equal(store.get().orchestrator.livingCompositeId, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("every Codex role and structured fallback uses unrestricted mode with correct flag placement", async () => {
