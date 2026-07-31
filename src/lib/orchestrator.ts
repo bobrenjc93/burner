@@ -138,13 +138,13 @@ export class Orchestrator {
 
   private mergeCadenceDue(state = this.store.get()): boolean {
     if (!this.portfolioMode()) return false;
-    const anchor = state.orchestrator.lastMergeAt ?? state.orchestrator.mergeWindowStartedAt;
+    const anchor = state.orchestrator.mergeWindowStartedAt ?? state.orchestrator.lastMergeAt;
     return Boolean(anchor && Date.now() - new Date(anchor).getTime() >= state.settings.mergeCadenceMinutes * 60_000);
   }
 
   private portfolioCookDue(state = this.store.get()): boolean {
     if (!this.portfolioMode()) return false;
-    const anchor = state.orchestrator.lastMergeAt ?? state.orchestrator.mergeWindowStartedAt;
+    const anchor = state.orchestrator.mergeWindowStartedAt ?? state.orchestrator.lastMergeAt;
     if (!anchor) return false;
     const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
     const latest = this.store.latestRuns();
@@ -863,8 +863,13 @@ export class Orchestrator {
         draft.orchestrator.baseSyncPending = false;
       });
       await this.store.addActivity({ type: "system", message: `Base updated to ${commit.slice(0, 8)}`, detail: "New agents will branch from the merged main; baseline and composites are being recalculated." });
+      let promoted = false;
       for (const compositeId of newlyMergedCompositeIds) {
-        if (await this.promoteMergedCompositeBaseline(compositeId, commit)) break;
+        if (await this.promoteMergedCompositeBaseline(compositeId, commit)) { promoted = true; break; }
+      }
+      if (!promoted) {
+        await this.store.update((draft) => { draft.orchestrator.mergeWindowStartedAt = undefined; });
+        await this.store.addActivity({ type: "evaluation", message: "Cold baseline required after merge", detail: "The next merge-cadence window will start after full and screening baselines finish." });
       }
     }
 

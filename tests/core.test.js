@@ -872,7 +872,7 @@ test("merged composites supersede source PRs and queue overlapping composites fo
     assert.equal(state.orchestrator.baseSyncPending, false);
     assert.equal(state.orchestrator.lastEvaluationAt, undefined);
     assert.ok(state.orchestrator.lastMergeAt);
-    assert.equal(state.orchestrator.mergeWindowStartedAt, state.orchestrator.lastMergeAt);
+    assert.equal(state.orchestrator.mergeWindowStartedAt, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
