@@ -105,7 +105,11 @@ export async function createBurnerServer(options: BurnerServerOptions) {
     route("POST", "/api/evaluations", async (_request, response, _params, body) => {
       const input = validateEvaluation(body);
       const evaluation = { ...input, id: id("eval"), createdAt: now() };
-      await store.update((state) => state.evaluations.push(evaluation));
+      await store.update((state) => {
+        state.evaluations.push(evaluation);
+        state.orchestrator.lastEvaluationAt = undefined;
+        state.orchestrator.mergeWindowStartedAt = undefined;
+      });
       await store.addActivity({ type: "evaluation", message: `Evaluation added: ${evaluation.name}` });
       events.emit("state", store.get());
       json(response, 201, evaluation);
@@ -115,7 +119,12 @@ export async function createBurnerServer(options: BurnerServerOptions) {
       let found = false;
       await store.update((state) => {
         const evaluation = state.evaluations.find((item) => item.id === params.evaluationId);
-        if (evaluation) { Object.assign(evaluation, input); found = true; }
+        if (evaluation) {
+          Object.assign(evaluation, input);
+          state.orchestrator.lastEvaluationAt = undefined;
+          state.orchestrator.mergeWindowStartedAt = undefined;
+          found = true;
+        }
       });
       if (!found) return json(response, 404, { error: "Evaluation not found" });
       await orchestrator.refreshEvaluationWeights();
@@ -124,7 +133,11 @@ export async function createBurnerServer(options: BurnerServerOptions) {
     }),
     route("DELETE", "/api/evaluations/:evaluationId", async (_request, response, params) => {
       const before = store.get().evaluations.length;
-      await store.update((state) => { state.evaluations = state.evaluations.filter((item) => item.id !== params.evaluationId); });
+      await store.update((state) => {
+        state.evaluations = state.evaluations.filter((item) => item.id !== params.evaluationId);
+        state.orchestrator.lastEvaluationAt = undefined;
+        state.orchestrator.mergeWindowStartedAt = undefined;
+      });
       if (store.get().evaluations.length === before) return json(response, 404, { error: "Evaluation not found" });
       events.emit("state", store.get());
       response.writeHead(204).end();

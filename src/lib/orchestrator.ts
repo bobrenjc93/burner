@@ -6,6 +6,7 @@ import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitServic
 import type { HeldLock } from "./locks.js";
 import { LockManager } from "./locks.js";
 import { commandExists, runCommand } from "./process.js";
+import { updateProgressArtifacts, type ProgressPoint } from "./progress.js";
 import { StateStore } from "./store.js";
 import { errorMessage, id, mapLimit, now, slugify, weightedScore } from "./utils.js";
 
@@ -138,13 +139,13 @@ export class Orchestrator {
 
   private mergeCadenceDue(state = this.store.get()): boolean {
     if (!this.portfolioMode()) return false;
-    const anchor = state.orchestrator.mergeWindowStartedAt ?? state.orchestrator.lastMergeAt;
+    const anchor = state.orchestrator.mergeWindowStartedAt;
     return Boolean(anchor && Date.now() - new Date(anchor).getTime() >= state.settings.mergeCadenceMinutes * 60_000);
   }
 
   private portfolioCookDue(state = this.store.get()): boolean {
     if (!this.portfolioMode()) return false;
-    const anchor = state.orchestrator.mergeWindowStartedAt ?? state.orchestrator.lastMergeAt;
+    const anchor = state.orchestrator.mergeWindowStartedAt;
     if (!anchor) return false;
     const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
     const latest = this.store.latestRuns();
@@ -444,7 +445,11 @@ export class Orchestrator {
       ? await this.runEvaluations("screening_baseline")
       : [];
     const runs = [...fullRuns, ...screeningRuns];
-    if (runs.every((run) => run.status === "completed" && run.score !== undefined)) {
+    const refreshedFull = this.store.latestRuns();
+    const refreshedScreening = this.store.latestScreeningRuns();
+    const complete = enabled.every((evaluation) => refreshedFull.get(evaluation.id)?.commit === commit) &&
+      enabled.every((evaluation) => !evaluation.screeningCommand || refreshedScreening.get(evaluation.id)?.commit === commit);
+    if (runs.every((run) => run.status === "completed" && run.score !== undefined) && complete) {
       await this.store.update((draft) => {
         draft.orchestrator.lastEvaluationAt = now();
         if (this.portfolioMode()) draft.orchestrator.mergeWindowStartedAt ??= now();
@@ -732,6 +737,7 @@ export class Orchestrator {
   async mergeComposite(compositeId: string): Promise<void> {
     const composite = this.store.get().composites.find((item) => item.id === compositeId);
     if (!composite?.prNumber || composite.status !== "open") throw new Error("Only an open composite pull request can be merged.");
+    await this.stampProgressBeforeMerge("composite", composite.id);
     await this.git.mergePr(this.root, composite.prNumber);
     await this.store.addActivity({ type: "pr", message: `Merge requested: ${composite.title}`, detail: `Waiting for GitHub to merge PR #${composite.prNumber}.` });
     await this.syncPullRequests(true);
@@ -740,10 +746,60 @@ export class Orchestrator {
   async mergeAgent(runId: string): Promise<AgentRun> {
     const run = this.store.get().agentRuns.find((item) => item.id === runId);
     if (!run?.prNumber || run.status !== "completed" || run.prState !== "open") throw new Error("Only an open, completed agent pull request can be merged.");
+    await this.stampProgressBeforeMerge("agent", run.id);
     await this.git.mergePr(this.root, run.prNumber);
     await this.store.addActivity({ type: "pr", message: `Merge requested for PR #${run.prNumber}`, detail: "Synchronizing the base branch before any new agents start." });
     await this.syncPullRequests(true);
     return this.store.get().agentRuns.find((item) => item.id === runId)!;
+  }
+
+  private async stampProgressBeforeMerge(kind: "agent" | "composite", candidateId: string): Promise<void> {
+    const state = this.store.get();
+    const candidate = kind === "agent"
+      ? state.agentRuns.find((item) => item.id === candidateId)
+      : state.composites.find((item) => item.id === candidateId);
+    if (!candidate) throw new Error("Merge candidate not found while recording evaluation progress.");
+    const deltas = candidate.deltas;
+    const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
+    const scores = Object.fromEntries(enabled.map((evaluation) => {
+      const score = deltas.find((delta) => delta.evaluationId === evaluation.id)?.after;
+      if (score === undefined) throw new Error(`Cannot record progress: '${evaluation.name}' has no candidate score.`);
+      return [evaluation.id, score];
+    }));
+    const prNumber = candidate.prNumber;
+    if (!prNumber) throw new Error("Merge candidate has no pull request number while recording progress.");
+    const title = kind === "agent"
+      ? state.ideas.find((idea) => idea.id === (candidate as AgentRun).ideaId)?.title ?? candidate.branch
+      : (candidate as CompositePr).title;
+    const baselineRuns = this.store.latestRuns();
+    const baselineScores = Object.fromEntries(enabled.flatMap((evaluation) => {
+      const score = baselineRuns.get(evaluation.id)?.score;
+      return score === undefined ? [] : [[evaluation.id, score] as const];
+    }));
+    const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
+    const recordedAt = now();
+    const points: ProgressPoint[] = [];
+    if (Object.keys(baselineScores).length === enabled.length) {
+      points.push({ key: `base:${baseCommit}`, recordedAt, label: `base ${baseCommit.slice(0, 7)}`, kind: "baseline", title: state.settings.baseBranch, scores: baselineScores });
+    }
+    points.push({ key: `pr:${prNumber}`, recordedAt, label: `PR #${prNumber}`, kind: kind === "agent" ? "leaf" : "composite", prNumber, title, scores });
+    const owner = `progress-${candidateId}`;
+    let worktree = "";
+    const createLock = await this.locks.acquire("git-metadata", `${owner}-create`);
+    try { worktree = await this.git.createExistingWorktree(owner, candidate.branch); }
+    finally { await createLock.release(); }
+    try {
+      await updateProgressArtifacts(worktree, state.evaluations, points);
+      if (await this.git.hasChanges(worktree)) {
+        await this.git.commit(worktree, `burner: record evaluation progress for PR #${prNumber}`);
+        await this.git.push(worktree, state.settings.remote, candidate.branch);
+      }
+    } finally {
+      const cleanupLock = await this.locks.acquire("git-metadata", `${owner}-cleanup`);
+      try { if (worktree) await this.git.removeWorktree(worktree); }
+      finally { await cleanupLock.release(); }
+    }
+    await this.store.addActivity({ type: "evaluation", message: `Progress graph updated for PR #${prNumber}`, detail: "README.md, SVG, and raw evaluation history were committed to the merge candidate." });
   }
 
   async retryComposite(compositeId: string): Promise<void> {

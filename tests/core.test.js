@@ -9,6 +9,7 @@ import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
 import { inferIdeaResources, Orchestrator, selectYoloLeafBatch, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
+import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
 import { createBurnerServer } from "../dist/server.js";
 import { StateStore, validateEvaluation } from "../dist/lib/store.js";
@@ -37,6 +38,37 @@ test("score helpers clamp and weight enabled evaluations", () => {
     { id: "paused", weight: 10, enabled: false },
   ];
   assert.equal(weightedScore(evaluations, new Map([["quality", 80], ["speed", 50], ["paused", 0]])), 70);
+});
+
+test("merge progress artifacts retain every series and deduplicate PR retries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-progress-test-"));
+  try {
+    await writeFile(join(root, "README.md"), "# Demo\n");
+    const timestamp = "2026-01-01T00:00:00.000Z";
+    const evaluations = [
+      { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+      { id: "speed", name: "Speed", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+    ];
+    await updateProgressArtifacts(root, evaluations, [
+      { key: "base:abc", recordedAt: timestamp, label: "base abc", kind: "baseline", title: "main", scores: { quality: 60, speed: 70 } },
+      { key: "pr:12", recordedAt: "2026-01-02T00:00:00.000Z", label: "PR #12", kind: "composite", prNumber: 12, title: "Combined", scores: { quality: 75, speed: 80 } },
+    ]);
+    await updateProgressArtifacts(root, evaluations, [
+      { key: "pr:12", recordedAt: "2026-01-03T00:00:00.000Z", label: "PR #12", kind: "composite", prNumber: 12, title: "Combined", scores: { quality: 76, speed: 81 } },
+    ]);
+    const readme = await readFile(join(root, "README.md"), "utf8");
+    const history = JSON.parse(await readFile(join(root, "docs", "burner-evaluation-history.json"), "utf8"));
+    const svg = await readFile(join(root, "docs", "burner-evaluation-progress.svg"), "utf8");
+    assert.match(readme, /burner-progress:start/);
+    assert.match(readme, /burner-evaluation-progress\.svg/);
+    assert.equal(history.points.length, 2);
+    assert.equal(history.points[1].recordedAt, "2026-01-02T00:00:00.000Z");
+    assert.equal(history.points[1].scores.quality, 76);
+    assert.match(svg, /Quality/);
+    assert.match(svg, /PR #12/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("benchmark-oriented ideas conservatively infer the shared CPU resource", () => {
@@ -146,7 +178,9 @@ test("portfolio merge clock starts after full and screening baselines", async ()
     const contexts = [];
     orchestrator.runEvaluations = async (context) => {
       contexts.push(context);
-      return [{ id: `run-${context}`, evaluationId: "bench", score: 80, commit: "base", createdAt: new Date().toISOString(), durationMs: 1, status: "completed", context }];
+      const run = { id: `run-${context}`, evaluationId: "bench", score: 80, commit: "base", createdAt: new Date().toISOString(), durationMs: 1, status: "completed", context };
+      await store.update((state) => state.evaluationRuns.push(run));
+      return [run];
     };
     await orchestrator.runBaselineEvaluations("baseline");
     assert.deepEqual(contexts, ["baseline", "screening_baseline"]);
