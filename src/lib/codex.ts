@@ -257,17 +257,17 @@ export class CodexClient {
       let result = await this.runCodex(args, {
         cwd,
         input: prompt,
-        timeoutMs: 45 * 60 * 1000,
+        timeoutMs: 15 * 60 * 1000,
         onStderr: (line) => this.onProgress?.(line),
       });
-      if (result.exitCode !== 0) {
+      if (result.exitCode !== 0 && result.exitCode !== 124) {
         await rm(outputPath, { force: true });
         const fallbackArgs = this.args(cwd, model);
         fallbackArgs.push("--output-last-message", outputPath, "-");
         result = await this.runCodex(fallbackArgs, {
           cwd,
           input: this.schemaFallbackPrompt(prompt, schema),
-          timeoutMs: 45 * 60 * 1000,
+          timeoutMs: 15 * 60 * 1000,
           onStderr: (line) => this.onProgress?.(line),
         });
       }
@@ -295,7 +295,7 @@ export class CodexClient {
         timeoutMs: 60 * 60 * 1000,
         onStderr: (line) => this.onProgress?.(line),
       });
-      if (result.exitCode !== 0) {
+      if (result.exitCode !== 0 && result.exitCode !== 124) {
         await rm(outputPath, { force: true });
         const fallbackArgs = this.args(cwd, model);
         fallbackArgs.push("--output-last-message", outputPath, "-");

@@ -10,6 +10,7 @@ import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
 import { inferIdeaResources, Orchestrator, selectYoloLeafBatch, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
+import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
 import { createBurnerServer } from "../dist/server.js";
 import { StateStore, validateEvaluation } from "../dist/lib/store.js";
@@ -26,6 +27,14 @@ test("CLI version matches the package version", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const output = await exec(process.cwd(), process.execPath, ["dist/cli.js", "--version"]);
   assert.equal(output.trim(), packageJson.version);
+});
+
+test("command timeouts terminate descendant processes and return exit code 124", async () => {
+  const started = Date.now();
+  const result = await runCommand("/bin/sh", ["-c", "sleep 30 & wait"], { cwd: process.cwd(), timeoutMs: 50 });
+  assert.equal(result.exitCode, 124);
+  assert.match(result.stderr, /Command timed out after 50ms/);
+  assert.ok(Date.now() - started < 2_000, "timed-out descendants should not keep their inherited pipes open");
 });
 
 test("score helpers clamp and weight enabled evaluations", () => {
@@ -186,6 +195,38 @@ test("portfolio merge clock starts after full and screening baselines", async ()
     assert.deepEqual(contexts, ["baseline", "screening_baseline"]);
     assert.ok(store.get().orchestrator.lastEvaluationAt);
     assert.ok(store.get().orchestrator.mergeWindowStartedAt);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("baseline recovery reruns only evaluations missing at the current commit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-partial-baseline-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [
+        { id: "done", name: "Done", prompt: "Measure", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "missing", name: "Missing", prompt: "Measure", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+      state.evaluationRuns.push({ id: "done-run", evaluationId: "done", score: 95, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    const calls = [];
+    orchestrator.runEvaluations = async (context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+      calls.push({ context, evaluationIds });
+      const run = { id: `run-${context}`, evaluationId: "missing", score: 92, commit: "base", createdAt: new Date().toISOString(), durationMs: 1, status: "completed", context };
+      await store.update((state) => state.evaluationRuns.push(run));
+      return [run];
+    };
+    await orchestrator.runBaselineEvaluations("baseline");
+    assert.deepEqual(calls, [
+      { context: "baseline", evaluationIds: ["missing"] },
+      { context: "screening_baseline", evaluationIds: ["missing"] },
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

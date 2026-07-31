@@ -412,7 +412,13 @@ export class Orchestrator {
     return this.store.get().agentRuns.find((item) => item.id === run.id)!;
   }
 
-  async runEvaluations(context: EvaluationRun["context"] = "manual", cwd = this.root, agentRunId?: string, compositeId?: string): Promise<EvaluationRun[]> {
+  async runEvaluations(
+    context: EvaluationRun["context"] = "manual",
+    cwd = this.root,
+    agentRunId?: string,
+    compositeId?: string,
+    evaluationIds?: readonly string[],
+  ): Promise<EvaluationRun[]> {
     const owner = id("evalsuite");
     const callerOwnsCpuLock = Boolean(
       agentRunId && this.store.get().agentRuns.find((run) => run.id === agentRunId)?.resources.includes("cpu-heavy"),
@@ -426,7 +432,7 @@ export class Orchestrator {
     let suiteLock: HeldLock | undefined;
     try {
       suiteLock = await this.locks.acquire("evaluation-suite", owner, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
-      return await this.runEvaluationSuite(context, cwd, agentRunId, compositeId);
+      return await this.runEvaluationSuite(context, cwd, agentRunId, compositeId, evaluationIds);
     } finally {
       await suiteLock?.release();
       await cpuLock?.release();
@@ -437,12 +443,14 @@ export class Orchestrator {
     const commit = await this.git.resolveRef(this.store.get().settings.baseBranch);
     const enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
     const fullBaseline = this.store.latestRuns();
-    const fullRuns = enabled.every((evaluation) => fullBaseline.get(evaluation.id)?.commit === commit)
+    const missingFull = enabled.filter((evaluation) => fullBaseline.get(evaluation.id)?.commit !== commit);
+    const fullRuns = missingFull.length === 0
       ? []
-      : await this.runEvaluations(context);
+      : await this.runEvaluations(context, this.root, undefined, undefined, missingFull.map((evaluation) => evaluation.id));
     const screeningBaseline = this.store.latestScreeningRuns();
-    const screeningRuns = enabled.some((evaluation) => evaluation.screeningCommand && screeningBaseline.get(evaluation.id)?.commit !== commit)
-      ? await this.runEvaluations("screening_baseline")
+    const missingScreening = enabled.filter((evaluation) => evaluation.screeningCommand && screeningBaseline.get(evaluation.id)?.commit !== commit);
+    const screeningRuns = missingScreening.length > 0
+      ? await this.runEvaluations("screening_baseline", this.root, undefined, undefined, missingScreening.map((evaluation) => evaluation.id))
       : [];
     const runs = [...fullRuns, ...screeningRuns];
     const refreshedFull = this.store.latestRuns();
@@ -485,9 +493,20 @@ export class Orchestrator {
     return true;
   }
 
-  private async runEvaluationSuite(context: EvaluationRun["context"], cwd: string, agentRunId?: string, compositeId?: string): Promise<EvaluationRun[]> {
+  private async runEvaluationSuite(
+    context: EvaluationRun["context"],
+    cwd: string,
+    agentRunId?: string,
+    compositeId?: string,
+    evaluationIds?: readonly string[],
+  ): Promise<EvaluationRun[]> {
     const state = this.store.get();
-    const evaluations = state.evaluations.filter((evaluation) => evaluation.enabled && (context !== "screening_baseline" || evaluation.screeningCommand));
+    const selectedIds = evaluationIds ? new Set(evaluationIds) : undefined;
+    const evaluations = state.evaluations.filter((evaluation) =>
+      evaluation.enabled &&
+      (!selectedIds || selectedIds.has(evaluation.id)) &&
+      (context !== "screening_baseline" || evaluation.screeningCommand),
+    );
     if (!evaluations.length) throw new Error("Add at least one enabled evaluation first.");
     if (evaluations.some((evaluation) => !evaluation.command)) await this.codex.preflight(cwd);
     const commit = await this.git.head(cwd);
