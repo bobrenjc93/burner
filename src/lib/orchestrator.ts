@@ -142,6 +142,24 @@ export class Orchestrator {
     return Boolean(anchor && Date.now() - new Date(anchor).getTime() >= state.settings.mergeCadenceMinutes * 60_000);
   }
 
+  private portfolioCookDue(state = this.store.get()): boolean {
+    if (!this.portfolioMode()) return false;
+    const anchor = state.orchestrator.lastMergeAt ?? state.orchestrator.mergeWindowStartedAt;
+    if (!anchor) return false;
+    const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
+    const latest = this.store.latestRuns();
+    let commandMs = 0;
+    let promptMs = 0;
+    for (const evaluation of state.evaluations.filter((item) => item.enabled)) {
+      const duration = latest.get(evaluation.id)?.durationMs ?? 0;
+      if (evaluation.command) commandMs += duration;
+      else promptMs = Math.max(promptMs, duration);
+    }
+    const observedLeadMs = commandMs + promptMs + 5 * 60_000;
+    const leadMs = Math.min(Math.max(5 * 60_000, observedLeadMs), Math.max(0, cadenceMs - 5 * 60_000));
+    return Date.now() - new Date(anchor).getTime() >= cadenceMs - leadMs;
+  }
+
   private portfolioReviewLimit(settings: BurnerState["settings"]): number {
     return this.portfolioMode() ? Math.min(settings.maxReviewRounds, settings.portfolioReviewRounds) : settings.maxReviewRounds;
   }
@@ -278,13 +296,14 @@ export class Orchestrator {
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const cadenceDue = this.mergeCadenceDue(state);
-    const leafIds = selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, cadenceDue ? 2 : this.yoloBatchSize);
+    const cookDue = cadenceDue || this.portfolioCookDue(state);
+    const leafIds = selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, cookDue ? 2 : this.yoloBatchSize);
     if (!leafIds.length) return false;
     const generation = state.composites.length + 1;
     await this.createComposite(
       leafIds,
       `YOLO generation ${generation}: ${leafIds.length} reviewed improvements`,
-      `Automatically master-cooked from ${leafIds.length} independently authored, reviewed, and evaluated leaf pull requests on ${state.settings.baseBranch.slice(0, 80)}.${cadenceDue && leafIds.length < this.yoloBatchSize ? ` Burner shortened this batch to honor the ${state.settings.mergeCadenceMinutes}-minute merge cadence.` : ""}`,
+      `Automatically master-cooked from ${leafIds.length} independently authored, reviewed, and evaluated leaf pull requests on ${state.settings.baseBranch.slice(0, 80)}.${cookDue && leafIds.length < this.yoloBatchSize ? ` Burner shortened this batch early enough to honor the ${state.settings.mergeCadenceMinutes}-minute merge deadline.` : ""}`,
       { makeLiving: false },
     );
     this.portfolioDraining = false;
@@ -296,17 +315,18 @@ export class Orchestrator {
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const cadenceDue = this.mergeCadenceDue(state);
+    const cookDue = cadenceDue || this.portfolioCookDue(state);
     const eligible = eligibleYoloLeaves(state, baseCommit);
-    const selected = cadenceDue
+    const selected = cookDue
       ? eligible.slice(0, this.yoloBatchSize).map((run) => run.id)
       : selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize);
-    const ready = selected.length >= (cadenceDue ? 1 : this.yoloBatchSize);
+    const ready = selected.length >= (cadenceDue ? 1 : cookDue ? 2 : this.yoloBatchSize);
     if (ready && !this.portfolioDraining) {
       this.portfolioDraining = true;
       await this.store.addActivity({
         type: "pr",
         message: "Portfolio batch ready; draining active agents",
-        detail: `${selected.length} eligible leaves are reserved for the next composite${cadenceDue ? " under the merge-cadence escape path" : ""}. No replacement agents will start until the current ${this.activeAgents.size} finish.`,
+        detail: `${selected.length} eligible leaves are reserved for the next composite${cookDue ? " under deadline-aware cadence scheduling" : ""}. No replacement agents will start until the current ${this.activeAgents.size} finish.`,
       });
     } else if (!ready) {
       this.portfolioDraining = false;

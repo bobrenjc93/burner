@@ -427,6 +427,32 @@ test("YOLO portfolio automatically cooks a complete batch without creating a liv
   }
 });
 
+test("YOLO starts a partial cook early enough for the observed full suite to meet its deadline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-deadline-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.evaluations = [
+        { id: "benchmark", name: "Benchmark", prompt: "Measure", command: "./full", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+      state.evaluationRuns = [
+        { id: "benchmark-run", evaluationId: "benchmark", score: 80, commit: "base", createdAt: timestamp, durationMs: 40 * 60_000, status: "completed", context: "baseline" },
+        { id: "quality-run", evaluationId: "quality", score: 80, commit: "base", createdAt: timestamp, durationMs: 3 * 60_000, status: "completed", context: "baseline" },
+      ];
+      state.orchestrator.mergeWindowStartedAt = new Date(Date.now() - 13 * 60_000).toISOString();
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    assert.equal(orchestrator.mergeCadenceDue(), false);
+    assert.equal(orchestrator.portfolioCookDue(), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("YOLO cadence cooks a healthy partial batch and falls back to one reviewed leaf", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-cadence-test-"));
   try {
