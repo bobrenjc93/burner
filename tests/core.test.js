@@ -885,6 +885,7 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
       assert.ok(!args.some((arg) => /sandbox_mode|approval_policy|read-only|workspace-write/.test(arg)));
     }
     assert.ok(calls.some(({ input }) => input.includes("rigorous repository evaluator")));
+    assert.ok(calls.some(({ input }) => input.includes("Finish this evaluation within 10 minutes")));
     assert.ok(calls.some(({ input }) => input.includes("improvement planner")));
     assert.ok(calls.some(({ input }) => input.includes("implementation agent")));
     const authorCall = calls.find(({ input }) => input.includes("implementation agent"));
@@ -1095,10 +1096,11 @@ test("state persists evaluation configuration and excludes candidate scores from
     await store.update((state) => {
       state.evaluationRuns.push(
         { id: "baseline", evaluationId: evaluation.id, score: 61, commit: "a", createdAt: "2026-01-01T00:00:00.000Z", durationMs: 1, status: "completed", context: "manual" },
-        { id: "candidate", evaluationId: evaluation.id, score: 99, commit: "b", createdAt: "2026-01-02T00:00:00.000Z", durationMs: 1, status: "completed", context: "agent" },
+        { id: "candidate", evaluationId: evaluation.id, score: 99, commit: "b", createdAt: "2026-01-02T00:00:00.000Z", durationMs: 1, status: "completed", context: "agent", error: "x".repeat(20_000) },
       );
     });
     assert.equal(store.latestRuns().get(evaluation.id)?.score, 61);
+    assert.ok(store.get().evaluationRuns.find((run) => run.id === "candidate").error.length <= 8_020);
     const reloaded = new StateStore(root);
     await reloaded.init();
     assert.equal(reloaded.get().projectName, root.split("/").at(-1));

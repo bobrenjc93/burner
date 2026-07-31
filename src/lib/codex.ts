@@ -76,6 +76,12 @@ export type PlannedIdea = Omit<Idea, "id" | "status" | "createdAt" | "updatedAt"
 export type SessionResult = { message: string; threadId: string };
 export type ReviewResult = { approved: boolean; summary: string; findings: ReviewFinding[] };
 
+function commandFailure(result: CommandResult, fallback: string): string {
+  const raw = result.stderr.trim() || result.stdout.trim() || fallback;
+  if (result.exitCode === 124) return raw.split("\n").reverse().find((line) => /timed out/i.test(line)) ?? fallback;
+  return raw.length > 8_000 ? `…[truncated]\n${raw.slice(-8_000)}` : raw;
+}
+
 export class CodexClient {
   private unrestrictedArgsPromise?: Promise<string[]>;
 
@@ -104,6 +110,7 @@ export class CodexClient {
     const prompt = [
       "You are a rigorous repository evaluator. Inspect the current repository state and answer the evaluation below.",
       "Base the score on concrete evidence from code, tests, configuration, and user-facing behavior. Do not edit any files.",
+      "Finish this evaluation within 10 minutes. Inspect targeted, representative evidence for every rubric category; do not exhaustively read every file or narrate intermediate progress.",
       "A score of 100 means genuinely exceptional and production-ready. Be calibrated, concise, and actionable.",
       `Evaluation: ${evaluation.name}`,
       evaluation.prompt,
@@ -272,7 +279,7 @@ export class CodexClient {
           onStderr: (line) => this.onProgress?.(line),
         });
       }
-      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || `codex exec exited with ${result.exitCode}`);
+      if (result.exitCode !== 0) throw new Error(commandFailure(result, `codex exec exited with ${result.exitCode}`));
       const raw = await readFile(outputPath, "utf8").catch(() => result.stdout);
       return parseJsonObject<T>(raw);
     } catch (error) {
@@ -307,7 +314,7 @@ export class CodexClient {
           onStderr: (line) => this.onProgress?.(line),
         });
       }
-      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || `codex reviewer exited with ${result.exitCode}`);
+      if (result.exitCode !== 0) throw new Error(commandFailure(result, `codex reviewer exited with ${result.exitCode}`));
       return parseJsonObject<T>(await readFile(outputPath, "utf8").catch(() => result.stdout));
     } finally {
       await rm(tempDir, { recursive: true, force: true });
@@ -336,7 +343,7 @@ export class CodexClient {
         timeoutMs: 2 * 60 * 60 * 1000,
         onStderr: (line) => this.onProgress?.(line),
       });
-      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `codex exec exited with ${result.exitCode}`);
+      if (result.exitCode !== 0) throw new Error(commandFailure(result, `codex exec exited with ${result.exitCode}`));
       const threadEvent = result.stdout.split("\n").map((line) => {
         try { return JSON.parse(line) as { type?: string; thread_id?: string }; } catch { return undefined; }
       }).find((event) => event?.type === "thread.started" && event.thread_id);

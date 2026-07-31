@@ -226,6 +226,11 @@ export class StateStore {
     const referencedRuns = new Set(this.state.composites.flatMap((composite) => composite.sources.map((source) => source.agentRunId)));
     const recentRuns = new Set(this.state.agentRuns.slice(-500).map((run) => run.id));
     this.state.agentRuns = this.state.agentRuns.filter((run) => recentRuns.has(run.id) || referencedRuns.has(run.id) || run.prState === "open");
+    const compact = (value: string | undefined) => value && value.length > 8_000 ? `…[truncated]\n${value.slice(-8_000)}` : value;
+    for (const run of this.state.evaluationRuns) run.error = compact(run.error);
+    for (const run of this.state.agentRuns) run.error = compact(run.error);
+    for (const composite of this.state.composites) composite.error = compact(composite.error);
+    for (const activity of this.state.activity) activity.detail = compact(activity.detail);
   }
 
   private migrate(): void {
