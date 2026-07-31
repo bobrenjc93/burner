@@ -74,6 +74,8 @@ function validateSettings(input: Record<string, unknown>): BurnerSettings {
     remote: text("remote"),
     defaultResources: Array.isArray(input.defaultResources) ? input.defaultResources.map(String).map((value) => value.trim()).filter(Boolean).slice(0, 20) : [],
     maxReviewRounds: integer("maxReviewRounds", 1, 50),
+    portfolioReviewRounds: integer("portfolioReviewRounds", 1, 10),
+    mergeCadenceMinutes: integer("mergeCadenceMinutes", 5, 10_080),
     preferLivingComposite: Boolean(input.preferLivingComposite),
     compositeAbsorbThreshold: number("compositeAbsorbThreshold", 0, 100),
   };

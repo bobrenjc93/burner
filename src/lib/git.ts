@@ -141,10 +141,13 @@ export class GitService {
     branch: string;
     title: string;
     body: string;
+    draft?: boolean;
   }): Promise<{ url: string; number?: number }> {
+    const args = ["pr", "create", "--base", options.base, "--head", options.branch, "--title", options.title, "--body", options.body];
+    if (options.draft) args.push("--draft");
     const result = await runCommand(
       "gh",
-      ["pr", "create", "--base", options.base, "--head", options.branch, "--title", options.title, "--body", options.body],
+      args,
       { cwd: options.cwd, timeoutMs: 5 * 60 * 1000 },
     );
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not open pull request");
@@ -164,6 +167,28 @@ export class GitService {
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not update PR #${number}`);
   }
 
+  async markPrReady(cwd: string, number: number): Promise<void> {
+    const result = await runCommand("gh", ["pr", "ready", String(number)], { cwd, timeoutMs: 2 * 60 * 1000 });
+    const stderr = result.stderr.toLowerCase();
+    if (result.exitCode !== 0 && !stderr.includes("already marked ready") && !stderr.includes("not a draft")) {
+      throw new Error(result.stderr.trim() || `Could not mark PR #${number} ready`);
+    }
+  }
+
+  async markPrDraft(cwd: string, number: number): Promise<void> {
+    const result = await runCommand("gh", ["pr", "ready", String(number), "--undo"], { cwd, timeoutMs: 2 * 60 * 1000 });
+    const stderr = result.stderr.toLowerCase();
+    if (result.exitCode !== 0 && !stderr.includes("already a draft") && !stderr.includes("is a draft")) {
+      throw new Error(result.stderr.trim() || `Could not mark PR #${number} as draft`);
+    }
+  }
+
+  async changedFiles(cwd: string, base: string, head: string): Promise<string[]> {
+    const result = await runCommand("git", ["diff", "--name-only", `${base}...${head}`], { cwd });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not compare ${base} and ${head}`);
+    return result.stdout.split("\n").map((value) => value.trim()).filter(Boolean);
+  }
+
   async closePr(cwd: string, number: number, comment: string, disposition: PullRequestDisposition = "unmerged"): Promise<void> {
     const result = await runCommand("gh", ["pr", "close", String(number), "--comment", comment], { cwd, timeoutMs: 5 * 60 * 1000 });
     if (result.exitCode !== 0 && !result.stderr.includes("already closed")) throw new Error(result.stderr.trim() || `Could not close PR #${number}`);
@@ -180,12 +205,24 @@ export class GitService {
     await this.ensureDispositionLabels(cwd);
     const desired = `burner-${disposition}`;
     const opposite = disposition === "merged" ? "burner-unmerged" : "burner-merged";
+    const args = ["pr", "edit", String(number), "--add-label", desired, "--remove-label", opposite];
+    if (disposition === "merged") args.push("--remove-label", "burner-quarantined");
     const result = await runCommand(
       "gh",
-      ["pr", "edit", String(number), "--add-label", desired, "--remove-label", opposite],
+      args,
       { cwd, timeoutMs: 2 * 60 * 1000 },
     );
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not label PR #${number} as ${disposition}`);
+  }
+
+  async markPrQuarantined(cwd: string, number: number): Promise<void> {
+    await this.ensureDispositionLabels(cwd);
+    const result = await runCommand(
+      "gh",
+      ["pr", "edit", String(number), "--add-label", "burner-quarantined"],
+      { cwd, timeoutMs: 2 * 60 * 1000 },
+    );
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not quarantine PR #${number}`);
   }
 
   private async ensureDispositionLabels(cwd: string): Promise<void> {
@@ -193,6 +230,7 @@ export class GitService {
     const labels = [
       ["burner-merged", "1f883d", "Merged directly or included through a merged Burner composite"],
       ["burner-unmerged", "d97706", "Open or closed without inclusion in main"],
+      ["burner-quarantined", "cf222e", "Removed from an autonomous batch after exhausting its review budget"],
     ] as const;
     for (const [name, color, description] of labels) {
       const result = await runCommand(
@@ -297,5 +335,26 @@ export function buildCompositePrBody(options: { description: string; sources: Co
     "Burner continuously updates this feature branch with approved, regression-free experiments. Merging it closes included source PRs and rebuilds every other open composite against the new base.",
     "",
     "<sub>Composite scores are recalculated from the combined worktree, never inferred by adding individual deltas.</sub>",
+  ].join("\n");
+}
+
+export function buildCompositeDraftPrBody(options: { description: string; sources: CompositeSource[]; reviewRounds?: ReviewRound[]; phase: string }): string {
+  return [
+    "## Master cook · draft",
+    "",
+    options.description,
+    "",
+    `🚧 **Burner is ${options.phase}.** This PR is visible early for auditability but is not mergeable until independent review and combined-code evaluation finish.`,
+    "",
+    "## Constituent changes",
+    "",
+    ...options.sources.map((source) => source.prNumber ? `- #${source.prNumber} — ${source.title}` : `- 🧪 ${source.title}`),
+    "",
+    ...(options.reviewRounds?.length ? reviewSection(options.reviewRounds) : []),
+    "## Recalculated composite evaluation",
+    "",
+    "Pending. Burner will replace this section with scores measured from the actual combined checkout, then mark the PR ready.",
+    "",
+    "<sub>Draft opened early by Burner so integration and review progress is visible on GitHub.</sub>",
   ].join("\n");
 }

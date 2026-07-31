@@ -48,6 +48,8 @@ Server options:
 
 Command options:
   -C, --directory <path>  target repository (default: current directory)
+  --merge-cadence-minutes <n>  YOLO merge-health window (default: 60)
+  --portfolio-review-rounds <n> bounded YOLO review rounds (default: 3)
   --json                  JSON output (commands already default to JSON)
   -V, --version           output the version number
   -h, --help              display help`;
@@ -205,9 +207,13 @@ async function runHeadless(args: string[]): Promise<boolean> {
       const settings = state.settings;
       const parallelism = option(args, "--parallelism");
       const reviewRounds = option(args, "--max-review-rounds");
+      const portfolioReviewRounds = option(args, "--portfolio-review-rounds");
+      const mergeCadence = option(args, "--merge-cadence-minutes");
       const threshold = option(args, "--absorb-threshold");
       if (parallelism !== undefined) settings.parallelism = numberOption(args, "--parallelism", settings.parallelism, 1, 12);
       if (reviewRounds !== undefined) settings.maxReviewRounds = numberOption(args, "--max-review-rounds", settings.maxReviewRounds, 1, 50);
+      if (portfolioReviewRounds !== undefined) settings.portfolioReviewRounds = numberOption(args, "--portfolio-review-rounds", settings.portfolioReviewRounds, 1, 10);
+      if (mergeCadence !== undefined) settings.mergeCadenceMinutes = numberOption(args, "--merge-cadence-minutes", settings.mergeCadenceMinutes, 5, 10_080);
       if (threshold !== undefined) settings.compositeAbsorbThreshold = numberOption(args, "--absorb-threshold", settings.compositeAbsorbThreshold, 0, 100);
       settings.autoCreatePrs = boolOption(args, "--auto-create-prs", settings.autoCreatePrs);
       settings.preferLivingComposite = boolOption(args, "--prefer-living", settings.preferLivingComposite);

@@ -9,7 +9,7 @@ import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
 import { inferIdeaResources, Orchestrator, selectYoloLeafBatch, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
-import { buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
+import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
 import { createBurnerServer } from "../dist/server.js";
 import { StateStore, validateEvaluation } from "../dist/lib/store.js";
 import { clampScore, parseJsonObject, slugify, weightedScore } from "../dist/lib/utils.js";
@@ -84,9 +84,11 @@ test("headless CLI configures evaluations, ideas, and conservative settings as J
     assert.equal(idea.predictedImpact, 90);
     assert.deepEqual(idea.evaluationIds, [evaluation.id]);
     assert.deepEqual(idea.resources, ["cpu"]);
-    const settings = JSON.parse(await exec(root, "node", [cli, "settings", "set", "-C", root, "--parallelism", "1", "--max-review-rounds", "4", "--auto-create-prs", "true"]));
+    const settings = JSON.parse(await exec(root, "node", [cli, "settings", "set", "-C", root, "--parallelism", "1", "--max-review-rounds", "4", "--portfolio-review-rounds", "3", "--merge-cadence-minutes", "60", "--auto-create-prs", "true"]));
     assert.equal(settings.parallelism, 1);
     assert.equal(settings.maxReviewRounds, 4);
+    assert.equal(settings.portfolioReviewRounds, 3);
+    assert.equal(settings.mergeCadenceMinutes, 60);
     assert.equal(settings.autoCreatePrs, true);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -266,12 +268,18 @@ test("GitHub PR disposition labels are mutually exclusive and initialized once",
   process.env.BURNER_TEST_GH_ARGS = argsLog;
   try {
     const git = new GitService(root, join(root, ".burner"));
+    await git.openPr({ cwd: root, base: "main", branch: "composite", title: "Composite", body: "Draft", draft: true });
+    await git.markPrReady(root, 42);
+    await git.markPrDraft(root, 42);
     await git.markPrDisposition(root, 42, "unmerged");
     await git.markPrDisposition(root, 42, "merged");
     const calls = (await readFile(argsLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    assert.equal(calls.filter((args) => args[0] === "label" && args[1] === "create").length, 2);
+    assert.ok(calls.some((args) => args[0] === "pr" && args[1] === "create" && args.includes("--draft")));
+    assert.ok(calls.some((args) => args[0] === "pr" && args[1] === "ready"));
+    assert.ok(calls.some((args) => args[0] === "pr" && args[1] === "ready" && args.includes("--undo")));
+    assert.equal(calls.filter((args) => args[0] === "label" && args[1] === "create").length, 3);
     assert.deepEqual(calls.at(-2), ["pr", "edit", "42", "--add-label", "burner-unmerged", "--remove-label", "burner-merged"]);
-    assert.deepEqual(calls.at(-1), ["pr", "edit", "42", "--add-label", "burner-merged", "--remove-label", "burner-unmerged"]);
+    assert.deepEqual(calls.at(-1), ["pr", "edit", "42", "--add-label", "burner-merged", "--remove-label", "burner-unmerged", "--remove-label", "burner-quarantined"]);
   } finally {
     process.env.PATH = previousPath;
     delete process.env.BURNER_TEST_GH_ARGS;
@@ -287,6 +295,9 @@ test("PR bodies record review approval and recalculated composite scores", () =>
   assert.match(body, /Composite score: 82\.0 \/ 100/);
   assert.match(body, /#12/);
   assert.match(body, /never inferred by adding individual deltas/);
+  const draft = buildCompositeDraftPrBody({ description: "Combined", sources: [{ agentRunId: "a", prNumber: 12, title: "A", branch: "a" }, { agentRunId: "b", prNumber: 13, title: "B", branch: "b" }], phase: "awaiting review" });
+  assert.match(draft, /Master cook · draft/);
+  assert.match(draft, /not mergeable until independent review and combined-code evaluation finish/);
 });
 
 test("YOLO merge selection prefers reviewed composites and rejects stale or deterministic regressions", () => {
@@ -325,6 +336,7 @@ test("YOLO portfolio waits for a full leaf batch, ranks impact, and reserves com
     agentRuns: [leaf("a1", 1), leaf("a2", 8), leaf("a3", 5)],
   };
   assert.deepEqual(selectYoloLeafBatch(state, "base", 4), []);
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 4, 2), ["a2", "a3", "a1"]);
   assert.deepEqual(selectYoloLeafBatch(state, "base", 3), ["a2", "a3", "a1"]);
   state.composites.push({ id: "composite", status: "queued", sources: [{ agentRunId: "a2" }] });
   assert.deepEqual(selectYoloLeafBatch(state, "base", 3), []);
@@ -332,6 +344,8 @@ test("YOLO portfolio waits for a full leaf batch, ranks impact, and reserves com
   assert.deepEqual(selectYoloLeafBatch(state, "base", 3), ["a3", "a4", "a1"]);
   state.agentRuns[2].baseCommit = "old-base";
   assert.deepEqual(selectYoloLeafBatch(state, "base", 3), []);
+  state.agentRuns[1].quarantinedAt = new Date().toISOString();
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 3, 2), ["a4", "a1"]);
 });
 
 test("YOLO portfolio automatically cooks a complete batch without creating a living line", async () => {
@@ -359,6 +373,126 @@ test("YOLO portfolio automatically cooks a complete batch without creating a liv
     assert.match(request[1], /YOLO generation 1/);
     assert.deepEqual(request[3], { makeLiving: false });
     assert.equal(store.get().orchestrator.livingCompositeId, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("YOLO cadence cooks a healthy partial batch and falls back to one reviewed leaf", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-cadence-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const old = new Date(Date.now() - 61 * 60_000).toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    const leaf = (id, number, impact) => ({ id, ideaId: `idea-${id}`, status: "completed", branch: `branch-${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp, prUrl: `https://example.test/pull/${number}`, prNumber: number, prState: "open", baseCommit: "base", deltas: [{ evaluationId: "speed", name: "Speed", before: 80, after: 81, delta: 1 }], impact, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.mergeWindowStartedAt = old;
+      state.evaluations = [{ id: "speed", name: "Speed", prompt: "Measure speed", command: "./benchmark", weight: 1, enabled: true, createdAt: timestamp }];
+      state.agentRuns = [leaf("a", 1, 3), leaf("b", 2, 2)];
+      state.ideas.push(
+        { id: "idea-a", title: "A", description: "", rationale: "", predictedImpact: 3, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "a" },
+        { id: "idea-b", title: "B", description: "", rationale: "", predictedImpact: 2, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "b" },
+      );
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    let cooked;
+    orchestrator.createComposite = async (...args) => { cooked = args; return {}; };
+    assert.equal(await orchestrator.autoMergeNext(), false);
+    assert.equal(await orchestrator.autoCookNext(), true);
+    assert.deepEqual(cooked[0], ["a", "b"]);
+    assert.match(cooked[2], /shortened this batch/);
+
+    await store.update((state) => { state.agentRuns.find((run) => run.id === "b").quarantinedAt = timestamp; });
+    orchestrator.activeAgents.add("in-flight");
+    assert.equal(await orchestrator.shouldDrainForPortfolio(), true);
+    orchestrator.activeAgents.clear();
+    let merged;
+    orchestrator.mergeAgent = async (id) => { merged = id; return {}; };
+    assert.equal(await orchestrator.autoMergeNext(), true);
+    assert.equal(merged, "a");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("YOLO portfolio caps reviews, quarantines the implicated leaf, and queues the healthy subset", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-quarantine-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const run = (id, number, impact) => ({ id, ideaId: `idea-${id}`, status: "completed", branch: `branch-${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp, prUrl: `https://example.test/pull/${number}`, prNumber: number, prState: "open", baseCommit: "base", deltas: [], impact, resources: [], reviewRounds: [], reviewApproved: true });
+    await store.update((state) => {
+      state.settings.portfolioReviewRounds = 3;
+      state.agentRuns.push(run("a", 1, 3), run("b", 2, 2), run("c", 3, 1));
+      state.composites.push({
+        id: "blocked", title: "Blocked generation", description: "Combined", status: "reviewing", branch: "composite-blocked", worktree: "", baseCommit: "base",
+        sources: [
+          { agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a", kind: "pull_request", impact: 3 },
+          { agentRunId: "b", prNumber: 2, title: "B", branch: "branch-b", kind: "pull_request", impact: 2 },
+          { agentRunId: "c", prNumber: 3, title: "C", branch: "branch-c", kind: "pull_request", impact: 1 },
+        ],
+        deltas: [], reviewRounds: [], prNumber: 100, prUrl: "https://example.test/pull/100", createdAt: timestamp, updatedAt: timestamp, isLiving: false,
+      });
+    });
+    const quarantined = [];
+    const closed = [];
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    orchestrator.git = {
+      resolveRef: async () => "base",
+      changedFiles: async (_cwd, _base, head) => head.endsWith("branch-b") ? ["src/parser.ts"] : ["README.md"],
+      markPrQuarantined: async (_cwd, number) => quarantined.push(number),
+      closePr: async (_cwd, number) => closed.push(number),
+    };
+    let fallback;
+    orchestrator.createComposite = async (ids, title, description) => { fallback = { ids, title, description }; return { id: "fallback" }; };
+    await orchestrator.quarantineCompositeBlocker("blocked", [{ severity: "high", title: "Parser bug", detail: "Fix", file: "src/parser.ts:42" }]);
+    const state = store.get();
+    assert.ok(state.agentRuns.find((item) => item.id === "b").quarantinedAt);
+    assert.equal(state.composites.find((item) => item.id === "blocked").status, "closed");
+    assert.equal(state.composites.find((item) => item.id === "blocked").supersededByCompositeId, "fallback");
+    assert.deepEqual(fallback.ids, ["a", "c"]);
+    assert.deepEqual(quarantined, [2]);
+    assert.deepEqual(closed, [100]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("YOLO portfolio opens a draft composite before review and bounds review rounds", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-draft-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.settings.portfolioReviewRounds = 3;
+      state.composites.push({ id: "draft", title: "Visible composite", description: "Combined", status: "building", branch: "composite-draft", worktree: root, sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "a", kind: "pull_request" }, { agentRunId: "b", prNumber: 2, title: "B", branch: "b", kind: "pull_request" }], deltas: [], reviewRounds: [], createdAt: timestamp, updatedAt: timestamp, isLiving: false });
+      state.agentRuns.push({ id: "agent", ideaId: "idea", status: "reviewing", branch: "agent", worktree: root, startedAt: timestamp, deltas: [], resources: [], reviewRounds: [] });
+    });
+    const opened = [];
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    orchestrator.git = {
+      push: async () => undefined,
+      openPr: async (options) => { opened.push(options); return { url: "https://example.test/pull/10", number: 10 }; },
+      head: async () => "head",
+      hasChanges: async () => false,
+    };
+    await orchestrator.publishCompositeDraft(root, "draft", "awaiting review", store.get().settings);
+    assert.equal(opened[0].draft, true);
+    assert.equal(store.get().composites[0].prNumber, 10);
+
+    let reviewCalls = 0;
+    orchestrator.codex = {
+      review: async () => { reviewCalls += 1; return { approved: false, summary: "Not yet", findings: [{ severity: "high", title: "Bug", detail: "Fix", file: "src/app.ts" }] }; },
+      revise: async () => ({ threadId: "thread", message: "revised" }),
+    };
+    await assert.rejects(() => orchestrator.reviewAgent(root, "agent", "Agent", "main", "thread", store.get().settings), /bounded review budget/);
+    assert.equal(reviewCalls, 3);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -649,6 +783,8 @@ test("merged composites supersede source PRs and queue overlapping composites fo
     assert.deepEqual(labeled, [[100, "merged"]]);
     assert.equal(state.orchestrator.baseSyncPending, false);
     assert.equal(state.orchestrator.lastEvaluationAt, undefined);
+    assert.ok(state.orchestrator.lastMergeAt);
+    assert.equal(state.orchestrator.mergeWindowStartedAt, state.orchestrator.lastMergeAt);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -705,6 +841,8 @@ test("state persists evaluation configuration and excludes candidate scores from
     assert.equal(reloaded.get().projectName, root.split("/").at(-1));
     assert.equal(reloaded.get().version, 3);
     assert.equal(reloaded.get().settings.maxReviewRounds, 8);
+    assert.equal(reloaded.get().settings.portfolioReviewRounds, 3);
+    assert.equal(reloaded.get().settings.mergeCadenceMinutes, 60);
     assert.equal(reloaded.get().settings.parallelism, 1);
     assert.equal(reloaded.latestRuns().get(evaluation.id)?.score, 61);
     assert.deepEqual(validateEvaluation({ name: " UX ", prompt: " Score it ", weight: 2 }), { name: "UX", prompt: "Score it", weight: 2, enabled: true });

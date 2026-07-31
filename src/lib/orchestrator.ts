@@ -2,7 +2,7 @@ import { join } from "node:path";
 import type { AgentRun, BurnerState, CompositePr, CompositeSource, Evaluation, EvaluationRun, Idea, ReviewRound, RuntimeStatus, ScoreDelta } from "../types.js";
 import { CodexClient, type ReviewResult, type SessionResult } from "./codex.js";
 import { EventHub } from "./events.js";
-import { buildCompositePrBody, buildPrBody, GitService } from "./git.js";
+import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "./git.js";
 import type { HeldLock } from "./locks.js";
 import { LockManager } from "./locks.js";
 import { commandExists, runCommand } from "./process.js";
@@ -17,6 +17,13 @@ type AgentBase = {
 };
 
 export type YoloMergeCandidate = { kind: "agent" | "composite"; id: string; prNumber: number; impact: number };
+
+class PortfolioReviewLimitError extends Error {
+  constructor(readonly findings: ReviewResult["findings"], readonly target: "agent" | "composite") {
+    super(`Portfolio ${target} exhausted its bounded review budget.`);
+    this.name = "PortfolioReviewLimitError";
+  }
+}
 
 const finalReviewApproved = (reviewApproved: boolean | undefined, rounds: ReviewRound[]) => reviewApproved === true && rounds.at(-1)?.approved === true;
 
@@ -56,22 +63,27 @@ function reservedCompositeSourceIds(state: BurnerState): Set<string> {
     .flatMap((composite) => composite.sources.map((source) => source.agentRunId)));
 }
 
-export function selectYoloLeafBatch(state: BurnerState, baseCommit: string, batchSize: number): string[] {
-  if (batchSize < 2) return [];
+function eligibleYoloLeaves(state: BurnerState, baseCommit: string): AgentRun[] {
   const { enabled, commands } = yoloEvaluationSets(state);
   if (!enabled.size) return [];
   const reserved = reservedCompositeSourceIds(state);
-  const eligible = state.agentRuns
+  return state.agentRuns
     .filter((run) =>
       run.status === "completed" &&
       run.prState === "open" &&
       run.prNumber !== undefined &&
       run.baseCommit === baseCommit &&
+      !run.quarantinedAt &&
       !reserved.has(run.id) &&
       finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
       isYoloCandidate(run.deltas, run.impact, enabled, commands, state.settings.compositeAbsorbThreshold))
     .sort((a, b) => (b.impact ?? -Infinity) - (a.impact ?? -Infinity));
-  return eligible.length >= batchSize ? eligible.slice(0, batchSize).map((run) => run.id) : [];
+}
+
+export function selectYoloLeafBatch(state: BurnerState, baseCommit: string, batchSize: number, minimumSize = batchSize): string[] {
+  if (batchSize < 2 || minimumSize < 2) return [];
+  const eligible = eligibleYoloLeaves(state, baseCommit);
+  return eligible.length >= minimumSize ? eligible.slice(0, batchSize).map((run) => run.id) : [];
 }
 
 export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string, includeAgents = true): YoloMergeCandidate | undefined {
@@ -97,6 +109,7 @@ export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string,
       run.prState === "open" &&
       run.prNumber !== undefined &&
       run.baseCommit === baseCommit &&
+      !run.quarantinedAt &&
       !compositeSourceIds.has(run.id) &&
       finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
       isYoloCandidate(run.deltas, run.impact, enabledEvaluationIds, commandEvaluationIds, threshold))
@@ -118,6 +131,33 @@ export class Orchestrator {
   private readonly yolo: boolean;
   private readonly yoloBatchSize: number;
   private portfolioDraining = false;
+
+  private portfolioMode(): boolean {
+    return this.yolo && this.yoloBatchSize > 1;
+  }
+
+  private mergeCadenceDue(state = this.store.get()): boolean {
+    if (!this.portfolioMode()) return false;
+    const anchor = state.orchestrator.lastMergeAt ?? state.orchestrator.mergeWindowStartedAt;
+    return Boolean(anchor && Date.now() - new Date(anchor).getTime() >= state.settings.mergeCadenceMinutes * 60_000);
+  }
+
+  private portfolioReviewLimit(settings: BurnerState["settings"]): number {
+    return this.portfolioMode() ? Math.min(settings.maxReviewRounds, settings.portfolioReviewRounds) : settings.maxReviewRounds;
+  }
+
+  private async recordCadenceBreach(): Promise<void> {
+    const state = this.store.get();
+    if (!this.mergeCadenceDue(state)) return;
+    const lastAlert = state.orchestrator.lastMergeCadenceAlertAt;
+    if (lastAlert && Date.now() - new Date(lastAlert).getTime() < state.settings.mergeCadenceMinutes * 60_000) return;
+    await this.store.update((draft) => { draft.orchestrator.lastMergeCadenceAlertAt = now(); });
+    await this.store.addActivity({
+      type: "error",
+      message: "Merge cadence missed",
+      detail: `No qualifying merge completed within ${state.settings.mergeCadenceMinutes} minutes. Burner will shorten the next batch, permit a single reviewed leaf merge, and quarantine review-loop blockers.`,
+    });
+  }
 
   constructor(
     private readonly root: string,
@@ -193,6 +233,9 @@ export class Orchestrator {
     const ghAuth = await runCommand("gh", ["auth", "status"], { cwd: this.root, timeoutMs: 8_000 });
     if (ghAuth.exitCode !== 0) throw new Error("Burner --yolo requires an authenticated GitHub CLI.");
     await this.codex.preflight(this.root);
+    await this.store.update((draft) => {
+      draft.orchestrator.mergeWindowStartedAt ??= now();
+    });
     await this.store.addActivity({
       type: "system",
       message: this.yoloBatchSize > 1 ? "YOLO portfolio enabled" : "YOLO autopilot enabled",
@@ -206,7 +249,8 @@ export class Orchestrator {
   private async autoMergeNext(): Promise<boolean> {
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
-    const candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1);
+    const cadenceNeedsSingleLeaf = this.mergeCadenceDue(state) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0;
+    const candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf);
     if (!candidate) return false;
     await this.store.addActivity({
       type: "pr",
@@ -222,13 +266,14 @@ export class Orchestrator {
     if (this.yoloBatchSize < 2) return false;
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
-    const leafIds = selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize);
+    const cadenceDue = this.mergeCadenceDue(state);
+    const leafIds = selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, cadenceDue ? 2 : this.yoloBatchSize);
     if (!leafIds.length) return false;
     const generation = state.composites.length + 1;
     await this.createComposite(
       leafIds,
       `YOLO generation ${generation}: ${leafIds.length} reviewed improvements`,
-      `Automatically master-cooked from ${leafIds.length} independently authored, reviewed, and evaluated leaf pull requests on ${state.settings.baseBranch.slice(0, 80)}.`,
+      `Automatically master-cooked from ${leafIds.length} independently authored, reviewed, and evaluated leaf pull requests on ${state.settings.baseBranch.slice(0, 80)}.${cadenceDue && leafIds.length < this.yoloBatchSize ? ` Burner shortened this batch to honor the ${state.settings.mergeCadenceMinutes}-minute merge cadence.` : ""}`,
       { makeLiving: false },
     );
     this.portfolioDraining = false;
@@ -239,13 +284,18 @@ export class Orchestrator {
     if (!this.yolo || this.yoloBatchSize < 2 || this.activeAgents.size === 0 || this.activeComposites.size > 0) return false;
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
-    const ready = selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize).length === this.yoloBatchSize;
+    const cadenceDue = this.mergeCadenceDue(state);
+    const eligible = eligibleYoloLeaves(state, baseCommit);
+    const selected = cadenceDue
+      ? eligible.slice(0, this.yoloBatchSize).map((run) => run.id)
+      : selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize);
+    const ready = selected.length >= (cadenceDue ? 1 : this.yoloBatchSize);
     if (ready && !this.portfolioDraining) {
       this.portfolioDraining = true;
       await this.store.addActivity({
         type: "pr",
         message: "Portfolio batch ready; draining active agents",
-        detail: `${this.yoloBatchSize} eligible leaves are reserved for the next composite. No replacement agents will start until the current ${this.activeAgents.size} finish.`,
+        detail: `${selected.length} eligible leaves are reserved for the next composite${cadenceDue ? " under the merge-cadence escape path" : ""}. No replacement agents will start until the current ${this.activeAgents.size} finish.`,
       });
     } else if (!ready) {
       this.portfolioDraining = false;
@@ -494,7 +544,7 @@ export class Orchestrator {
       const run = state.agentRuns.find((item) => item.id === runId);
       const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
       if (!run?.prNumber || !run.prUrl || (run.prState && run.prState !== "open")) throw new Error("Every composite source must be an open Burner pull request.");
-      return { agentRunId: run.id, prNumber: run.prNumber, title: idea?.title ?? run.branch, branch: run.branch, kind: "pull_request" as const };
+      return { agentRunId: run.id, prNumber: run.prNumber, title: idea?.title ?? run.branch, branch: run.branch, kind: "pull_request" as const, impact: run.impact };
     });
     if (sources.length < 2) throw new Error("Choose at least two open pull requests to master cook.");
     const compositeId = id("composite");
@@ -604,7 +654,14 @@ export class Orchestrator {
         if (!remote) continue;
         const next = remote.state === "OPEN" ? "open" : remote.state === "MERGED" ? "merged" : run.prState === "superseded" ? "superseded" : "closed";
         if (run.prState !== next) {
-          if (next === "merged") { baseChanged = true; draft.orchestrator.baseSyncPending = true; }
+          if (next === "merged") {
+            const mergedAt = now();
+            baseChanged = true;
+            draft.orchestrator.baseSyncPending = true;
+            draft.orchestrator.lastMergeAt = mergedAt;
+            draft.orchestrator.mergeWindowStartedAt = mergedAt;
+            draft.orchestrator.lastMergeCadenceAlertAt = undefined;
+          }
           run.prState = next;
           changedRunIds.add(run.id);
           dispositionUpdates.push({ number: run.prNumber, disposition: next === "merged" ? "merged" : "unmerged" });
@@ -615,9 +672,13 @@ export class Orchestrator {
         const remote = byNumber.get(composite.prNumber);
         if (!remote) continue;
         if (remote.state === "MERGED" && composite.status !== "merged") {
+          const mergedAt = now();
           composite.status = "merged";
-          composite.mergedAt = now();
-          composite.updatedAt = now();
+          composite.mergedAt = mergedAt;
+          composite.updatedAt = mergedAt;
+          draft.orchestrator.lastMergeAt = mergedAt;
+          draft.orchestrator.mergeWindowStartedAt = mergedAt;
+          draft.orchestrator.lastMergeCadenceAlertAt = undefined;
           newlyMergedCompositeIds.push(composite.id);
           baseChanged = true;
           draft.orchestrator.baseSyncPending = true;
@@ -744,6 +805,7 @@ export class Orchestrator {
       await this.syncPullRequests();
       const initial = this.store.get();
       if (!initial.orchestrator.enabled && !force) return;
+      if (this.portfolioMode()) await this.recordCadenceBreach();
       if (this.yolo && this.runningEvaluations === 0 && this.activeAgents.size === 0 && this.activeComposites.size === 0) {
         if (await this.autoMergeNext()) return;
         if (await this.autoCookNext()) return;
@@ -949,9 +1011,20 @@ export class Orchestrator {
       await this.reviewAndDeliverAgent(idea, base, runId, worktree, branch, settings, author.threadId, lastMessage);
     } catch (error) {
       const message = errorMessage(error);
-      await this.updateAgent(runId, { status: "failed", error: message, completedAt: now() });
+      const quarantined = error instanceof PortfolioReviewLimitError;
+      const completedAt = now();
+      await this.updateAgent(runId, {
+        status: "failed",
+        error: message,
+        completedAt,
+        ...(quarantined ? { quarantinedAt: completedAt, quarantineReason: `No approval within ${this.portfolioReviewLimit(this.store.get().settings)} portfolio review rounds.` } : {}),
+      });
       await this.finishIdea(idea.id, "failed");
-      await this.store.addActivity({ type: "error", message: `Agent failed: ${idea.title}`, detail: message });
+      await this.store.addActivity({
+        type: "error",
+        message: quarantined ? `Agent quarantined: ${idea.title}` : `Agent failed: ${idea.title}`,
+        detail: quarantined ? "The review budget was exhausted. Burner released the portfolio slot so healthier work can advance." : message,
+      });
       this.events.emit("agent", { runId, status: "failed", error: message });
     } finally {
       await releaseLocks();
@@ -1088,11 +1161,14 @@ export class Orchestrator {
         }
       }
 
+      await this.publishCompositeDraft(worktree, compositeId, "integrating the combined source branches", settings);
       const author = await this.codex.integrateComposite(worktree, composite.title, sourcesToMerge.map((source) => source.title), settings);
       if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: integrate ${composite.title}`);
       await this.updateComposite(compositeId, { authorThreadId: author.threadId, updatedAt: now() });
+      await this.publishCompositeDraft(worktree, compositeId, "integrating and awaiting independent review", settings);
       const reviewed = await this.reviewComposite(worktree, compositeId, composite.title, settings.baseBranch, author.threadId, settings);
       await this.updateComposite(compositeId, { authorThreadId: reviewed.threadId, reviewApproved: true, status: "evaluating", updatedAt: now() });
+      await this.publishCompositeDraft(worktree, compositeId, "recalculating every evaluation after review approval", settings);
 
       if (await this.git.resolveRef(settings.baseBranch) !== baseCommit) {
         throw new Error("BASE_CHANGED: the base branch moved while this composite was cooking; it will be rebuilt and reevaluated.");
@@ -1117,9 +1193,10 @@ export class Orchestrator {
       if (await this.git.resolveRef(settings.baseBranch) !== baseCommit) {
         throw new Error("BASE_CHANGED: the base branch moved during composite evaluation; it will be rebuilt and reevaluated.");
       }
-      if (rebuild && composite.prNumber) {
+      if (composite.prNumber) {
         await this.git.forcePush(worktree, settings.remote, composite.branch);
         await this.git.editPr(worktree, composite.prNumber, composite.title, body);
+        await this.git.markPrReady(worktree, composite.prNumber);
       } else {
         await this.git.push(worktree, settings.remote, composite.branch);
         const pr = await this.git.openPr({ cwd: worktree, base: settings.baseBranch, branch: composite.branch, title: composite.title, body });
@@ -1138,6 +1215,10 @@ export class Orchestrator {
         const cleanupLock = await this.locks.acquire("git-metadata", `${compositeId}-failed-cleanup`);
         try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
       }
+      if (error instanceof PortfolioReviewLimitError && error.target === "composite") {
+        await this.quarantineCompositeBlocker(compositeId, error.findings);
+        return;
+      }
       const baseMoved = message.startsWith("BASE_CHANGED:");
       const currentMode = this.store.get().composites.find((item) => item.id === compositeId)?.rebuildMode;
       await this.updateComposite(compositeId, { status: baseMoved ? "rebuilding" : "failed", rebuildMode: baseMoved ? "from_base" : currentMode, error: message.replace("BASE_CHANGED: ", ""), updatedAt: now() });
@@ -1150,9 +1231,12 @@ export class Orchestrator {
   private async reviewAgent(cwd: string, runId: string, title: string, baseBranch: string, threadId: string, settings: BurnerState["settings"]): Promise<SessionResult> {
     let currentThreadId = threadId;
     let message = this.store.get().agentRuns.find((run) => run.id === runId)?.lastMessage ?? "";
-    for (let roundNumber = 1; roundNumber <= settings.maxReviewRounds; roundNumber += 1) {
+    const reviewLimit = this.portfolioReviewLimit(settings);
+    let lastReview: ReviewResult | undefined;
+    for (let roundNumber = 1; roundNumber <= reviewLimit; roundNumber += 1) {
       await this.updateAgent(runId, { status: "reviewing" });
       const review = await this.codex.review(cwd, baseBranch, title, settings);
+      lastReview = review;
       const round: ReviewRound = { id: id("review"), round: roundNumber, commit: await this.git.head(cwd), approved: review.approved, summary: review.summary, findings: review.findings, createdAt: now() };
       await this.store.update((state) => state.agentRuns.find((run) => run.id === runId)?.reviewRounds.push(round));
       this.events.emit("review", { runId, round: roundNumber, approved: review.approved, findings: review.findings.length });
@@ -1164,7 +1248,7 @@ export class Orchestrator {
         });
         return { message, threadId: currentThreadId };
       }
-      if (roundNumber === settings.maxReviewRounds) break;
+      if (roundNumber === reviewLimit) break;
       await this.updateAgent(runId, { status: "revising" });
       const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), settings);
       currentThreadId = revision.threadId;
@@ -1177,18 +1261,23 @@ export class Orchestrator {
         if (stored) Object.assign(stored, round);
       });
     }
-    throw new Error(`Reviewer did not approve after ${settings.maxReviewRounds} rounds; no PR was opened.`);
+    if (this.portfolioMode()) throw new PortfolioReviewLimitError(lastReview?.findings ?? [], "agent");
+    throw new Error(`Reviewer did not approve after ${reviewLimit} rounds; no PR was opened.`);
   }
 
   private async reviewComposite(cwd: string, compositeId: string, title: string, baseBranch: string, threadId: string, settings: BurnerState["settings"]): Promise<SessionResult> {
     let currentThreadId = threadId;
     let message = "Composite integration complete.";
-    for (let roundNumber = 1; roundNumber <= settings.maxReviewRounds; roundNumber += 1) {
+    const reviewLimit = this.portfolioReviewLimit(settings);
+    let lastReview: ReviewResult | undefined;
+    for (let roundNumber = 1; roundNumber <= reviewLimit; roundNumber += 1) {
       await this.updateComposite(compositeId, { status: "reviewing", updatedAt: now() });
       const review = await this.codex.review(cwd, baseBranch, title, settings);
+      lastReview = review;
       const round: ReviewRound = { id: id("review"), round: roundNumber, commit: await this.git.head(cwd), approved: review.approved, summary: review.summary, findings: review.findings, createdAt: now() };
       await this.store.update((state) => state.composites.find((item) => item.id === compositeId)?.reviewRounds.push(round));
       this.events.emit("review", { compositeId, round: roundNumber, approved: review.approved, findings: review.findings.length });
+      await this.publishCompositeDraft(cwd, compositeId, `in independent review round ${roundNumber}`, settings);
       if (review.approved) {
         round.completedAt = now();
         await this.store.update((state) => {
@@ -1197,7 +1286,7 @@ export class Orchestrator {
         });
         return { message, threadId: currentThreadId };
       }
-      if (roundNumber === settings.maxReviewRounds) break;
+      if (roundNumber === reviewLimit) break;
       await this.updateComposite(compositeId, { status: "revising", updatedAt: now() });
       const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), settings);
       currentThreadId = revision.threadId;
@@ -1209,13 +1298,109 @@ export class Orchestrator {
         const stored = state.composites.find((item) => item.id === compositeId)?.reviewRounds.find((item) => item.id === round.id);
         if (stored) Object.assign(stored, round);
       });
+      await this.publishCompositeDraft(cwd, compositeId, `revising findings from review round ${roundNumber}`, settings);
     }
-    throw new Error(`Composite reviewer did not approve after ${settings.maxReviewRounds} rounds.`);
+    if (this.portfolioMode()) throw new PortfolioReviewLimitError(lastReview?.findings ?? [], "composite");
+    throw new Error(`Composite reviewer did not approve after ${reviewLimit} rounds.`);
   }
 
   private normalizeReview(review: ReviewResult): ReviewResult {
     if (review.findings.length || review.approved) return review;
     return { ...review, findings: [{ severity: "medium", title: "Reviewer requested another pass", detail: review.summary || "Inspect the complete diff and address remaining review concerns.", file: "" }] };
+  }
+
+  private async quarantineCompositeBlocker(compositeId: string, findings: ReviewResult["findings"]): Promise<void> {
+    const state = this.store.get();
+    const composite = state.composites.find((item) => item.id === compositeId);
+    if (!composite) return;
+    const baseCommit = composite.baseCommit ?? await this.git.resolveRef(state.settings.baseBranch);
+    const findingFiles = findings
+      .map((finding) => finding.file.trim().replace(/^\.\//, "").replace(/:\d+(?::\d+)?$/, ""))
+      .filter(Boolean);
+    const scored: Array<{ source: CompositeSource; score: number; impact: number }> = [];
+    for (const source of composite.sources.filter((item) => item.kind === "pull_request")) {
+      let files: string[] = [];
+      try {
+        files = await this.git.changedFiles(this.root, baseCommit, `${state.settings.remote}/${source.branch}`);
+      } catch {
+        // The source may have been removed remotely. It remains a valid low-confidence quarantine candidate.
+      }
+      const score = findingFiles.reduce((total, findingFile) => total + (files.some((file) => file === findingFile || findingFile.endsWith(`/${file}`) || file.endsWith(`/${findingFile}`)) ? 1 : 0), 0);
+      const runImpact = state.agentRuns.find((run) => run.id === source.agentRunId)?.impact;
+      scored.push({ source, score, impact: source.impact ?? runImpact ?? -Infinity });
+    }
+    scored.sort((a, b) => b.score - a.score || a.impact - b.impact || b.source.agentRunId.localeCompare(a.source.agentRunId));
+    const suspect = scored[0]?.source;
+    if (!suspect) {
+      await this.updateComposite(compositeId, { status: "failed", error: "Portfolio review budget exhausted, but no leaf source could be isolated.", updatedAt: now() });
+      return;
+    }
+
+    const timestamp = now();
+    const reason = findingFiles.length && scored[0]!.score > 0
+      ? `Composite review repeatedly blocked in ${findingFiles.join(", ")}. Burner isolated the leaf with the strongest file overlap.`
+      : "Composite review exhausted its bounded budget. Burner isolated the lowest-impact leaf so the healthy subset could continue.";
+    await this.store.update((draft) => {
+      const run = draft.agentRuns.find((item) => item.id === suspect.agentRunId);
+      if (run) { run.quarantinedAt = timestamp; run.quarantineReason = reason; }
+      const current = draft.composites.find((item) => item.id === compositeId);
+      if (current) {
+        current.status = "closed";
+        current.reviewApproved = false;
+        current.quarantinedSourceAgentRunId = suspect.agentRunId;
+        current.error = `Review budget exhausted; quarantined ${suspect.prNumber ? `#${suspect.prNumber}` : suspect.title}.`;
+        current.updatedAt = timestamp;
+      }
+    });
+    if (suspect.prNumber) await this.git.markPrQuarantined(this.root, suspect.prNumber).catch(() => undefined);
+    if (composite.prNumber) {
+      await this.git.closePr(this.root, composite.prNumber, `Burner retired this draft after its bounded review budget. ${suspect.prNumber ? `Source PR #${suspect.prNumber}` : suspect.title} was quarantined; a healthy subset will continue.`);
+    }
+    await this.store.addActivity({
+      type: "error",
+      message: `Portfolio leaf quarantined: ${suspect.prNumber ? `#${suspect.prNumber}` : suspect.title}`,
+      detail: `${reason} The remaining ${composite.sources.length - 1} source changes were released immediately.`,
+    });
+
+    const remainingIds = composite.sources.filter((source) => source.agentRunId !== suspect.agentRunId && source.kind === "pull_request").map((source) => source.agentRunId);
+    if (remainingIds.length >= 2) {
+      const fallback = await this.createComposite(
+        remainingIds,
+        `${composite.title.replace(/ · healthy subset.*$/, "")} · healthy subset`,
+        `${composite.description}\n\nBurner removed ${suspect.prNumber ? `#${suspect.prNumber}` : suspect.title} after the portfolio review budget was exhausted and continued with the remaining reviewed leaves.`,
+        { makeLiving: false },
+      );
+      await this.updateComposite(compositeId, { supersededByCompositeId: fallback.id, updatedAt: now() });
+    }
+  }
+
+  private async publishCompositeDraft(cwd: string, compositeId: string, phase: string, settings: BurnerState["settings"]): Promise<void> {
+    if (!settings.autoCreatePrs && !this.yolo) return;
+    const composite = this.store.get().composites.find((item) => item.id === compositeId);
+    if (!composite) return;
+    const body = buildCompositeDraftPrBody({
+      description: composite.description,
+      sources: composite.sources,
+      reviewRounds: composite.reviewRounds,
+      phase,
+    });
+    if (composite.prNumber) {
+      await this.git.markPrDraft(cwd, composite.prNumber);
+      await this.git.forcePush(cwd, settings.remote, composite.branch);
+      await this.git.editPr(cwd, composite.prNumber, composite.title, body);
+      return;
+    }
+    await this.git.push(cwd, settings.remote, composite.branch);
+    const pr = await this.git.openPr({
+      cwd,
+      base: settings.baseBranch,
+      branch: composite.branch,
+      title: composite.title,
+      body,
+      draft: true,
+    });
+    await this.updateComposite(compositeId, { prUrl: pr.url, prNumber: pr.number, updatedAt: now() });
+    await this.store.addActivity({ type: "pr", message: `Draft composite opened: ${composite.title}`, detail: `${pr.url} · ${phase}.` });
   }
 
   private calculateDeltas(state: BurnerState, before: Map<string, EvaluationRun>, afterRuns: EvaluationRun[]): ScoreDelta[] {

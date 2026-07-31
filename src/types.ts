@@ -106,6 +106,8 @@ export type AgentRun = {
   baseCommit?: string;
   parentCompositeId?: string;
   absorbedAt?: string;
+  quarantinedAt?: string;
+  quarantineReason?: string;
 };
 
 export type CompositeSource = {
@@ -143,6 +145,8 @@ export type CompositePr = {
   rebuildMode?: "incremental" | "from_base";
   pendingExperimentRunIds?: string[];
   checkpointBranch?: string;
+  quarantinedSourceAgentRunId?: string;
+  supersededByCompositeId?: string;
 };
 
 export type Activity = {
@@ -165,6 +169,8 @@ export type BurnerSettings = {
   remote: string;
   defaultResources: string[];
   maxReviewRounds: number;
+  portfolioReviewRounds: number;
+  mergeCadenceMinutes: number;
   preferLivingComposite: boolean;
   compositeAbsorbThreshold: number;
 };
@@ -185,6 +191,9 @@ export type BurnerState = {
     lastPlanningAt?: string;
     baseSyncPending?: boolean;
     livingCompositeId?: string;
+    lastMergeAt?: string;
+    mergeWindowStartedAt?: string;
+    lastMergeCadenceAlertAt?: string;
   };
 };
 
