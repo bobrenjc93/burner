@@ -343,6 +343,7 @@ export class Orchestrator {
     if (!run.worktree || !run.authorThreadId || !run.baseRef || !run.baseCommit) throw new Error("This run failed before it produced a resumable candidate.");
     if (await this.git.resolveRef(run.baseRef) !== run.baseCommit) throw new Error("The candidate base has moved; queue a fresh idea against the latest base instead.");
     await this.git.head(run.worktree);
+    if (await this.git.hasChanges(run.worktree)) await this.git.commit(run.worktree, "burner: preserve interrupted revision");
     const baseline = run.parentCompositeId
       ? this.store.latestCompositeRuns(run.parentCompositeId)
       : this.portfolioMode() ? this.store.latestAgentBaselines() : this.store.latestRuns();
