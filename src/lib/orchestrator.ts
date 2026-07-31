@@ -376,16 +376,37 @@ export class Orchestrator {
     const lease = await this.locks.tryAcquireAll(run.resources, `${run.id}-retry`);
     if (!lease) throw new Error("A required resource is currently locked.");
     const base: AgentBase = { ref: run.baseRef, commit: run.baseCommit, baseline, compositeId: run.parentCompositeId };
+    const unresolvedReview = run.reviewRounds.at(-1);
     this.activeAgents.add(idea.id);
     await this.store.update((draft) => {
       const currentRun = draft.agentRuns.find((item) => item.id === run.id);
       const currentIdea = draft.ideas.find((item) => item.id === idea.id);
-      if (currentRun) Object.assign(currentRun, { status: "reviewing", error: undefined, completedAt: undefined, reviewApproved: false, reviewRounds: [], deltas: [], impact: undefined });
+      if (currentRun) Object.assign(currentRun, { status: unresolvedReview && !unresolvedReview.approved ? "revising" : "reviewing", error: undefined, completedAt: undefined, reviewApproved: false, deltas: [], impact: undefined });
       if (currentIdea) Object.assign(currentIdea, { status: "running", updatedAt: now() });
     });
     await this.store.addActivity({ type: "agent", message: `Agent retry resumed: ${idea.title}`, detail: "Reusing the existing candidate and author session." });
     try {
-      await this.reviewAndDeliverAgent(idea, base, run.id, run.worktree, run.branch, state.settings, run.authorThreadId, run.lastMessage ?? "");
+      let authorThreadId = run.authorThreadId;
+      let lastMessage = run.lastMessage ?? "";
+      if (unresolvedReview && !unresolvedReview.approved && unresolvedReview.findings.length) {
+        const revision = await this.codex.revise(run.worktree, authorThreadId, this.normalizeReview({
+          approved: false,
+          summary: unresolvedReview.summary,
+          findings: unresolvedReview.findings,
+        }), state.settings);
+        authorThreadId = revision.threadId;
+        lastMessage = revision.message;
+        if (await this.git.hasChanges(run.worktree)) await this.git.commit(run.worktree, "burner: address final review feedback before retry");
+        unresolvedReview.authorResponse = revision.message;
+        unresolvedReview.completedAt = now();
+        await this.store.update((draft) => {
+          const currentRun = draft.agentRuns.find((item) => item.id === run.id);
+          const storedReview = currentRun?.reviewRounds.find((item) => item.id === unresolvedReview.id);
+          if (storedReview) Object.assign(storedReview, unresolvedReview);
+          if (currentRun) Object.assign(currentRun, { lastMessage, authorThreadId });
+        });
+      }
+      await this.reviewAndDeliverAgent(idea, base, run.id, run.worktree, run.branch, state.settings, authorThreadId, lastMessage);
     } catch (error) {
       const message = errorMessage(error);
       const quarantined = error instanceof PortfolioReviewLimitError;
@@ -1456,8 +1477,10 @@ export class Orchestrator {
     let currentThreadId = threadId;
     let message = this.store.get().agentRuns.find((run) => run.id === runId)?.lastMessage ?? "";
     const reviewLimit = this.portfolioReviewLimit(settings);
+    const priorRounds = this.store.get().agentRuns.find((run) => run.id === runId)?.reviewRounds.length ?? 0;
     let lastReview: ReviewResult | undefined;
-    for (let roundNumber = 1; roundNumber <= reviewLimit; roundNumber += 1) {
+    for (let attempt = 1; attempt <= reviewLimit; attempt += 1) {
+      const roundNumber = priorRounds + attempt;
       await this.updateAgent(runId, { status: "reviewing" });
       const review = await this.codex.review(cwd, baseBranch, title, settings);
       lastReview = review;
@@ -1472,7 +1495,7 @@ export class Orchestrator {
         });
         return { message, threadId: currentThreadId };
       }
-      if (roundNumber === reviewLimit) break;
+      if (attempt === reviewLimit) break;
       await this.updateAgent(runId, { status: "revising" });
       const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), settings);
       currentThreadId = revision.threadId;

@@ -312,6 +312,47 @@ test("agent retries cannot exceed configured parallelism", async () => {
   }
 });
 
+test("agent retry preserves review history and applies unresolved feedback before reviewing again", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-retry-feedback-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [];
+      state.ideas.push({ id: "idea", title: "Durability", description: "Fix storage", rationale: "Safety", predictedImpact: 80, evaluationIds: [], resources: [], status: "failed", source: "manual", createdAt: timestamp, updatedAt: timestamp });
+      state.agentRuns.push({
+        id: "agent", ideaId: "idea", status: "failed", branch: "burner/durability", worktree: root,
+        startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1",
+        baseRef: "main", baseCommit: "base", reviewRounds: [{ id: "review-5", round: 5, commit: "candidate", approved: false, summary: "Still unsafe", findings: [{ severity: "high", title: "Data loss", detail: "Fix fsync", file: "storage.rs" }], createdAt: timestamp }],
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = {
+      resolveRef: async () => "base",
+      head: async () => "candidate",
+      hasChanges: (() => { let calls = 0; return async () => ++calls > 1; })(),
+      commit: async () => "fixed",
+    };
+    let revised;
+    orchestrator.codex = { revise: async (_cwd, threadId, review) => { revised = { threadId, review }; return { threadId: "thread-2", message: "Fixed fsync" }; } };
+    let delivered;
+    orchestrator.reviewAndDeliverAgent = async (_idea, _base, runId, _worktree, _branch, _settings, threadId, message) => {
+      delivered = { threadId, message };
+      await store.update((state) => { const run = state.agentRuns.find((item) => item.id === runId); if (run) run.status = "completed"; });
+    };
+    await orchestrator.retryAgent("agent");
+    const run = store.get().agentRuns.find((item) => item.id === "agent");
+    assert.equal(revised.threadId, "thread-1");
+    assert.equal(revised.review.findings[0].title, "Data loss");
+    assert.deepEqual(delivered, { threadId: "thread-2", message: "Fixed fsync" });
+    assert.equal(run.reviewRounds.length, 1);
+    assert.equal(run.reviewRounds[0].authorResponse, "Fixed fsync");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("compiled server serves the API and closes connected event streams", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-server-test-"));
   const burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0 });
