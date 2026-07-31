@@ -76,8 +76,9 @@ test("headless CLI configures evaluations, ideas, and conservative settings as J
     assert.match(help, /--yolo-batch-size <n>\s+leaf PRs per composite/);
     await assert.rejects(() => exec(root, "node", [cli, "--no-open", "--yolo-batch-size", "0"]), /integer between 1 and 100/);
     assert.deepEqual(JSON.parse(await exec(root, "node", [cli, "eval", "clear", "--yes", "-C", root])), { removed: 3 });
-    const evaluation = JSON.parse(await exec(root, "node", [cli, "eval", "add", "-C", root, "--name", "Correctness", "--prompt", "Score correctness out of 100", "--weight", "2"]));
+    const evaluation = JSON.parse(await exec(root, "node", [cli, "eval", "add", "-C", root, "--name", "Correctness", "--prompt", "Score correctness out of 100", "--command", "./full", "--screening-command", "./quick", "--weight", "2"]));
     assert.equal(evaluation.name, "Correctness");
+    assert.equal(evaluation.screeningCommand, "./quick");
     const listed = JSON.parse(await exec(root, "node", [cli, "eval", "list", "-C", root]));
     assert.deepEqual(listed.map((item) => item.id), [evaluation.id]);
     const idea = JSON.parse(await exec(root, "node", [cli, "idea", "add", "-C", root, "--title", "Build core", "--description", "Implement the core", "--impact", "90", "--eval", evaluation.id, "--resource", "cpu"]));
@@ -106,6 +107,51 @@ test("command evaluations return deterministic structured scores without Codex",
     assert.equal(output.score, 42.3);
     assert.equal(output.summary, "Measured locally");
     assert.deepEqual(output.evidence, ["same workload"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("portfolio leaf screens are comparable and composites retain the full command", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-screening-eval-test-"));
+  const full = join(root, "full");
+  const screen = join(root, "screen");
+  try {
+    await writeFile(full, `#!/bin/sh\nprintf '%s\\n' '{"score":90,"summary":"216 full cases","evidence":[],"suggestions":[]}'\n`);
+    await writeFile(screen, `#!/bin/sh\nprintf '%s\\n' '{"score":80,"summary":"48 screening cases","evidence":[],"suggestions":[]}'\n`);
+    await Promise.all([chmod(full, 0o755), chmod(screen, 0o755)]);
+    const settings = { parallelism: 1, evaluationIntervalMinutes: 30, orchestratorIntervalMinutes: 15, autoRun: false, autoCreatePrs: true, evaluatorModel: "", agentModel: "", baseBranch: "main", remote: "origin", defaultResources: [], maxReviewRounds: 8, preferLivingComposite: true, compositeAbsorbThreshold: 0 };
+    const evaluation = { id: "bench", name: "Benchmark", prompt: "Measure it", command: full, screeningCommand: screen, weight: 1, enabled: true, createdAt: new Date().toISOString() };
+    const codex = new CodexClient();
+    assert.equal((await codex.evaluate(root, evaluation, settings, "screening_baseline")).score, 80);
+    assert.equal((await codex.evaluate(root, evaluation, settings, "agent")).score, 80);
+    assert.equal((await codex.evaluate(root, evaluation, settings, "composite")).score, 90);
+    assert.equal((await codex.evaluate(root, evaluation, settings, "baseline")).score, 90);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("portfolio merge clock starts after full and screening baselines", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-screening-clock-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    await store.update((state) => {
+      state.evaluations = [{ id: "bench", name: "Benchmark", prompt: "Measure", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: new Date().toISOString() }];
+      state.orchestrator.mergeWindowStartedAt = undefined;
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    const contexts = [];
+    orchestrator.runEvaluations = async (context) => {
+      contexts.push(context);
+      return [{ id: `run-${context}`, evaluationId: "bench", score: 80, commit: "base", createdAt: new Date().toISOString(), durationMs: 1, status: "completed", context }];
+    };
+    await orchestrator.runBaselineEvaluations("baseline");
+    assert.deepEqual(contexts, ["baseline", "screening_baseline"]);
+    assert.ok(store.get().orchestrator.lastEvaluationAt);
+    assert.ok(store.get().orchestrator.mergeWindowStartedAt);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -291,6 +337,9 @@ test("PR bodies record review approval and recalculated composite scores", () =>
   const rounds = [{ id: "r1", round: 1, commit: "abc", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() }];
   const deltas = [{ evaluationId: "quality", name: "Quality", before: 70, after: 82, delta: 12 }];
   assert.match(buildPrBody("Change", "Done", deltas, 12, rounds), /Approved by an independent Codex reviewer/);
+  const screened = buildPrBody("Change", "Done", [{ ...deltas[0], screening: true }], 12, rounds);
+  assert.match(screened, /Quality \(leaf screen\)/);
+  assert.match(screened, /Composite PRs rerun each full command/);
   const body = buildCompositePrBody({ description: "Combined", sources: [{ agentRunId: "a", prNumber: 12, title: "A", branch: "a" }, { agentRunId: "b", prNumber: 13, title: "B", branch: "b" }], deltas, compositeScore: 82, impact: 12, reviewRounds: rounds });
   assert.match(body, /Composite score: 82\.0 \/ 100/);
   assert.match(body, /#12/);
@@ -790,6 +839,28 @@ test("merged composites supersede source PRs and queue overlapping composites fo
   }
 });
 
+test("an exactly merged composite becomes the next full baseline without rerunning it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-promote-baseline-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp }];
+      state.composites.push({ id: "combined", title: "Combined", description: "", status: "merged", branch: "burner/combined", worktree: "", sources: [], deltas: [], reviewRounds: [], createdAt: timestamp, updatedAt: timestamp, isLiving: false });
+      state.evaluationRuns.push({ id: "combined-score", evaluationId: "quality", score: 88, commit: "combined-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "combined" });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { tree: async () => "same-tree" };
+    assert.equal(await orchestrator.promoteMergedCompositeBaseline("combined", "new-main"), true);
+    assert.equal(store.latestRuns().get("quality").score, 88);
+    assert.equal(store.latestRuns().get("quality").commit, "new-main");
+    assert.equal(store.latestScreeningRuns().size, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("successful experiments bind to and incrementally evolve the living composite", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-living-test-"));
   try {
@@ -846,6 +917,8 @@ test("state persists evaluation configuration and excludes candidate scores from
     assert.equal(reloaded.get().settings.parallelism, 1);
     assert.equal(reloaded.latestRuns().get(evaluation.id)?.score, 61);
     assert.deepEqual(validateEvaluation({ name: " UX ", prompt: " Score it ", weight: 2 }), { name: "UX", prompt: "Score it", weight: 2, enabled: true });
+    assert.deepEqual(validateEvaluation({ name: "Bench", prompt: "Score", command: " full ", screeningCommand: " quick " }), { name: "Bench", prompt: "Score", command: "full", screeningCommand: "quick", weight: 1, enabled: true });
+    assert.throws(() => validateEvaluation({ name: "Bench", prompt: "Score", screeningCommand: "quick" }), /requires a full evaluation command/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -38,6 +38,12 @@ export class GitService {
     return result.stdout.trim();
   }
 
+  async tree(ref: string): Promise<string> {
+    const result = await runCommand("git", ["rev-parse", `${ref}^{tree}`], { cwd: this.root });
+    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not resolve tree for ${ref}`);
+    return result.stdout.trim();
+  }
+
   async hasRef(ref: string): Promise<boolean> {
     return (await runCommand("git", ["rev-parse", "--verify", ref], { cwd: this.root })).exitCode === 0;
   }
@@ -283,7 +289,8 @@ function evaluationRows(deltas: ScoreDelta[]): string {
         const before = delta.before === undefined ? "—" : delta.before.toFixed(1);
         const after = delta.after === undefined ? "—" : delta.after.toFixed(1);
         const change = delta.delta === undefined ? "—" : `${delta.delta >= 0 ? "+" : ""}${delta.delta.toFixed(1)}`;
-        return `| ${delta.name.replace(/\|/g, "\\|")} | ${before} | ${after} | ${change} |`;
+        const name = `${delta.name}${delta.screening ? " (leaf screen)" : ""}`;
+        return `| ${name.replace(/\|/g, "\\|")} | ${before} | ${after} | ${change} |`;
       }).join("\n")
     : "| No completed evaluations | — | — | — |";
 }
@@ -306,7 +313,9 @@ export function buildPrBody(description: string, lastMessage: string, deltas: Sc
     "| --- | ---: | ---: | ---: |",
     rows,
     "",
-    "<sub>Generated and evaluated locally by Burner. Scores are model-based signals; review the code and evidence before merging.</sub>",
+    deltas.some((delta) => delta.screening)
+      ? "<sub>Leaf-screen commands are compared with the same screen on the base. Composite PRs rerun each full command on the combined checkout before merging.</sub>"
+      : "<sub>Generated and evaluated locally by Burner. Scores are model-based signals; review the code and evidence before merging.</sub>",
   ].join("\n");
 }
 

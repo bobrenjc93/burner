@@ -27,7 +27,7 @@ SECURITY WARNING:
   Command-backed evaluations are separate direct local subprocesses.
 
 Commands:
-  eval add       Add an evaluation (--name, --prompt, [--command], [--weight])
+  eval add       Add an evaluation (--name, --prompt, [--command], [--screening-command], [--weight])
   eval clear     Remove every evaluation (--yes is required)
   eval list      List evaluations and latest scores
   eval run       Run all enabled evaluations and wait for results
@@ -112,7 +112,7 @@ async function runHeadless(args: string[]): Promise<boolean> {
   if (command === "eval" && subcommand === "add") {
     const store = new StateStore(root);
     await store.init();
-    const input = validateEvaluation({ name: required(args, "--name"), prompt: required(args, "--prompt"), command: option(args, "--command"), weight: numberOption(args, "--weight", 1, Number.EPSILON, 10), enabled: true });
+    const input = validateEvaluation({ name: required(args, "--name"), prompt: required(args, "--prompt"), command: option(args, "--command"), screeningCommand: option(args, "--screening-command"), weight: numberOption(args, "--weight", 1, Number.EPSILON, 10), enabled: true });
     const evaluation = { ...input, id: id("eval"), createdAt: now() };
     await store.update((state) => state.evaluations.push(evaluation));
     print(evaluation);
@@ -143,7 +143,7 @@ async function runHeadless(args: string[]): Promise<boolean> {
   }
 
   if (command === "eval" && subcommand === "run") {
-    const runs = await withOrchestrator(root, (orchestrator) => orchestrator.runEvaluations("manual"));
+    const runs = await withOrchestrator(root, (orchestrator) => orchestrator.runBaselineEvaluations("manual"));
     print(runs);
     if (runs.some((run) => run.status !== "completed")) process.exitCode = 2;
     return true;

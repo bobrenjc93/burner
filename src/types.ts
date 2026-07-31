@@ -3,6 +3,7 @@ export type Evaluation = {
   name: string;
   prompt: string;
   command?: string;
+  screeningCommand?: string;
   weight: number;
   enabled: boolean;
   createdAt: string;
@@ -20,7 +21,7 @@ export type EvaluationRun = {
   durationMs: number;
   status: "running" | "completed" | "failed";
   error?: string;
-  context: "baseline" | "agent" | "composite" | "manual";
+  context: "baseline" | "screening_baseline" | "agent" | "composite" | "manual";
   agentRunId?: string;
   compositeId?: string;
 };
@@ -48,6 +49,7 @@ export type ScoreDelta = {
   after?: number;
   delta?: number;
   summary?: string;
+  screening?: boolean;
 };
 
 export type ReviewFinding = {

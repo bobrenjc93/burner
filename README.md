@@ -53,7 +53,7 @@ Usage: burner [options] [directory]
        burner <command> [subcommand] -C <directory> [options]
 
 Commands:
-  eval add       Add an evaluation (--name, --prompt, [--command], [--weight])
+  eval add       Add an evaluation (--name, --prompt, [--command], [--screening-command], [--weight])
   eval clear     Remove every evaluation (--yes is required)
   eval list      List evaluations and latest scores
   eval run       Run all enabled evaluations and wait for results
@@ -74,6 +74,7 @@ The same workflow is scriptable. Commands emit JSON, and `-C` selects the target
 burner eval clear --yes -C ./my-project
 burner eval add -C ./my-project --name "Correctness" --prompt "Score correctness and test evidence out of 100"
 burner eval add -C ./my-project --name "Benchmark" --prompt "Deterministic benchmark score" --command './bench.sh --json'
+burner eval add -C ./my-project --name "Large benchmark" --prompt "Decision-grade benchmark" --command './bench.sh --mode full --json' --screening-command './bench.sh --mode quick --json'
 burner settings set -C ./my-project --parallelism 1 --max-review-rounds 8 --portfolio-review-rounds 3 --merge-cadence-minutes 60
 burner eval run -C ./my-project
 burner idea add -C ./my-project --title "Add crash recovery" --description "Implement and test WAL recovery" --impact 90
@@ -108,9 +109,11 @@ Burner keeps two mutually exclusive GitHub disposition labels in sync. New/open 
 
 At higher concurrency, a complete leaf batch becomes a drain barrier: Burner stops refilling agent slots, lets in-flight work finish, and then cooks the composite before dispatching more leaves. Short git-metadata operations wait in a lock queue instead of failing agents during simultaneous worktree startup. Evaluation suites are serialized across candidates, acquire the shared `cpu-heavy` resource, and run deterministic command evaluations before parallel prompt evaluations. An evaluating agent that already owns `cpu-heavy` reuses that lease, avoiding lock inversion. This prevents configured benchmarks, benchmark-focused agents, and prompt evaluators' read-only checks from racing another candidate's measurements while unrelated author/reviewer work can still run concurrently.
 
+Long deterministic evaluations may define a `--screening-command` for YOLO portfolio leaves. Burner first measures that exact screen on the current base, compares every leaf against the comparable screen baseline, and labels those rows in leaf PRs. Composite PRs never inherit or extrapolate screen results: they rerun the full `--command` on the actual combined checkout before becoming merge-eligible. The merge-cadence clock starts only after both cold baselines finish, so setup time is reported separately from sustained portfolio throughput.
+
 Prompt evaluations are intentionally treated as noisy signals rather than hard vetoes; a candidate must still have positive weighted impact across all evaluations, while deterministic command-backed regressions always block selection. Integration or evaluation failures remain visible for inspection. Bounded review failures quarantine the implicated leaf and recook the healthy subset; cadence expiry permits a single fully qualified leaf merge only when no two-leaf subset is available. YOLO startup fails unless the root checkout is clean and on the configured base branch, the configured remote exists, Codex supports unrestricted mode, and GitHub CLI authentication is ready. This is distinct from unrestricted Codex execution: Burner always launches Codex without approvals or sandboxing, while `burner --yolo` additionally authorizes GitHub portfolio mutations and merges.
 
-An evaluation may optionally provide a local command. Burner runs it directly in each evaluated checkout and expects one JSON object on stdout with `score` (0–100), `summary`, `evidence`, and `suggestions`. Command evaluations are useful for deterministic benchmarks and test-derived metrics; they are direct local subprocesses that inherit Burner's permissions and are not `codex exec` invocations, so only configure commands you trust. Evaluations without a command use an unrestricted Codex agent.
+An evaluation may optionally provide a local command and a faster, comparable leaf screening command. Burner runs them directly in each evaluated checkout and expects one JSON object on stdout with `score` (0–100), `summary`, `evidence`, and `suggestions`. Command evaluations are useful for deterministic benchmarks and test-derived metrics; they are direct local subprocesses that inherit Burner's permissions and are not `codex exec` invocations, so only configure commands you trust. Evaluations without a command use an unrestricted Codex agent.
 
 ## Review and composite workflow
 

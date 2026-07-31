@@ -233,8 +233,19 @@ export class Orchestrator {
     const ghAuth = await runCommand("gh", ["auth", "status"], { cwd: this.root, timeoutMs: 8_000 });
     if (ghAuth.exitCode !== 0) throw new Error("Burner --yolo requires an authenticated GitHub CLI.");
     await this.codex.preflight(this.root);
+    const baseCommit = await this.git.resolveRef(settings.baseBranch);
+    const fullBaseline = this.store.latestRuns();
+    const screeningBaseline = this.store.latestScreeningRuns();
     await this.store.update((draft) => {
-      draft.orchestrator.mergeWindowStartedAt ??= now();
+      const enabled = draft.evaluations.filter((evaluation) => evaluation.enabled);
+      const complete = enabled.every((evaluation) => fullBaseline.get(evaluation.id)?.commit === baseCommit) &&
+        (!this.portfolioMode() || enabled.every((evaluation) => !evaluation.screeningCommand || screeningBaseline.get(evaluation.id)?.commit === baseCommit));
+      if (complete) {
+        draft.orchestrator.mergeWindowStartedAt ??= now();
+      } else {
+        draft.orchestrator.lastEvaluationAt = undefined;
+        draft.orchestrator.mergeWindowStartedAt = undefined;
+      }
     });
     await this.store.addActivity({
       type: "system",
@@ -332,7 +343,9 @@ export class Orchestrator {
     if (!run.worktree || !run.authorThreadId || !run.baseRef || !run.baseCommit) throw new Error("This run failed before it produced a resumable candidate.");
     if (await this.git.resolveRef(run.baseRef) !== run.baseCommit) throw new Error("The candidate base has moved; queue a fresh idea against the latest base instead.");
     await this.git.head(run.worktree);
-    const baseline = run.parentCompositeId ? this.store.latestCompositeRuns(run.parentCompositeId) : this.store.latestRuns();
+    const baseline = run.parentCompositeId
+      ? this.store.latestCompositeRuns(run.parentCompositeId)
+      : this.portfolioMode() ? this.store.latestAgentBaselines() : this.store.latestRuns();
     const enabledEvaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
     const missingBaseline = enabledEvaluations.find((evaluation) => baseline.get(evaluation.id)?.commit !== run.baseCommit);
     if (missingBaseline) throw new Error(`Refresh '${missingBaseline.name}' at the candidate base before retrying.`);
@@ -386,9 +399,57 @@ export class Orchestrator {
     }
   }
 
+  async runBaselineEvaluations(context: "baseline" | "manual" = "manual"): Promise<EvaluationRun[]> {
+    const commit = await this.git.resolveRef(this.store.get().settings.baseBranch);
+    const enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
+    const fullBaseline = this.store.latestRuns();
+    const fullRuns = enabled.every((evaluation) => fullBaseline.get(evaluation.id)?.commit === commit)
+      ? []
+      : await this.runEvaluations(context);
+    const screeningBaseline = this.store.latestScreeningRuns();
+    const screeningRuns = enabled.some((evaluation) => evaluation.screeningCommand && screeningBaseline.get(evaluation.id)?.commit !== commit)
+      ? await this.runEvaluations("screening_baseline")
+      : [];
+    const runs = [...fullRuns, ...screeningRuns];
+    if (runs.every((run) => run.status === "completed" && run.score !== undefined)) {
+      await this.store.update((draft) => {
+        draft.orchestrator.lastEvaluationAt = now();
+        if (this.portfolioMode()) draft.orchestrator.mergeWindowStartedAt ??= now();
+      });
+    }
+    return runs;
+  }
+
+  private async promoteMergedCompositeBaseline(compositeId: string, baseCommit: string): Promise<boolean> {
+    const state = this.store.get();
+    const composite = state.composites.find((item) => item.id === compositeId);
+    if (!composite) return false;
+    const runs = this.store.latestCompositeRuns(compositeId);
+    const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
+    if (!enabled.length || enabled.some((evaluation) => runs.get(evaluation.id)?.score === undefined)) return false;
+    if (await this.git.tree(baseCommit) !== await this.git.tree(composite.branch)) return false;
+    const createdAt = now();
+    await this.store.update((draft) => {
+      for (const evaluation of enabled) {
+        const source = runs.get(evaluation.id)!;
+        draft.evaluationRuns.push({
+          ...source,
+          id: id("evalrun"),
+          commit: baseCommit,
+          createdAt,
+          context: "baseline",
+          agentRunId: undefined,
+          compositeId: undefined,
+        });
+      }
+    });
+    await this.store.addActivity({ type: "evaluation", message: "Merged composite promoted to baseline", detail: `The tested composite tree exactly matches ${baseCommit.slice(0, 8)}; only leaf screens need refreshing.` });
+    return true;
+  }
+
   private async runEvaluationSuite(context: EvaluationRun["context"], cwd: string, agentRunId?: string, compositeId?: string): Promise<EvaluationRun[]> {
     const state = this.store.get();
-    const evaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
+    const evaluations = state.evaluations.filter((evaluation) => evaluation.enabled && (context !== "screening_baseline" || evaluation.screeningCommand));
     if (!evaluations.length) throw new Error("Add at least one enabled evaluation first.");
     if (evaluations.some((evaluation) => !evaluation.command)) await this.codex.preflight(cwd);
     const commit = await this.git.head(cwd);
@@ -416,10 +477,13 @@ export class Orchestrator {
         this.events.emit("evaluation", { id: run.id, status: "running", evaluationId: evaluation.id });
         let commandLock: HeldLock | undefined;
         try {
-          if (evaluation.command) {
+          if (evaluation.command || evaluation.screeningCommand) {
             commandLock = await this.locks.acquire(`command-evaluation-${evaluation.id}`, run.id, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
           }
-          const output = await this.codex.evaluate(cwd, evaluation, state.settings, context);
+          const evaluated = context === "agent" && !this.portfolioMode()
+            ? { ...evaluation, screeningCommand: undefined }
+            : evaluation;
+          const output = await this.codex.evaluate(cwd, evaluated, state.settings, context);
           Object.assign(run, output, { status: "completed" as const, durationMs: Date.now() - started });
           await this.store.update((draft) => {
             const current = draft.evaluationRuns.find((item) => item.id === run.id);
@@ -438,8 +502,8 @@ export class Orchestrator {
         }
         return run;
       };
-      const commandRuns = await mapLimit(evaluations.filter((evaluation) => evaluation.command), 1, evaluateOne);
-      const promptRuns = await mapLimit(evaluations.filter((evaluation) => !evaluation.command), Math.min(state.settings.parallelism, 3), evaluateOne);
+      const commandRuns = await mapLimit(evaluations.filter((evaluation) => evaluation.command || evaluation.screeningCommand), 1, evaluateOne);
+      const promptRuns = await mapLimit(evaluations.filter((evaluation) => !evaluation.command && !evaluation.screeningCommand), Math.min(state.settings.parallelism, 3), evaluateOne);
       const runs = [...commandRuns, ...promptRuns];
       const succeeded = runs.filter((run) => run.status === "completed").length;
       await this.store.addActivity({
@@ -447,11 +511,6 @@ export class Orchestrator {
         message: `${succeeded}/${runs.length} evaluations completed`,
         detail: context === "agent" || context === "composite" ? "Candidate branch scoring finished." : "Baseline signals are up to date.",
       });
-      if (context !== "agent" && context !== "composite") {
-        await this.store.update((draft) => {
-          draft.orchestrator.lastEvaluationAt = now();
-        });
-      }
       return runs;
     } finally {
       this.runningEvaluations -= evaluations.length;
@@ -729,6 +788,9 @@ export class Orchestrator {
         draft.orchestrator.baseSyncPending = false;
       });
       await this.store.addActivity({ type: "system", message: `Base updated to ${commit.slice(0, 8)}`, detail: "New agents will branch from the merged main; baseline and composites are being recalculated." });
+      for (const compositeId of newlyMergedCompositeIds) {
+        if (await this.promoteMergedCompositeBaseline(compositeId, commit)) break;
+      }
     }
 
     if (syncedBaseCommit && this.yolo && this.yoloBatchSize > 1) {
@@ -817,7 +879,7 @@ export class Orchestrator {
         !initial.orchestrator.lastEvaluationAt ||
         Date.now() - new Date(initial.orchestrator.lastEvaluationAt).getTime() >= settings.evaluationIntervalMinutes * 60_000;
       if (evaluationDue && this.runningEvaluations === 0 && this.activeAgents.size === 0 && this.activeComposites.size === 0) {
-        await this.runEvaluations("baseline");
+        await this.runBaselineEvaluations("baseline");
       }
       const refreshed = this.store.get();
       const configuredLiving = refreshed.orchestrator.livingCompositeId ? refreshed.composites.find((item) => item.id === refreshed.orchestrator.livingCompositeId) : undefined;
@@ -882,7 +944,11 @@ export class Orchestrator {
       return { ref, commit, baseline, compositeId: composite.id };
     }
     const commit = await this.git.resolveRef(state.settings.baseBranch);
-    return { ref: state.settings.baseBranch, commit, baseline: this.store.latestRuns() };
+    return {
+      ref: state.settings.baseBranch,
+      commit,
+      baseline: this.portfolioMode() ? this.store.latestAgentBaselines() : this.store.latestRuns(),
+    };
   }
 
   private async absorbExperiment(
@@ -1415,6 +1481,7 @@ export class Orchestrator {
         after: after.score,
         delta,
         summary: after.summary,
+        screening: after.context === "agent" && Boolean(evaluation?.screeningCommand) && this.portfolioMode(),
       };
     });
   }

@@ -150,8 +150,24 @@ export class StateStore {
       if (
         run.status !== "completed" ||
         run.score === undefined ||
-        (context ? run.context !== context : run.context === "agent" || run.context === "composite")
+        (context ? run.context !== context : run.context === "agent" || run.context === "composite" || run.context === "screening_baseline")
       ) continue;
+      const current = latest.get(run.evaluationId);
+      if (!current || run.createdAt > current.createdAt) latest.set(run.evaluationId, run);
+    }
+    return latest;
+  }
+
+  latestAgentBaselines(): Map<string, EvaluationRun> {
+    const latest = this.latestRuns();
+    for (const [evaluationId, run] of this.latestScreeningRuns()) latest.set(evaluationId, run);
+    return latest;
+  }
+
+  latestScreeningRuns(): Map<string, EvaluationRun> {
+    const latest = new Map<string, EvaluationRun>();
+    for (const run of this.state.evaluationRuns) {
+      if (run.context !== "screening_baseline" || run.status !== "completed" || run.score === undefined) continue;
       const current = latest.get(run.evaluationId);
       if (!current || run.createdAt > current.createdAt) latest.set(run.evaluationId, run);
     }
@@ -171,7 +187,7 @@ export class StateStore {
   compositeScores(): { current?: number; previous?: number } {
     const byEvaluation = new Map<string, EvaluationRun[]>();
     for (const run of this.state.evaluationRuns) {
-      if (run.status !== "completed" || run.score === undefined || run.context === "agent") continue;
+      if (run.status !== "completed" || run.score === undefined || run.context === "agent" || run.context === "screening_baseline") continue;
       const runs = byEvaluation.get(run.evaluationId) ?? [];
       runs.push(run);
       byEvaluation.set(run.evaluationId, runs);
@@ -240,8 +256,11 @@ export function validateEvaluation(input: Partial<Evaluation>): Omit<Evaluation,
   const prompt = input.prompt?.trim();
   if (!name || !prompt) throw new Error("Evaluation name and prompt are required.");
   const command = input.command?.trim() || undefined;
+  const screeningCommand = input.screeningCommand?.trim() || undefined;
   if (command && command.length > 8_000) throw new Error("Evaluation command must be at most 8,000 characters.");
+  if (screeningCommand && !command) throw new Error("A screening command requires a full evaluation command.");
+  if (screeningCommand && screeningCommand.length > 8_000) throw new Error("Evaluation screening command must be at most 8,000 characters.");
   const weight = Number(input.weight ?? 1);
   if (!Number.isFinite(weight) || weight <= 0 || weight > 10) throw new Error("Weight must be between 0 and 10.");
-  return { name, prompt, ...(command ? { command } : {}), weight, enabled: input.enabled ?? true };
+  return { name, prompt, ...(command ? { command } : {}), ...(screeningCommand ? { screeningCommand } : {}), weight, enabled: input.enabled ?? true };
 }

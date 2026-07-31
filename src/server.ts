@@ -130,7 +130,7 @@ export async function createBurnerServer(options: BurnerServerOptions) {
     }),
     route("POST", "/api/evaluations/run", (_request, response) => {
       json(response, 202, { accepted: true });
-      void orchestrator.runEvaluations("manual").catch(async (error) => {
+      void orchestrator.runBaselineEvaluations("manual").catch(async (error) => {
         await store.addActivity({ type: "error", message: "Evaluation run failed", detail: errorMessage(error) });
         events.emit("error", { message: errorMessage(error) });
       });

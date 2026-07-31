@@ -114,7 +114,11 @@ export class CodexClient {
   }
 
   private async commandEvaluation(cwd: string, evaluation: Evaluation, context: EvaluationRun["context"]): Promise<EvaluationOutput> {
-    const result = await runCommand("/bin/sh", ["-lc", evaluation.command!], {
+    const command = context === "agent" || context === "screening_baseline"
+      ? evaluation.screeningCommand ?? evaluation.command
+      : evaluation.command;
+    if (!command) throw new Error(`Evaluation '${evaluation.name}' has no command for ${context}.`);
+    const result = await runCommand("/bin/sh", ["-lc", command], {
       cwd,
       env: { BURNER_EVALUATION_CONTEXT: context, BURNER_EVALUATION_NAME: evaluation.name },
       timeoutMs: 60 * 60 * 1000,
