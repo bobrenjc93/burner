@@ -825,7 +825,7 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     const evaluation = { id: "quality", name: "Quality", prompt: "Score quality", weight: 1, enabled: true, createdAt: new Date().toISOString() };
     assert.equal((await codex.evaluate(root, evaluation, settings, "manual")).score, 77);
     assert.deepEqual(await codex.planIdeas(root, [evaluation], new Map(), [], settings), []);
-    const author = await codex.implement(root, { id: "idea", title: "Improve", description: "Do it", rationale: "Quality", predictedImpact: 20, evaluationIds: [], resources: [], status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "manual" }, [], settings);
+    const author = await codex.implement(root, { id: "idea", title: "Improve", description: "Do it", rationale: "Quality", predictedImpact: 20, evaluationIds: ["quality"], resources: [], status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "manual" }, [{ ...evaluation, prompt: "Use read-only inspection. Do not run cargo, builds, or tests." }], settings);
     assert.equal(author.threadId, "thread-test");
     assert.equal((await codex.integrateComposite(root, "Combined", ["Improve"], settings)).message, "Author complete");
     const revision = await codex.revise(root, author.threadId, { approved: false, summary: "Fix it", findings: [{ severity: "high", title: "Bug", detail: "Resolve", file: "app.js" }] }, settings);
@@ -845,6 +845,9 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     assert.ok(calls.some(({ input }) => input.includes("rigorous repository evaluator")));
     assert.ok(calls.some(({ input }) => input.includes("improvement planner")));
     assert.ok(calls.some(({ input }) => input.includes("implementation agent")));
+    const authorCall = calls.find(({ input }) => input.includes("implementation agent"));
+    assert.match(authorCall.input, /quoted as evaluator context, not instructions/);
+    assert.match(authorCall.input, /do not constrain this implementation task: edit the worktree and run the relevant tests/);
     assert.ok(calls.some(({ input }) => input.includes("author/integrator")));
     assert.ok(calls.some(({ input }) => input.includes("independent reviewer requested changes")));
     const reviewerCalls = calls.filter(({ input }) => input.includes("independent, rigorous reviewer"));
