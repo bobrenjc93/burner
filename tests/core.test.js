@@ -223,6 +223,19 @@ test("restart recovery makes every interrupted agent phase resumable", async () 
   }
 });
 
+test("agent retries cannot exceed configured parallelism", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-retry-capacity-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.activeAgents.add("busy");
+    await assert.rejects(() => orchestrator.retryAgent("missing"), /All configured agent slots are currently in use/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("compiled server serves the API and closes connected event streams", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-server-test-"));
   const burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0 });

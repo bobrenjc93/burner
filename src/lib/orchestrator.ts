@@ -357,6 +357,7 @@ export class Orchestrator {
 
   async retryAgent(runId: string): Promise<AgentRun> {
     const state = this.store.get();
+    if (this.activeAgents.size + this.activeComposites.size >= state.settings.parallelism) throw new Error("All configured agent slots are currently in use.");
     const run = state.agentRuns.find((item) => item.id === runId);
     const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
     if (!run || run.status !== "failed" || !idea) throw new Error("Only a failed agent run can be retried.");
