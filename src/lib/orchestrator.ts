@@ -52,8 +52,9 @@ function yoloEvaluationSets(state: BurnerState): { enabled: Set<string>; command
 }
 
 export function inferIdeaResources(idea: Pick<Idea, "title" | "description" | "rationale">): string[] {
+  const focus = `${idea.title} ${idea.rationale}`;
   const text = `${idea.title} ${idea.description} ${idea.rationale}`;
-  return /\b(?:benchmarks?|performance|profil(?:e|er|ing)|load[ -]?tests?|stress[ -]?tests?)\b/i.test(text)
+  return /\b(?:benchmarks?|performance|profil(?:e|er|ing))\b/i.test(focus) || /\b(?:load[ -]?tests?|stress[ -]?tests?)\b/i.test(text)
     ? ["cpu-heavy"]
     : [];
 }

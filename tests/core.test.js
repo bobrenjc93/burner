@@ -83,6 +83,7 @@ test("merge progress artifacts retain every series and deduplicate PR retries", 
 test("benchmark-oriented ideas conservatively infer the shared CPU resource", () => {
   assert.deepEqual(inferIdeaResources({ title: "Emit benchmark evidence", description: "Prove results", rationale: "Integrity" }), ["cpu-heavy"]);
   assert.deepEqual(inferIdeaResources({ title: "Profile grouped queries", description: "Find hot paths", rationale: "Speed" }), ["cpu-heavy"]);
+  assert.deepEqual(inferIdeaResources({ title: "Implement SQL NULL semantics", description: "Avoid special-casing benchmark queries", rationale: "Correctness" }), []);
   assert.deepEqual(inferIdeaResources({ title: "Improve SQL docs", description: "Add examples", rationale: "Clarity" }), []);
 });
 
