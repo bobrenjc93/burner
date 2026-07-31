@@ -900,6 +900,39 @@ test("an exactly merged composite becomes the next full baseline without rerunni
   }
 });
 
+test("evaluation weight changes restamp open leaf impacts and PR bodies", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-reweight-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [
+        { id: "capability", name: "Capability", prompt: "Score", weight: 2, enabled: true, createdAt: timestamp },
+        { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "parity", name: "Parity", prompt: "Score", command: "bench", weight: 3, enabled: true, createdAt: timestamp },
+        { id: "integrity", name: "Integrity", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+      state.ideas = [{ id: "idea", title: "Improve", description: "Change it", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "run" }];
+      state.agentRuns = [{ id: "run", ideaId: "idea", status: "completed", branch: "branch", worktree: "", startedAt: timestamp, completedAt: timestamp, prNumber: 42, prState: "open", deltas: [
+        { evaluationId: "capability", name: "Capability", before: 40, after: 45, delta: 5 },
+        { evaluationId: "quality", name: "Quality", before: 75, after: 85, delta: 10 },
+        { evaluationId: "parity", name: "Parity", before: 100, after: 100, delta: 0 },
+        { evaluationId: "integrity", name: "Integrity", before: 85, after: 70, delta: -15 },
+      ], impact: -1.2, resources: [], reviewRounds: [], reviewApproved: true }];
+    });
+    const edits = [];
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { editPr: async (...args) => edits.push(args) };
+    await orchestrator.refreshEvaluationWeights();
+    assert.equal(store.get().agentRuns[0].impact, 0.7);
+    assert.equal(edits.length, 1);
+    assert.match(edits[0][3], /Burner impact score: \+0\.7/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("successful experiments bind to and incrementally evolve the living composite", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-living-test-"));
   try {

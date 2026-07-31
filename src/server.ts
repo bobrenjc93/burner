@@ -118,6 +118,7 @@ export async function createBurnerServer(options: BurnerServerOptions) {
         if (evaluation) { Object.assign(evaluation, input); found = true; }
       });
       if (!found) return json(response, 404, { error: "Evaluation not found" });
+      await orchestrator.refreshEvaluationWeights();
       events.emit("state", store.get());
       json(response, 200, { ok: true });
     }),

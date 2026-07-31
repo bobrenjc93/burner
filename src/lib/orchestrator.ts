@@ -278,7 +278,7 @@ export class Orchestrator {
   private async autoMergeNext(): Promise<boolean> {
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
-    const cadenceNeedsSingleLeaf = this.mergeCadenceDue(state) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0;
+    const cadenceNeedsSingleLeaf = (this.mergeCadenceDue(state) || this.portfolioCookDue(state)) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0;
     const candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf);
     if (!candidate) return false;
     await this.store.addActivity({
@@ -386,15 +386,26 @@ export class Orchestrator {
       await this.reviewAndDeliverAgent(idea, base, run.id, run.worktree, run.branch, state.settings, run.authorThreadId, run.lastMessage ?? "");
     } catch (error) {
       const message = errorMessage(error);
-      await this.updateAgent(run.id, { status: "failed", error: message, completedAt: now() });
+      const quarantined = error instanceof PortfolioReviewLimitError;
+      const completedAt = now();
+      await this.updateAgent(run.id, {
+        status: "failed",
+        error: message,
+        completedAt,
+        ...(quarantined ? { quarantinedAt: completedAt, quarantineReason: `No approval within ${this.portfolioReviewLimit(this.store.get().settings)} portfolio review rounds.` } : {}),
+      });
       await this.finishIdea(idea.id, "failed");
-      await this.store.addActivity({ type: "error", message: `Agent retry failed: ${idea.title}`, detail: message });
+      await this.store.addActivity({
+        type: "error",
+        message: quarantined ? `Agent quarantined: ${idea.title}` : `Agent retry failed: ${idea.title}`,
+        detail: quarantined ? "The review budget was exhausted. Burner released the portfolio slot so healthier work can advance." : message,
+      });
     } finally {
       await lease.release();
       this.activeAgents.delete(idea.id);
       this.runtimeCache = undefined;
       this.events.emit("state", this.store.get());
-      if (this.yolo && this.store.get().orchestrator.enabled) void this.tick(true);
+      if (this.yolo && this.store.get().orchestrator.enabled) void this.tick(false);
       else void this.scheduleComposites(true);
     }
     return this.store.get().agentRuns.find((item) => item.id === run.id)!;
@@ -674,6 +685,48 @@ export class Orchestrator {
     });
     await this.store.addActivity({ type: "system", message: `Living line selected: ${title}`, detail: "New planning and experiments will build from this composite." });
     this.events.emit("state", this.store.get());
+  }
+
+  async refreshEvaluationWeights(): Promise<void> {
+    const changedAgentIds = new Set<string>();
+    const changedCompositeIds = new Set<string>();
+    await this.store.update((state) => {
+      for (const run of state.agentRuns) {
+        if (!run.deltas.length) continue;
+        const impact = this.calculateImpact(state, run.deltas);
+        if (run.impact !== impact) { run.impact = impact; changedAgentIds.add(run.id); }
+      }
+      for (const composite of state.composites) {
+        if (!composite.deltas.length) continue;
+        const impact = this.calculateImpact(state, composite.deltas);
+        const scores = new Map(composite.deltas.flatMap((delta) => delta.after === undefined ? [] : [[delta.evaluationId, delta.after] as const]));
+        const compositeScore = weightedScore(state.evaluations, scores);
+        if (composite.impact !== impact || (compositeScore !== undefined && composite.compositeScore !== compositeScore)) {
+          composite.impact = impact;
+          if (compositeScore !== undefined) composite.compositeScore = compositeScore;
+          changedCompositeIds.add(composite.id);
+        }
+      }
+    });
+    const state = this.store.get();
+    for (const run of state.agentRuns.filter((item) => changedAgentIds.has(item.id) && item.prNumber && item.prState === "open")) {
+      const idea = state.ideas.find((item) => item.id === run.ideaId);
+      await this.git.editPr(this.root, run.prNumber!, idea?.title ?? run.branch, buildPrBody(idea?.description ?? "", run.lastMessage ?? "", run.deltas, run.impact ?? 0, run.reviewRounds));
+    }
+    for (const composite of state.composites.filter((item) => changedCompositeIds.has(item.id) && item.prNumber && item.status === "open")) {
+      await this.git.editPr(this.root, composite.prNumber!, composite.title, buildCompositePrBody({
+        description: composite.description,
+        sources: composite.sources,
+        deltas: composite.deltas,
+        compositeScore: composite.compositeScore ?? 0,
+        impact: composite.impact ?? 0,
+        reviewRounds: composite.reviewRounds,
+      }));
+    }
+    if (changedAgentIds.size || changedCompositeIds.size) {
+      await this.store.addActivity({ type: "evaluation", message: "Evaluation weights reapplied", detail: `${changedAgentIds.size} leaf and ${changedCompositeIds.size} composite impact stamp${changedAgentIds.size + changedCompositeIds.size === 1 ? "" : "s"} refreshed.` });
+      this.events.emit("state", this.store.get());
+    }
   }
 
   async mergeComposite(compositeId: string): Promise<void> {
@@ -1122,7 +1175,7 @@ export class Orchestrator {
       this.runtimeCache = undefined;
       this.events.emit("state", this.store.get());
       if (this.store.get().orchestrator.enabled) {
-        if (this.yolo) void this.tick(true);
+        if (this.yolo) void this.tick(false);
         else void this.schedule();
       }
       if (!this.yolo || !this.store.get().orchestrator.enabled) void this.scheduleComposites(true);
@@ -1198,7 +1251,7 @@ export class Orchestrator {
       this.activeComposites.delete(next.id);
       this.runtimeCache = undefined;
       this.events.emit("state", this.store.get());
-      if (this.yolo && this.store.get().orchestrator.enabled) void this.tick(true);
+      if (this.yolo && this.store.get().orchestrator.enabled) void this.tick(false);
       else void this.scheduleComposites(true);
     });
   }
