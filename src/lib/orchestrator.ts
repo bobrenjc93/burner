@@ -882,6 +882,7 @@ export class Orchestrator {
         await this.runBaselineEvaluations("baseline");
       }
       const refreshed = this.store.get();
+      if (!refreshed.orchestrator.enabled && !force) return;
       const configuredLiving = refreshed.orchestrator.livingCompositeId ? refreshed.composites.find((item) => item.id === refreshed.orchestrator.livingCompositeId) : undefined;
       if (!(this.yolo && this.yoloBatchSize > 1) && refreshed.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") {
         await this.scheduleComposites();
@@ -893,6 +894,7 @@ export class Orchestrator {
         Date.now() - new Date(refreshed.orchestrator.lastPlanningAt).getTime() >= settings.orchestratorIntervalMinutes * 60_000;
       const queued = refreshed.ideas.filter((idea) => idea.status === "queued").length;
       if (planningDue && queued < settings.parallelism * 2) await this.plan();
+      if (!this.store.get().orchestrator.enabled && !force) return;
       await this.scheduleComposites();
       await this.schedule();
     } catch (error) {
