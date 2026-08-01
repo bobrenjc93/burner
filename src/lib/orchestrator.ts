@@ -39,8 +39,9 @@ function isYoloCandidate(
   deltas: ScoreDelta[],
   impact: number | undefined,
   enabledEvaluationIds: Set<string>,
-  _commandEvaluationIds: Set<string>,
+  commandEvaluationIds: Set<string>,
   threshold: number,
+  strictPromptRegressions = true,
 ): impact is number {
   if (!Number.isFinite(impact) || impact! <= threshold) return false;
   const byEvaluation = new Map(deltas.map((delta) => [delta.evaluationId, delta]));
@@ -48,7 +49,10 @@ function isYoloCandidate(
     const delta = byEvaluation.get(evaluationId)?.delta;
     return Number.isFinite(delta);
   });
-  return complete && [...enabledEvaluationIds].every((evaluationId) => byEvaluation.get(evaluationId)!.delta! >= 0);
+  if (!complete) return false;
+  const commandsPass = [...commandEvaluationIds].every((evaluationId) => byEvaluation.get(evaluationId)!.delta! >= 0);
+  const promptsPass = !strictPromptRegressions || [...enabledEvaluationIds].every((evaluationId) => byEvaluation.get(evaluationId)!.delta! >= 0);
+  return commandsPass && promptsPass;
 }
 
 function yoloEvaluationSets(state: BurnerState): { enabled: Set<string>; commands: Set<string> } {
@@ -85,7 +89,7 @@ function eligibleYoloLeaves(state: BurnerState, baseCommit: string): AgentRun[] 
       !run.quarantinedAt &&
       !reserved.has(run.id) &&
       finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
-      isYoloCandidate(run.deltas, run.impact, enabled, commands, state.settings.compositeAbsorbThreshold))
+      isYoloCandidate(run.deltas, run.impact, enabled, commands, state.settings.compositeAbsorbThreshold, false))
     .sort((a, b) => (b.impact ?? -Infinity) - (a.impact ?? -Infinity));
 }
 
@@ -195,11 +199,15 @@ export class Orchestrator {
     if (!this.mergeCadenceDue(state)) return;
     const lastAlert = state.orchestrator.lastMergeCadenceAlertAt;
     if (lastAlert && Date.now() - new Date(lastAlert).getTime() < state.settings.mergeCadenceMinutes * 60_000) return;
+    const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
+    const reviewedLeaves = state.agentRuns.filter((run) =>
+      run.status === "completed" && run.prState === "open" && run.baseCommit === baseCommit && finalReviewApproved(run.reviewApproved, run.reviewRounds));
+    const eligibleLeaves = eligibleYoloLeaves(state, baseCommit);
     await this.store.update((draft) => { draft.orchestrator.lastMergeCadenceAlertAt = now(); });
     await this.store.addActivity({
       type: "error",
       message: "Merge cadence missed",
-      detail: `No qualifying merge completed within ${state.settings.mergeCadenceMinutes} minutes. Burner will shorten the next batch, permit a single reviewed leaf merge, and quarantine review-loop blockers.`,
+      detail: `No qualifying merge completed within ${state.settings.mergeCadenceMinutes} minutes. ${reviewedLeaves.length} reviewed open leaf PR${reviewedLeaves.length === 1 ? " is" : "s are"} available; ${eligibleLeaves.length} ${eligibleLeaves.length === 1 ? "is" : "are"} batch-eligible after completeness, impact, command-regression, quarantine, and reservation checks. Burner will shorten the next batch and preserve strict full-composite validation.`,
     });
   }
 

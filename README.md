@@ -95,13 +95,15 @@ Portfolio mode treats the configured merge cadence as a health SLA. The default 
 
 YOLO reviews are bounded independently from manual work. The default portfolio checkpoint is twelve author/reviewer rounds. A leaf that cannot clear that window is preserved as a visible draft PR with its unresolved findings and `burner-quarantined` label, so substantial work and its author session are not lost. If a composite exhausts the window, Burner maps reviewer file findings back to source branches, labels the strongest-overlap leaf `burner-quarantined`, retires the blocked draft, and immediately recooks the remaining healthy subset.
 
-Each leaf selected for a portfolio generation, and each composite eligible for merging:
+Each leaf selected for a portfolio generation:
 
 - was approved by the final independent review round;
 - has a completed delta for every currently enabled evaluation;
 - has positive weighted impact above the configured absorption threshold;
-- has no regression in any enabled evaluation; and
+- has no command-backed evaluation regression; and
 - was built and evaluated from the current base commit.
+
+Prompt evaluations can be noisy or depend on a sibling change, as progress accounting did before the graph branch was combined. A leaf prompt regression therefore does not prevent master-cooking. The actual combined composite is held to the stricter rule: every enabled evaluation must be complete and non-regressing before merge.
 
 Burner merges at most one change at a time, closes a merged composite's constituent leaf PRs as superseded, synchronizes `main`, and refreshes the full baseline before beginning the next generation. Other open composites are rebuilt against the new base; unbatched leaves from an obsolete base are closed with an explanation so stale results cannot leak into a later generation. A qualifying portfolio composite becomes the living line: planning and follow-up experiments use its measured branch, and regression-free experiments are absorbed and fully reevaluated before the eventual merge. Failed composites release their leaves instead of reserving them forever.
 
@@ -113,7 +115,7 @@ At higher concurrency, a complete leaf batch becomes a drain barrier: Burner sto
 
 Long deterministic evaluations may define a `--screening-command` for YOLO portfolio leaves. Burner first measures that exact screen on the current base, compares every leaf against the comparable screen baseline, and labels those rows in leaf PRs. A rejected infrastructure or unstable-timing run is treated as incomplete rather than numeric zero, preventing a transient bad baseline from manufacturing impact. Correctness and candidate resource-limit failures remain legitimate score-zero regressions. Composite PRs always rerun the full `--command`; cadence-driven single-leaf merges also receive full-command validation before merge.
 
-Every enabled evaluation is a monotonic merge gate in YOLO mode. Prompt scores remain noisier than command scores, but a regression blocks selection instead of being hidden by a weighted gain elsewhere. Composite evaluation regressions are fed back to the integration author, independently reviewed again, and fully rescored for up to three repair passes. Cadence expiry permits a single leaf only after full validation when no two-leaf subset is available.
+Every enabled evaluation is a monotonic final-merge gate in YOLO mode. Prompt regressions do not strand otherwise useful leaf branches before they can be combined, but they must be resolved by the fully integrated composite. Composite evaluation regressions are fed back to the integration author, independently reviewed again, and fully rescored for up to three repair passes. Cadence expiry permits a single leaf only after full validation when no two-leaf subset is available.
 
 An evaluation may optionally provide a local command and a faster, comparable leaf screening command. Burner runs them directly in each evaluated checkout and expects one JSON object on stdout with `score` (0–100), `summary`, `evidence`, and `suggestions`. Command evaluations are useful for deterministic benchmarks and test-derived metrics; they are direct local subprocesses that inherit Burner's permissions and are not `codex exec` invocations, so only configure commands you trust. Evaluations without a command use an unrestricted Codex agent.
 

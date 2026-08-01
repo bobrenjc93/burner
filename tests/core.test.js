@@ -549,6 +549,33 @@ test("YOLO portfolio waits for a full leaf batch, ranks impact, and reserves com
   assert.deepEqual(selectYoloLeafBatch(state, "base", 3), ["a2", "a3", "a4"]);
 });
 
+test("YOLO leaf batches tolerate prompt noise but never command regressions", () => {
+  const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
+  const state = {
+    settings: { compositeAbsorbThreshold: 0 },
+    evaluations: [
+      { id: "benchmark", enabled: true, command: "./benchmark" },
+      { id: "progress", enabled: true },
+    ],
+    composites: [],
+    agentRuns: [
+      { id: "leaf-a", status: "completed", prState: "open", prNumber: 1, baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], impact: 5, deltas: [
+        { evaluationId: "benchmark", name: "Benchmark", before: 50, after: 50, delta: 0 },
+        { evaluationId: "progress", name: "Progress", before: 20, after: 0, delta: -20 },
+      ] },
+      { id: "leaf-b", status: "completed", prState: "open", prNumber: 2, baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], impact: 4, deltas: [
+        { evaluationId: "benchmark", name: "Benchmark", before: 50, after: 55, delta: 5 },
+        { evaluationId: "progress", name: "Progress", before: 20, after: 20, delta: 0 },
+      ] },
+    ],
+  };
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 2), ["leaf-a", "leaf-b"]);
+  assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "leaf-b", prNumber: 2, impact: 4 });
+  state.agentRuns[0].deltas[0] = { ...state.agentRuns[0].deltas[0], after: 45, delta: -5 };
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 2), []);
+  assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "leaf-b", prNumber: 2, impact: 4 });
+});
+
 test("YOLO portfolio automatically cooks a complete batch as an evolving living line", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-portfolio-test-"));
   try {
