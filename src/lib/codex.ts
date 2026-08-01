@@ -82,6 +82,12 @@ function commandFailure(result: CommandResult, fallback: string): string {
   return raw.length > 8_000 ? `…[truncated]\n${raw.slice(-8_000)}` : raw;
 }
 
+function isInconclusiveCommandOutput(output: EvaluationOutput): boolean {
+  if (output.score !== 0 || !/\b(?:benchmark rejected|no timing score was accepted|invalid measurement)\b/i.test(output.summary)) return false;
+  if (!output.evidence.length) return true;
+  return output.evidence.some((item) => /\b(?:unstable timing|timing .{0,80}(?:spread|variance|noise)|timed? out|failed to launch|could not execute|no such file|permission denied|checksum mismatch|provenance failure|identity mismatch)\b/i.test(item));
+}
+
 export class CodexClient {
   private unrestrictedArgsPromise?: Promise<string[]>;
 
@@ -134,7 +140,7 @@ export class CodexClient {
     });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Evaluation command exited with ${result.exitCode}`);
     const output = this.normalizeEvaluation(parseJsonObject<EvaluationOutput>(result.stdout));
-    if (output.score === 0 && /\b(?:benchmark rejected|no timing score was accepted|invalid measurement|setup or correctness failure)\b/i.test(output.summary)) {
+    if (isInconclusiveCommandOutput(output)) {
       const detail = output.evidence[0] ? ` ${output.evidence[0]}` : "";
       throw new Error(`Evaluation command reported an inconclusive measurement: ${output.summary}.${detail}`.slice(0, 2_000));
     }

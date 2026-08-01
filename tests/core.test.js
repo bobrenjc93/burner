@@ -158,13 +158,15 @@ test("command evaluations reject fail-closed measurements instead of treating th
   const root = await mkdtemp(join(tmpdir(), "burner-command-rejection-test-"));
   const evaluator = join(root, "evaluate");
   try {
-    await writeFile(evaluator, `#!/bin/sh\nprintf '%s\\n' '{"score":0,"summary":"Benchmark rejected: no timing score was accepted.","evidence":["resource limit"],"suggestions":[]}'\n`);
+    await writeFile(evaluator, `#!/bin/sh\nprintf '%s\\n' '{"score":0,"summary":"Benchmark rejected: no timing score was accepted.","evidence":["unstable timing: max/min spread exceeds the accepted limit"],"suggestions":[]}'\n`);
     await chmod(evaluator, 0o755);
     const settings = { parallelism: 1, evaluationIntervalMinutes: 30, orchestratorIntervalMinutes: 15, autoRun: false, autoCreatePrs: true, evaluatorModel: "", agentModel: "", baseBranch: "main", remote: "origin", defaultResources: [], maxReviewRounds: 12, portfolioReviewRounds: 12, mergeCadenceMinutes: 60, preferLivingComposite: true, compositeAbsorbThreshold: 0 };
     await assert.rejects(
       () => new CodexClient().evaluate(root, { id: "bench", name: "Benchmark", prompt: "Measure it", command: evaluator, weight: 1, enabled: true, createdAt: new Date().toISOString() }, settings, "manual"),
       /inconclusive measurement.*Benchmark rejected/s,
     );
+    await writeFile(evaluator, `#!/bin/sh\nprintf '%s\\n' '{"score":0,"summary":"Benchmark rejected: no timing score was accepted.","evidence":["typed correctness mismatch for unsupported SELECT"],"suggestions":[]}'\n`);
+    assert.equal((await new CodexClient().evaluate(root, { id: "bench", name: "Benchmark", prompt: "Measure it", command: evaluator, weight: 1, enabled: true, createdAt: new Date().toISOString() }, settings, "manual")).score, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1212,7 +1214,7 @@ test("state persists evaluation configuration and excludes candidate scores from
       state.evaluationRuns.push(
         { id: "baseline", evaluationId: evaluation.id, score: 61, commit: "a", createdAt: "2026-01-01T00:00:00.000Z", durationMs: 1, status: "completed", context: "manual" },
         { id: "candidate", evaluationId: evaluation.id, score: 99, commit: "b", createdAt: "2026-01-02T00:00:00.000Z", durationMs: 1, status: "completed", context: "agent", error: "x".repeat(20_000) },
-        { id: "rejected-screen", evaluationId: evaluation.id, score: 0, summary: "Benchmark rejected: no timing score was accepted.", commit: "a", createdAt: "2026-01-03T00:00:00.000Z", durationMs: 1, status: "completed", context: "screening_baseline" },
+        { id: "rejected-screen", evaluationId: evaluation.id, score: 0, summary: "Benchmark rejected: no timing score was accepted.", evidence: ["unstable timing: max/min spread 11.7"], commit: "a", createdAt: "2026-01-03T00:00:00.000Z", durationMs: 1, status: "completed", context: "screening_baseline" },
       );
     });
     assert.equal(store.latestRuns().get(evaluation.id)?.score, 61);
