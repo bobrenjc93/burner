@@ -5,10 +5,22 @@ import { runCommand } from "./process.js";
 
 export type PullRequestDisposition = "merged" | "unmerged";
 
+type PullRequestMergeStatus = {
+  state: "OPEN" | "CLOSED" | "MERGED";
+  mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  headRefOid: string;
+};
+
+const wait = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+
 export class GitService {
   private dispositionLabelsReady = false;
 
-  constructor(readonly root: string, private readonly dataDir: string) {}
+  constructor(
+    readonly root: string,
+    private readonly dataDir: string,
+    private readonly mergePolling: { attempts?: number; intervalMs?: number; mergeAttempts?: number } = {},
+  ) {}
 
   async status(): Promise<{ available: boolean; branch?: string; commit?: string; dirty?: boolean }> {
     const inside = await runCommand("git", ["rev-parse", "--is-inside-work-tree"], { cwd: this.root }).catch(() => undefined);
@@ -202,9 +214,50 @@ export class GitService {
   }
 
   async mergePr(cwd: string, number: number): Promise<void> {
-    const result = await runCommand("gh", ["pr", "merge", String(number), "--merge"], { cwd, timeoutMs: 10 * 60 * 1000 });
-    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not merge PR #${number}`);
-    await this.markPrDisposition(cwd, number, "merged").catch(() => undefined);
+    const expectedHead = await this.head(cwd);
+    const mergeAttempts = this.mergePolling.mergeAttempts ?? 3;
+    let lastError = "";
+    for (let attempt = 1; attempt <= mergeAttempts; attempt += 1) {
+      const status = await this.waitForPrMergeability(cwd, number, expectedHead);
+      if (status.state === "MERGED") {
+        await this.markPrDisposition(cwd, number, "merged").catch(() => undefined);
+        return;
+      }
+      const result = await runCommand("gh", ["pr", "merge", String(number), "--merge"], { cwd, timeoutMs: 10 * 60 * 1000 });
+      if (result.exitCode === 0) {
+        await this.markPrDisposition(cwd, number, "merged").catch(() => undefined);
+        return;
+      }
+      lastError = result.stderr.trim() || result.stdout.trim() || `Could not merge PR #${number}`;
+      const transient = /not mergeable|mergeability|head (?:branch|sha).*(?:changed|updated)|base branch.*(?:changed|updated)/i.test(lastError);
+      if (!transient || attempt === mergeAttempts) throw new Error(lastError);
+      await wait(this.mergePolling.intervalMs ?? 2_500);
+    }
+    throw new Error(lastError || `Could not merge PR #${number}`);
+  }
+
+  private async waitForPrMergeability(cwd: string, number: number, expectedHead: string): Promise<PullRequestMergeStatus> {
+    const attempts = this.mergePolling.attempts ?? 24;
+    const intervalMs = this.mergePolling.intervalMs ?? 2_500;
+    let lastStatus: PullRequestMergeStatus | undefined;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const result = await runCommand(
+        "gh",
+        ["pr", "view", String(number), "--json", "state,mergeable,headRefOid"],
+        { cwd, timeoutMs: 2 * 60 * 1000 },
+      );
+      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not inspect PR #${number} mergeability`);
+      lastStatus = JSON.parse(result.stdout) as PullRequestMergeStatus;
+      if (lastStatus.state === "MERGED") return lastStatus;
+      if (lastStatus.state !== "OPEN") throw new Error(`PR #${number} is ${lastStatus.state.toLowerCase()} instead of open.`);
+      if (lastStatus.headRefOid === expectedHead && lastStatus.mergeable === "MERGEABLE") return lastStatus;
+      if (lastStatus.headRefOid === expectedHead && lastStatus.mergeable === "CONFLICTING") {
+        throw new Error(`PR #${number} conflicts with its base branch at ${expectedHead.slice(0, 8)}.`);
+      }
+      if (attempt < attempts) await wait(intervalMs);
+    }
+    const observed = lastStatus?.headRefOid ? lastStatus.headRefOid.slice(0, 8) : "unknown";
+    throw new Error(`GitHub did not report PR #${number} mergeable at head ${expectedHead.slice(0, 8)} after ${attempts} checks (observed ${observed}, ${lastStatus?.mergeable ?? "UNKNOWN"}).`);
   }
 
   async markPrDisposition(cwd: string, number: number, disposition: PullRequestDisposition): Promise<void> {

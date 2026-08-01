@@ -485,6 +485,44 @@ test("GitHub PR disposition labels are mutually exclusive and initialized once",
   }
 });
 
+test("GitHub merge waits for the pushed head and retries transient not-mergeable responses", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-mergeability-test-"));
+  const bin = join(root, "bin");
+  const statePath = join(root, "gh-state.json");
+  await import("node:fs/promises").then((fs) => fs.mkdir(bin));
+  await exec(root, "git", ["init", "-b", "main"]);
+  await writeFile(join(root, "README.md"), "# Test\n");
+  await exec(root, "git", ["add", "."]);
+  await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "base"]);
+  const head = (await exec(root, "git", ["rev-parse", "HEAD"])).trim();
+  const executable = join(bin, "gh");
+  await writeFile(executable, `#!/usr/bin/env node
+const fs=require("fs");const args=process.argv.slice(2);const path=process.env.BURNER_TEST_GH_STATE;const state=fs.existsSync(path)?JSON.parse(fs.readFileSync(path,"utf8")):{views:0,merges:0};
+if(args[0]==="pr"&&args[1]==="view"){state.views++;fs.writeFileSync(path,JSON.stringify(state));const mergeable=process.env.BURNER_TEST_CONFLICT==="1"?"CONFLICTING":state.views===1?"UNKNOWN":"MERGEABLE";console.log(JSON.stringify({state:"OPEN",mergeable,headRefOid:process.env.BURNER_TEST_HEAD}));process.exit(0);}
+if(args[0]==="pr"&&args[1]==="merge"){state.merges++;fs.writeFileSync(path,JSON.stringify(state));if(state.merges===1){console.error("GraphQL: Pull Request is not mergeable (mergePullRequest)");process.exit(1);}process.exit(0);}
+process.exit(0);
+`);
+  await chmod(executable, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath}`;
+  process.env.BURNER_TEST_GH_STATE = statePath;
+  process.env.BURNER_TEST_HEAD = head;
+  try {
+    const git = new GitService(root, join(root, ".burner"), { attempts: 4, intervalMs: 0, mergeAttempts: 2 });
+    await git.mergePr(root, 42);
+    assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")), { views: 3, merges: 2 });
+    process.env.BURNER_TEST_CONFLICT = "1";
+    await assert.rejects(() => git.mergePr(root, 43), /conflicts with its base branch/);
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).merges, 2, "a real conflict must not call merge");
+  } finally {
+    process.env.PATH = previousPath;
+    delete process.env.BURNER_TEST_GH_STATE;
+    delete process.env.BURNER_TEST_HEAD;
+    delete process.env.BURNER_TEST_CONFLICT;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("PR bodies record review approval and recalculated composite scores", () => {
   const rounds = [{ id: "r1", round: 1, commit: "abc", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() }];
   const deltas = [{ evaluationId: "quality", name: "Quality", before: 70, after: 82, delta: 12 }];
