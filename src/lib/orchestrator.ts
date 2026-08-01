@@ -99,6 +99,23 @@ export function selectYoloLeafBatch(state: BurnerState, baseCommit: string, batc
   return eligible.length >= minimumSize ? eligible.slice(0, batchSize).map((run) => run.id) : [];
 }
 
+export function partitionReviewFallbacks(agentRunIds: string[], originalSize: number): string[][] {
+  if (agentRunIds.length < 2) return [];
+  const maximumSize = Math.max(2, Math.floor(originalSize / 2));
+  const batches: string[][] = [];
+  for (let index = 0; index < agentRunIds.length;) {
+    const remaining = agentRunIds.length - index;
+    if (remaining === 1 && batches.length) {
+      batches.at(-1)!.push(agentRunIds[index]!);
+      break;
+    }
+    const size = Math.min(maximumSize, remaining);
+    batches.push(agentRunIds.slice(index, index + size));
+    index += size;
+  }
+  return batches;
+}
+
 export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string, includeAgents = true): YoloMergeCandidate | undefined {
   const { enabled: enabledEvaluationIds, commands: commandEvaluationIds } = yoloEvaluationSets(state);
   if (!enabledEvaluationIds.size) return undefined;
@@ -955,7 +972,6 @@ export class Orchestrator {
       if (composite && composite.status === "failed") {
         composite.status = composite.prNumber ? "rebuilding" : "queued";
         composite.error = undefined;
-        composite.reviewRounds = [];
         composite.reviewApproved = false;
         composite.updatedAt = now();
         found = true;
@@ -1684,17 +1700,18 @@ export class Orchestrator {
     }
   }
 
-  private async reviewAgent(cwd: string, runId: string, title: string, baseBranch: string, threadId: string, settings: BurnerState["settings"]): Promise<SessionResult> {
+  private async reviewAgent(cwd: string, runId: string, title: string, baseBranch: string, threadId: string, _settings: BurnerState["settings"]): Promise<SessionResult> {
     let currentThreadId = threadId;
     let message = this.store.get().agentRuns.find((run) => run.id === runId)?.lastMessage ?? "";
-    const reviewLimit = this.portfolioReviewLimit(settings);
-    const priorRounds = this.store.get().agentRuns.find((run) => run.id === runId)?.reviewRounds.length ?? 0;
-    let lastReview: ReviewResult | undefined;
-    for (let attempt = 1; attempt <= reviewLimit; attempt += 1) {
-      const roundNumber = priorRounds + attempt;
+    let lastFindings = this.store.get().agentRuns.find((run) => run.id === runId)?.reviewRounds.at(-1)?.findings ?? [];
+    while (true) {
+      const roundsUsed = this.store.get().agentRuns.find((run) => run.id === runId)?.reviewRounds.length ?? 0;
+      const liveSettings = this.store.get().settings;
+      if (roundsUsed >= this.portfolioReviewLimit(liveSettings)) break;
+      const roundNumber = roundsUsed + 1;
       await this.updateAgent(runId, { status: "reviewing" });
-      const review = await this.codex.review(cwd, baseBranch, title, settings);
-      lastReview = review;
+      const review = await this.codex.review(cwd, baseBranch, title, liveSettings);
+      lastFindings = review.findings;
       const round: ReviewRound = { id: id("review"), round: roundNumber, commit: await this.git.head(cwd), approved: review.approved, summary: review.summary, findings: review.findings, createdAt: now() };
       await this.store.update((state) => state.agentRuns.find((run) => run.id === runId)?.reviewRounds.push(round));
       this.events.emit("review", { runId, round: roundNumber, approved: review.approved, findings: review.findings.length });
@@ -1706,9 +1723,11 @@ export class Orchestrator {
         });
         return { message, threadId: currentThreadId };
       }
-      if (attempt === reviewLimit) break;
+      const revisionSettings = this.store.get().settings;
+      const currentRounds = this.store.get().agentRuns.find((run) => run.id === runId)?.reviewRounds.length ?? 0;
+      if (currentRounds >= this.portfolioReviewLimit(revisionSettings)) break;
       await this.updateAgent(runId, { status: "revising" });
-      const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), settings);
+      const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), revisionSettings);
       currentThreadId = revision.threadId;
       message = revision.message;
       if (await this.git.hasChanges(cwd)) await this.git.commit(cwd, `burner: address review round ${roundNumber}`);
@@ -1719,25 +1738,27 @@ export class Orchestrator {
         if (stored) Object.assign(stored, round);
       });
     }
-    if (this.portfolioMode()) throw new PortfolioReviewLimitError(lastReview?.findings ?? [], "agent");
-    throw new Error(`Reviewer did not approve after ${reviewLimit} rounds; no PR was opened.`);
+    const reviewLimit = this.portfolioReviewLimit(this.store.get().settings);
+    if (this.portfolioMode()) throw new PortfolioReviewLimitError(lastFindings, "agent");
+    throw new Error(`Reviewer did not approve after ${reviewLimit} total rounds; no PR was opened.`);
   }
 
-  private async reviewComposite(cwd: string, compositeId: string, title: string, baseBranch: string, threadId: string, settings: BurnerState["settings"]): Promise<SessionResult> {
+  private async reviewComposite(cwd: string, compositeId: string, title: string, baseBranch: string, threadId: string, _settings: BurnerState["settings"]): Promise<SessionResult> {
     let currentThreadId = threadId;
     let message = "Composite integration complete.";
-    const reviewLimit = this.portfolioReviewLimit(settings);
-    const priorRounds = this.store.get().composites.find((item) => item.id === compositeId)?.reviewRounds.length ?? 0;
-    let lastReview: ReviewResult | undefined;
-    for (let attempt = 1; attempt <= reviewLimit; attempt += 1) {
-      const roundNumber = priorRounds + attempt;
+    let lastFindings = this.store.get().composites.find((item) => item.id === compositeId)?.reviewRounds.at(-1)?.findings ?? [];
+    while (true) {
+      const roundsUsed = this.store.get().composites.find((item) => item.id === compositeId)?.reviewRounds.length ?? 0;
+      const liveSettings = this.store.get().settings;
+      if (roundsUsed >= this.portfolioReviewLimit(liveSettings)) break;
+      const roundNumber = roundsUsed + 1;
       await this.updateComposite(compositeId, { status: "reviewing", updatedAt: now() });
-      const review = await this.codex.review(cwd, baseBranch, title, settings);
-      lastReview = review;
+      const review = await this.codex.review(cwd, baseBranch, title, liveSettings);
+      lastFindings = review.findings;
       const round: ReviewRound = { id: id("review"), round: roundNumber, commit: await this.git.head(cwd), approved: review.approved, summary: review.summary, findings: review.findings, createdAt: now() };
       await this.store.update((state) => state.composites.find((item) => item.id === compositeId)?.reviewRounds.push(round));
       this.events.emit("review", { compositeId, round: roundNumber, approved: review.approved, findings: review.findings.length });
-      await this.publishCompositeDraft(cwd, compositeId, `in independent review round ${roundNumber}`, settings);
+      await this.publishCompositeDraft(cwd, compositeId, `in independent review round ${roundNumber}`, liveSettings);
       if (review.approved) {
         round.completedAt = now();
         await this.store.update((state) => {
@@ -1746,9 +1767,11 @@ export class Orchestrator {
         });
         return { message, threadId: currentThreadId };
       }
-      if (attempt === reviewLimit) break;
+      const revisionSettings = this.store.get().settings;
+      const currentRounds = this.store.get().composites.find((item) => item.id === compositeId)?.reviewRounds.length ?? 0;
+      if (currentRounds >= this.portfolioReviewLimit(revisionSettings)) break;
       await this.updateComposite(compositeId, { status: "revising", updatedAt: now() });
-      const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), settings);
+      const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), revisionSettings);
       currentThreadId = revision.threadId;
       message = revision.message;
       if (await this.git.hasChanges(cwd)) await this.git.commit(cwd, `burner: address composite review round ${roundNumber}`);
@@ -1758,10 +1781,11 @@ export class Orchestrator {
         const stored = state.composites.find((item) => item.id === compositeId)?.reviewRounds.find((item) => item.id === round.id);
         if (stored) Object.assign(stored, round);
       });
-      await this.publishCompositeDraft(cwd, compositeId, `revising findings from review round ${roundNumber}`, settings);
+      await this.publishCompositeDraft(cwd, compositeId, `revising findings from review round ${roundNumber}`, revisionSettings);
     }
-    if (this.portfolioMode()) throw new PortfolioReviewLimitError(lastReview?.findings ?? [], "composite");
-    throw new Error(`Composite reviewer did not approve after ${reviewLimit} rounds.`);
+    const reviewLimit = this.portfolioReviewLimit(this.store.get().settings);
+    if (this.portfolioMode()) throw new PortfolioReviewLimitError(lastFindings, "composite");
+    throw new Error(`Composite reviewer did not approve after ${reviewLimit} total rounds.`);
   }
 
   private normalizeReview(review: ReviewResult): ReviewResult {
@@ -1819,18 +1843,27 @@ export class Orchestrator {
     await this.store.addActivity({
       type: "error",
       message: `Portfolio leaf quarantined: ${suspect.prNumber ? `#${suspect.prNumber}` : suspect.title}`,
-      detail: `${reason} The remaining ${composite.sources.length - 1} source changes were released immediately.`,
+      detail: `${reason} The remaining ${composite.sources.length - 1} source changes will be repartitioned immediately.`,
     });
 
     const remainingIds = composite.sources.filter((source) => source.agentRunId !== suspect.agentRunId && source.kind === "pull_request").map((source) => source.agentRunId);
-    if (remainingIds.length >= 2) {
-      const fallback = await this.createComposite(
-        remainingIds,
-        `${composite.title.replace(/ · healthy subset.*$/, "")} · healthy subset`,
-        `${composite.description}\n\nBurner removed ${suspect.prNumber ? `#${suspect.prNumber}` : suspect.title} after the portfolio review budget was exhausted and continued with the remaining reviewed leaves.`,
-        { makeLiving: false },
-      );
-      await this.updateComposite(compositeId, { supersededByCompositeId: fallback.id, updatedAt: now() });
+    const fallbackBatches = partitionReviewFallbacks(remainingIds, composite.sources.length);
+    const fallbacks: CompositePr[] = [];
+    for (const [index, batch] of fallbackBatches.entries()) {
+      fallbacks.push(await this.createComposite(
+        batch,
+        `${composite.title.replace(/ · recovery \d+\/\d+$/, "")} · recovery ${index + 1}/${fallbackBatches.length}`,
+        `${composite.description}\n\nBurner removed ${suspect.prNumber ? `#${suspect.prNumber}` : suspect.title} after the portfolio review budget was exhausted and split the remaining leaves into a smaller recovery batch (${index + 1}/${fallbackBatches.length}).`,
+        { makeLiving: index === 0 && (composite.isLiving || state.orchestrator.livingCompositeId === composite.id) },
+      ));
+    }
+    if (fallbacks[0]) {
+      await this.updateComposite(compositeId, { supersededByCompositeId: fallbacks[0].id, updatedAt: now() });
+      await this.store.addActivity({
+        type: "pr",
+        message: `${fallbacks.length} smaller recovery composite${fallbacks.length === 1 ? "" : "s"} queued`,
+        detail: `${remainingIds.length} healthy leaves were repartitioned into batches of ${fallbackBatches.map((batch) => batch.length).join(" + ")} instead of rebuilding the oversized generation.`,
+      });
     }
   }
 

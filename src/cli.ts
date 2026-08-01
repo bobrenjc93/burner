@@ -49,7 +49,7 @@ Server options:
 Command options:
   -C, --directory <path>  target repository (default: current directory)
   --merge-cadence-minutes <n>  YOLO merge-health window (default: 60)
-  --portfolio-review-rounds <n> YOLO rounds before a visible draft checkpoint (default: 12)
+  --portfolio-review-rounds <n> cumulative YOLO rounds before quarantine/recovery (default: 12)
   --json                  JSON output (commands already default to JSON)
   -V, --version           output the version number
   -h, --help              display help`;

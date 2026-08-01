@@ -8,7 +8,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { inferIdeaResources, Orchestrator, selectYoloLeafBatch, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
+import { inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
@@ -576,6 +576,12 @@ test("YOLO leaf batches tolerate prompt noise but never command regressions", ()
   assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "leaf-b", prNumber: 2, impact: 4 });
 });
 
+test("review-budget recovery partitions healthy leaves into balanced half-size composites", () => {
+  assert.deepEqual(partitionReviewFallbacks(["a", "b", "c", "d", "e", "f", "g"], 8), [["a", "b", "c", "d"], ["e", "f", "g"]]);
+  assert.deepEqual(partitionReviewFallbacks(["a", "b", "c"], 4), [["a", "b", "c"]]);
+  assert.deepEqual(partitionReviewFallbacks(["a"], 2), []);
+});
+
 test("YOLO portfolio automatically cooks a complete batch as an evolving living line", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-portfolio-test-"));
   try {
@@ -710,7 +716,7 @@ test("cadence-driven single leaves receive full evaluation validation before mer
   }
 });
 
-test("YOLO portfolio caps reviews, quarantines the implicated leaf, and queues the healthy subset", async () => {
+test("YOLO portfolio caps reviews, quarantines the implicated leaf, and queues smaller healthy partitions", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-quarantine-test-"));
   try {
     const store = new StateStore(root);
@@ -719,13 +725,18 @@ test("YOLO portfolio caps reviews, quarantines the implicated leaf, and queues t
     const run = (id, number, impact) => ({ id, ideaId: `idea-${id}`, status: "completed", branch: `branch-${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp, prUrl: `https://example.test/pull/${number}`, prNumber: number, prState: "open", baseCommit: "base", deltas: [], impact, resources: [], reviewRounds: [], reviewApproved: true });
     await store.update((state) => {
       state.settings.portfolioReviewRounds = 3;
-      state.agentRuns.push(run("a", 1, 3), run("b", 2, 2), run("c", 3, 1));
+      state.agentRuns.push(run("a", 1, 8), run("b", 2, 7), run("c", 3, 6), run("d", 4, 5), run("e", 5, 4), run("f", 6, 3), run("g", 7, 2), run("h", 8, 1));
       state.composites.push({
         id: "blocked", title: "Blocked generation", description: "Combined", status: "reviewing", branch: "composite-blocked", worktree: "", baseCommit: "base",
         sources: [
-          { agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a", kind: "pull_request", impact: 3 },
-          { agentRunId: "b", prNumber: 2, title: "B", branch: "branch-b", kind: "pull_request", impact: 2 },
-          { agentRunId: "c", prNumber: 3, title: "C", branch: "branch-c", kind: "pull_request", impact: 1 },
+          { agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a", kind: "pull_request", impact: 8 },
+          { agentRunId: "b", prNumber: 2, title: "B", branch: "branch-b", kind: "pull_request", impact: 7 },
+          { agentRunId: "c", prNumber: 3, title: "C", branch: "branch-c", kind: "pull_request", impact: 6 },
+          { agentRunId: "d", prNumber: 4, title: "D", branch: "branch-d", kind: "pull_request", impact: 5 },
+          { agentRunId: "e", prNumber: 5, title: "E", branch: "branch-e", kind: "pull_request", impact: 4 },
+          { agentRunId: "f", prNumber: 6, title: "F", branch: "branch-f", kind: "pull_request", impact: 3 },
+          { agentRunId: "g", prNumber: 7, title: "G", branch: "branch-g", kind: "pull_request", impact: 2 },
+          { agentRunId: "h", prNumber: 8, title: "H", branch: "branch-h", kind: "pull_request", impact: 1 },
         ],
         deltas: [], reviewRounds: [], prNumber: 100, prUrl: "https://example.test/pull/100", createdAt: timestamp, updatedAt: timestamp, isLiving: false,
       });
@@ -739,14 +750,18 @@ test("YOLO portfolio caps reviews, quarantines the implicated leaf, and queues t
       markPrQuarantined: async (_cwd, number) => quarantined.push(number),
       closePr: async (_cwd, number) => closed.push(number),
     };
-    let fallback;
-    orchestrator.createComposite = async (ids, title, description) => { fallback = { ids, title, description }; return { id: "fallback" }; };
+    const fallbacks = [];
+    orchestrator.createComposite = async (ids, title, description) => {
+      const fallback = { ids, title, description, id: `fallback-${fallbacks.length + 1}` };
+      fallbacks.push(fallback);
+      return fallback;
+    };
     await orchestrator.quarantineCompositeBlocker("blocked", [{ severity: "high", title: "Parser bug", detail: "Fix", file: "src/parser.ts:42" }]);
     const state = store.get();
     assert.ok(state.agentRuns.find((item) => item.id === "b").quarantinedAt);
     assert.equal(state.composites.find((item) => item.id === "blocked").status, "closed");
-    assert.equal(state.composites.find((item) => item.id === "blocked").supersededByCompositeId, "fallback");
-    assert.deepEqual(fallback.ids, ["a", "c"]);
+    assert.equal(state.composites.find((item) => item.id === "blocked").supersededByCompositeId, "fallback-1");
+    assert.deepEqual(fallbacks.map((fallback) => fallback.ids), [["a", "c", "d", "e"], ["f", "g", "h"]]);
     assert.deepEqual(quarantined, [2]);
     assert.deepEqual(closed, [100]);
   } finally {
@@ -784,6 +799,65 @@ test("YOLO portfolio opens a draft composite before review and bounds review rou
     };
     await assert.rejects(() => orchestrator.reviewAgent(root, "agent", "Agent", "main", "thread", store.get().settings), /bounded review budget/);
     assert.equal(reviewCalls, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("review budgets are live and cumulative for agents and composites", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-live-review-budget-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const rejectedRound = (round) => ({ id: `review-${round}`, round, commit: `commit-${round}`, approved: false, summary: "Blocked", findings: [{ severity: "high", title: "Bug", detail: "Fix", file: "src/app.ts" }], createdAt: timestamp });
+    await store.update((state) => {
+      state.settings.portfolioReviewRounds = 3;
+      state.agentRuns.push({ id: "agent", ideaId: "idea", status: "reviewing", branch: "agent", worktree: root, startedAt: timestamp, deltas: [], resources: [], reviewRounds: [rejectedRound(1)] });
+      state.composites.push({ id: "composite", title: "Composite", description: "Combined", status: "reviewing", branch: "composite", worktree: root, sources: [], deltas: [], reviewRounds: [rejectedRound(1), rejectedRound(2)], createdAt: timestamp, updatedAt: timestamp, isLiving: false });
+    });
+    const capturedSettings = store.get().settings;
+    let reviewCalls = 0;
+    let revisionCalls = 0;
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { head: async () => "head", hasChanges: async () => false };
+    orchestrator.codex = {
+      review: async () => {
+        reviewCalls += 1;
+        await store.update((state) => { state.settings.portfolioReviewRounds = 2; });
+        return { approved: false, summary: "Still blocked", findings: [{ severity: "high", title: "Bug", detail: "Fix", file: "src/app.ts" }] };
+      },
+      revise: async () => { revisionCalls += 1; return { threadId: "thread", message: "revised" }; },
+    };
+
+    await assert.rejects(() => orchestrator.reviewAgent(root, "agent", "Agent", "main", "thread", capturedSettings), /bounded review budget/);
+    assert.equal(reviewCalls, 1);
+    assert.equal(revisionCalls, 0);
+    assert.equal(store.get().agentRuns[0].reviewRounds.length, 2);
+
+    await assert.rejects(() => orchestrator.reviewComposite(root, "composite", "Composite", "main", "thread", capturedSettings), /bounded review budget/);
+    assert.equal(reviewCalls, 1, "an already exhausted composite must not start another review");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("retrying a failed composite preserves its cumulative review history", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-composite-retry-budget-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => state.composites.push({
+      id: "failed", title: "Failed", description: "Combined", status: "failed", branch: "composite", worktree: root, sources: [], deltas: [],
+      reviewRounds: [{ id: "review-1", round: 1, commit: "head", approved: false, summary: "Blocked", findings: [], createdAt: timestamp }],
+      prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: false,
+    }));
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.scheduleComposites = async () => undefined;
+    await orchestrator.retryComposite("failed");
+    assert.equal(store.get().composites[0].status, "rebuilding");
+    assert.equal(store.get().composites[0].reviewRounds.length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
