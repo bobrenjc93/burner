@@ -4,6 +4,7 @@ import type { Evaluation } from "../types.js";
 
 export type ProgressPoint = {
   key: string;
+  commit?: string;
   recordedAt: string;
   label: string;
   kind: "baseline" | "leaf" | "composite";
@@ -25,6 +26,37 @@ const END = "<!-- burner-progress:end -->";
 const COLORS = ["#ff6b35", "#7c5cff", "#00a7a5", "#e6a700", "#d94f8a", "#2589bd", "#5b8c36", "#9c6644", "#6c757d", "#ef476f"];
 
 const escapeXml = (value: string) => value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[character]!);
+
+function baselineIdentity(point: ProgressPoint): string | undefined {
+  if (point.kind !== "baseline") return undefined;
+  if (point.commit?.trim()) return point.commit.trim();
+  return /^(?:base|baseline):(.+)$/.exec(point.key)?.[1];
+}
+
+function collapseDuplicateBaselines(points: ProgressPoint[]): ProgressPoint[] {
+  const collapsed: ProgressPoint[] = [];
+  const indexes = new Map<string, number>();
+  for (const point of [...points].sort((left, right) => left.recordedAt.localeCompare(right.recordedAt))) {
+    const identity = baselineIdentity(point);
+    const existingIndex = identity === undefined ? undefined : indexes.get(identity);
+    if (existingIndex === undefined) {
+      if (identity !== undefined) indexes.set(identity, collapsed.length);
+      collapsed.push(point);
+      continue;
+    }
+    const existing = collapsed[existingIndex]!;
+    collapsed[existingIndex] = {
+      ...existing,
+      ...point,
+      key: existing.key,
+      commit: existing.commit ?? point.commit,
+      recordedAt: existing.recordedAt,
+      label: existing.label,
+      title: existing.title || point.title,
+    };
+  }
+  return collapsed;
+}
 
 function emptyHistory(): ProgressHistory {
   return { version: 1, evaluations: {}, points: [] };
@@ -94,16 +126,29 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
 
 export async function updateProgressArtifacts(cwd: string, evaluations: Evaluation[], newPoints: ProgressPoint[]): Promise<ProgressHistory> {
   const history = await readHistory(cwd);
+  history.points = collapseDuplicateBaselines(history.points);
   for (const evaluation of evaluations.filter((item) => item.enabled)) {
     const existing = history.evaluations[evaluation.id];
     history.evaluations[evaluation.id] = { name: evaluation.name, color: existing?.color ?? COLORS[Object.keys(history.evaluations).length % COLORS.length]! };
   }
   for (const point of newPoints) {
-    const existingIndex = history.points.findIndex((item) => item.key === point.key);
-    if (existingIndex >= 0) history.points[existingIndex] = { ...point, recordedAt: history.points[existingIndex]!.recordedAt };
+    const identity = baselineIdentity(point);
+    const existingIndex = history.points.findIndex((item) => item.key === point.key || (identity !== undefined && baselineIdentity(item) === identity));
+    if (existingIndex >= 0) {
+      const existing = history.points[existingIndex]!;
+      history.points[existingIndex] = {
+        ...existing,
+        ...point,
+        key: identity === undefined ? point.key : existing.key,
+        commit: existing.commit ?? point.commit,
+        recordedAt: existing.recordedAt,
+        label: identity === undefined ? point.label : existing.label,
+        title: identity === undefined ? point.title : existing.title || point.title,
+      };
+    }
     else history.points.push(point);
   }
-  history.points.sort((left, right) => left.recordedAt.localeCompare(right.recordedAt));
+  history.points = collapseDuplicateBaselines(history.points);
   await atomicWrite(join(cwd, HISTORY_PATH), `${JSON.stringify(history, null, 2)}\n`);
   await atomicWrite(join(cwd, GRAPH_PATH), renderSvg(history));
   const readmePath = join(cwd, "README.md");

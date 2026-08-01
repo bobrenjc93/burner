@@ -42,8 +42,9 @@ function isYoloCandidate(
   commandEvaluationIds: Set<string>,
   threshold: number,
   strictPromptRegressions = true,
+  requireImpactThreshold = true,
 ): impact is number {
-  if (!Number.isFinite(impact) || impact! <= threshold) return false;
+  if (!Number.isFinite(impact) || (requireImpactThreshold && impact! <= threshold)) return false;
   const byEvaluation = new Map(deltas.map((delta) => [delta.evaluationId, delta]));
   const complete = [...enabledEvaluationIds].every((evaluationId) => {
     const delta = byEvaluation.get(evaluationId)?.delta;
@@ -89,7 +90,7 @@ function eligibleYoloLeaves(state: BurnerState, baseCommit: string): AgentRun[] 
       !run.quarantinedAt &&
       !reserved.has(run.id) &&
       finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
-      isYoloCandidate(run.deltas, run.impact, enabled, commands, state.settings.compositeAbsorbThreshold, false))
+      isYoloCandidate(run.deltas, run.impact, enabled, commands, state.settings.compositeAbsorbThreshold, false, false))
     .sort((a, b) => (b.impact ?? -Infinity) - (a.impact ?? -Infinity));
 }
 
@@ -943,7 +944,7 @@ export class Orchestrator {
     const recordedAt = now();
     const points: ProgressPoint[] = [];
     if (Object.keys(baselineScores).length === enabled.length) {
-      points.push({ key: `base:${baseCommit}`, recordedAt, label: `base ${baseCommit.slice(0, 7)}`, kind: "baseline", title: state.settings.baseBranch, scores: baselineScores });
+      points.push({ key: `base:${baseCommit}`, commit: baseCommit, recordedAt, label: `base ${baseCommit.slice(0, 7)}`, kind: "baseline", title: state.settings.baseBranch, scores: baselineScores });
     }
     points.push({ key: `pr:${prNumber}`, recordedAt, label: `PR #${prNumber}`, kind: kind === "agent" ? "leaf" : "composite", prNumber, title, scores });
     const owner = `progress-${candidateId}`;

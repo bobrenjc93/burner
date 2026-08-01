@@ -49,7 +49,7 @@ test("score helpers clamp and weight enabled evaluations", () => {
   assert.equal(weightedScore(evaluations, new Map([["quality", 80], ["speed", 50], ["paused", 0]])), 70);
 });
 
-test("merge progress artifacts retain every series and deduplicate PR retries", async () => {
+test("merge progress artifacts deduplicate semantic baselines and PR retries", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-progress-test-"));
   try {
     await writeFile(join(root, "README.md"), "# Demo\n");
@@ -59,10 +59,11 @@ test("merge progress artifacts retain every series and deduplicate PR retries", 
       { id: "speed", name: "Speed", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
     ];
     await updateProgressArtifacts(root, evaluations, [
-      { key: "base:abc", recordedAt: timestamp, label: "base abc", kind: "baseline", title: "main", scores: { quality: 60, speed: 70 } },
+      { key: "baseline:abc", commit: "abc", recordedAt: timestamp, label: "Baseline abc", kind: "baseline", title: "main", scores: { quality: 60, speed: 70 } },
       { key: "pr:12", recordedAt: "2026-01-02T00:00:00.000Z", label: "PR #12", kind: "composite", prNumber: 12, title: "Combined", scores: { quality: 75, speed: 80 } },
     ]);
     await updateProgressArtifacts(root, evaluations, [
+      { key: "base:abc", commit: "abc", recordedAt: "2026-01-02T12:00:00.000Z", label: "base abc", kind: "baseline", title: "main", scores: { quality: 61, speed: 71 } },
       { key: "pr:12", recordedAt: "2026-01-03T00:00:00.000Z", label: "PR #12", kind: "composite", prNumber: 12, title: "Combined", scores: { quality: 76, speed: 81 } },
     ]);
     const readme = await readFile(join(root, "README.md"), "utf8");
@@ -71,6 +72,9 @@ test("merge progress artifacts retain every series and deduplicate PR retries", 
     assert.match(readme, /burner-progress:start/);
     assert.match(readme, /burner-evaluation-progress\.svg/);
     assert.equal(history.points.length, 2);
+    assert.equal(history.points[0].key, "baseline:abc");
+    assert.equal(history.points[0].recordedAt, timestamp);
+    assert.equal(history.points[0].scores.quality, 61);
     assert.equal(history.points[1].recordedAt, "2026-01-02T00:00:00.000Z");
     assert.equal(history.points[1].scores.quality, 76);
     assert.match(svg, /Quality/);
@@ -549,7 +553,7 @@ test("YOLO portfolio waits for a full leaf batch, ranks impact, and reserves com
   assert.deepEqual(selectYoloLeafBatch(state, "base", 3), ["a2", "a3", "a4"]);
 });
 
-test("YOLO leaf batches tolerate prompt noise but never command regressions", () => {
+test("YOLO leaf batches tolerate negative prompt impact but never command regressions", () => {
   const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
   const state = {
     settings: { compositeAbsorbThreshold: 0 },
@@ -559,21 +563,21 @@ test("YOLO leaf batches tolerate prompt noise but never command regressions", ()
     ],
     composites: [],
     agentRuns: [
-      { id: "leaf-a", status: "completed", prState: "open", prNumber: 1, baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], impact: 5, deltas: [
+      { id: "leaf-a", status: "completed", prState: "open", prNumber: 1, baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], impact: -5.5, deltas: [
         { evaluationId: "benchmark", name: "Benchmark", before: 50, after: 50, delta: 0 },
         { evaluationId: "progress", name: "Progress", before: 20, after: 0, delta: -20 },
       ] },
-      { id: "leaf-b", status: "completed", prState: "open", prNumber: 2, baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], impact: 4, deltas: [
+      { id: "leaf-b", status: "completed", prState: "open", prNumber: 2, baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], impact: -3, deltas: [
         { evaluationId: "benchmark", name: "Benchmark", before: 50, after: 55, delta: 5 },
         { evaluationId: "progress", name: "Progress", before: 20, after: 20, delta: 0 },
       ] },
     ],
   };
-  assert.deepEqual(selectYoloLeafBatch(state, "base", 2), ["leaf-a", "leaf-b"]);
-  assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "leaf-b", prNumber: 2, impact: 4 });
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 2), ["leaf-b", "leaf-a"]);
+  assert.equal(selectYoloMergeCandidate(state, "base"), undefined);
   state.agentRuns[0].deltas[0] = { ...state.agentRuns[0].deltas[0], after: 45, delta: -5 };
   assert.deepEqual(selectYoloLeafBatch(state, "base", 2), []);
-  assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "leaf-b", prNumber: 2, impact: 4 });
+  assert.equal(selectYoloMergeCandidate(state, "base"), undefined);
 });
 
 test("review-budget recovery partitions healthy leaves into balanced half-size composites", () => {
