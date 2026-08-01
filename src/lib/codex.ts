@@ -13,9 +13,9 @@ const evaluationSchema = {
   type: "object",
   properties: {
     score: { type: "number", minimum: 0, maximum: 100 },
-    summary: { type: "string" },
-    evidence: { type: "array", items: { type: "string" }, maxItems: 8 },
-    suggestions: { type: "array", items: { type: "string" }, maxItems: 6 },
+    summary: { type: "string", maxLength: 1_000 },
+    evidence: { type: "array", items: { type: "string", maxLength: 1_500 }, maxItems: 8 },
+    suggestions: { type: "array", items: { type: "string", maxLength: 750 }, maxItems: 6 },
   },
   required: ["score", "summary", "evidence", "suggestions"],
   additionalProperties: false,
@@ -111,6 +111,7 @@ export class CodexClient {
       "You are a rigorous repository evaluator. Inspect the current repository state and answer the evaluation below.",
       "Base the score on concrete evidence from code, tests, configuration, and user-facing behavior. Do not edit any files.",
       "Finish this evaluation within 10 minutes. Inspect targeted, representative evidence for every rubric category; do not exhaustively read every file or narrate intermediate progress.",
+      "Use no more than 12 shell commands. Reserve enough time to return the required structured result; concise evidence is preferred over exhaustive evidence.",
       "A score of 100 means genuinely exceptional and production-ready. Be calibrated, concise, and actionable.",
       `Evaluation: ${evaluation.name}`,
       evaluation.prompt,
@@ -132,7 +133,12 @@ export class CodexClient {
       onStderr: (line) => this.onProgress?.(line),
     });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Evaluation command exited with ${result.exitCode}`);
-    return this.normalizeEvaluation(parseJsonObject<EvaluationOutput>(result.stdout));
+    const output = this.normalizeEvaluation(parseJsonObject<EvaluationOutput>(result.stdout));
+    if (output.score === 0 && /\b(?:benchmark rejected|no timing score was accepted|invalid measurement|setup or correctness failure)\b/i.test(output.summary)) {
+      const detail = output.evidence[0] ? ` ${output.evidence[0]}` : "";
+      throw new Error(`Evaluation command reported an inconclusive measurement: ${output.summary}.${detail}`.slice(0, 2_000));
+    }
+    return output;
   }
 
   private normalizeEvaluation(output: EvaluationOutput): EvaluationOutput {
@@ -141,9 +147,9 @@ export class CodexClient {
     }
     return {
       score: clampScore(output.score),
-      summary: output.summary.trim(),
-      evidence: output.evidence.map(String).slice(0, 8),
-      suggestions: output.suggestions.map(String).slice(0, 6),
+      summary: output.summary.trim().slice(0, 1_000),
+      evidence: output.evidence.map((item) => String(item).slice(0, 1_500)).slice(0, 8),
+      suggestions: output.suggestions.map((item) => String(item).slice(0, 750)).slice(0, 6),
     };
   }
 

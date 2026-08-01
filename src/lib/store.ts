@@ -5,6 +5,12 @@ import { id, now, weightedScore } from "./utils.js";
 
 type Listener = (state: BurnerState) => void;
 
+const isInconclusiveMeasurement = (run: EvaluationRun): boolean =>
+  run.score === 0 && /\b(?:benchmark rejected|no timing score was accepted|invalid measurement|setup or correctness failure)\b/i.test(run.summary ?? "");
+
+const isUsableRun = (run: EvaluationRun): boolean =>
+  run.status === "completed" && run.score !== undefined && !isInconclusiveMeasurement(run);
+
 function initialState(root: string): BurnerState {
   const createdAt = now();
   return {
@@ -21,8 +27,8 @@ function initialState(root: string): BurnerState {
       baseBranch: "main",
       remote: "origin",
       defaultResources: [],
-      maxReviewRounds: 8,
-      portfolioReviewRounds: 3,
+      maxReviewRounds: 12,
+      portfolioReviewRounds: 12,
       mergeCadenceMinutes: 60,
       preferLivingComposite: true,
       compositeAbsorbThreshold: 0,
@@ -148,8 +154,7 @@ export class StateStore {
     const latest = new Map<string, EvaluationRun>();
     for (const run of this.state.evaluationRuns) {
       if (
-        run.status !== "completed" ||
-        run.score === undefined ||
+        !isUsableRun(run) ||
         (context ? run.context !== context : run.context === "agent" || run.context === "composite" || run.context === "screening_baseline")
       ) continue;
       const current = latest.get(run.evaluationId);
@@ -167,7 +172,7 @@ export class StateStore {
   latestScreeningRuns(): Map<string, EvaluationRun> {
     const latest = new Map<string, EvaluationRun>();
     for (const run of this.state.evaluationRuns) {
-      if (run.context !== "screening_baseline" || run.status !== "completed" || run.score === undefined) continue;
+      if (run.context !== "screening_baseline" || !isUsableRun(run)) continue;
       const current = latest.get(run.evaluationId);
       if (!current || run.createdAt > current.createdAt) latest.set(run.evaluationId, run);
     }
@@ -177,7 +182,7 @@ export class StateStore {
   latestCompositeRuns(compositeId: string): Map<string, EvaluationRun> {
     const latest = new Map<string, EvaluationRun>();
     for (const run of this.state.evaluationRuns) {
-      if (run.context !== "composite" || run.compositeId !== compositeId || run.status !== "completed" || run.score === undefined) continue;
+      if (run.context !== "composite" || run.compositeId !== compositeId || !isUsableRun(run)) continue;
       const current = latest.get(run.evaluationId);
       if (!current || run.createdAt > current.createdAt) latest.set(run.evaluationId, run);
     }
@@ -237,14 +242,21 @@ export class StateStore {
     const legacy = this.state as BurnerState & { version: number; composites?: BurnerState["composites"] };
     legacy.version = 3;
     legacy.composites ??= [];
-    legacy.settings.maxReviewRounds ??= 8;
-    legacy.settings.portfolioReviewRounds ??= 3;
+    legacy.settings.maxReviewRounds ??= 12;
+    legacy.settings.portfolioReviewRounds ??= 12;
     legacy.settings.mergeCadenceMinutes ??= 60;
     legacy.settings.preferLivingComposite ??= true;
     legacy.settings.compositeAbsorbThreshold ??= 0;
     for (const run of legacy.agentRuns ?? []) {
       run.reviewRounds ??= [];
       if (run.prUrl && !run.prState) run.prState = "open";
+    }
+    for (const run of legacy.evaluationRuns ?? []) {
+      run.attempts ??= 1;
+      if (run.status === "completed" && isInconclusiveMeasurement(run)) {
+        run.status = "failed";
+        run.error = `Inconclusive command evaluation: ${run.summary}`;
+      }
     }
     for (const composite of legacy.composites) {
       composite.isLiving ??= legacy.orchestrator.livingCompositeId === composite.id;

@@ -20,6 +20,7 @@ export type EvaluationRun = {
   createdAt: string;
   durationMs: number;
   status: "running" | "completed" | "failed";
+  attempts?: number;
   error?: string;
   context: "baseline" | "screening_baseline" | "agent" | "composite" | "manual";
   agentRunId?: string;
@@ -110,6 +111,7 @@ export type AgentRun = {
   absorbedAt?: string;
   quarantinedAt?: string;
   quarantineReason?: string;
+  evaluationRetryCount?: number;
 };
 
 export type CompositeSource = {

@@ -26,13 +26,20 @@ class PortfolioReviewLimitError extends Error {
   }
 }
 
+class CandidateEvaluationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CandidateEvaluationError";
+  }
+}
+
 const finalReviewApproved = (reviewApproved: boolean | undefined, rounds: ReviewRound[]) => reviewApproved === true && rounds.at(-1)?.approved === true;
 
 function isYoloCandidate(
   deltas: ScoreDelta[],
   impact: number | undefined,
   enabledEvaluationIds: Set<string>,
-  commandEvaluationIds: Set<string>,
+  _commandEvaluationIds: Set<string>,
   threshold: number,
 ): impact is number {
   if (!Number.isFinite(impact) || impact! <= threshold) return false;
@@ -41,7 +48,7 @@ function isYoloCandidate(
     const delta = byEvaluation.get(evaluationId)?.delta;
     return Number.isFinite(delta);
   });
-  return complete && [...commandEvaluationIds].every((evaluationId) => byEvaluation.get(evaluationId)!.delta! >= 0);
+  return complete && [...enabledEvaluationIds].every((evaluationId) => byEvaluation.get(evaluationId)!.delta! >= 0);
 }
 
 function yoloEvaluationSets(state: BurnerState): { enabled: Set<string>; commands: Set<string> } {
@@ -61,7 +68,7 @@ export function inferIdeaResources(idea: Pick<Idea, "title" | "description" | "r
 
 function reservedCompositeSourceIds(state: BurnerState): Set<string> {
   return new Set(state.composites
-    .filter((composite) => !["merged", "closed"].includes(composite.status))
+    .filter((composite) => ["queued", "building", "reviewing", "revising", "evaluating", "rebuilding", "open"].includes(composite.status))
     .flatMap((composite) => composite.sources.map((source) => source.agentRunId)));
 }
 
@@ -133,6 +140,23 @@ export class Orchestrator {
   private readonly yolo: boolean;
   private readonly yoloBatchSize: number;
   private portfolioDraining = false;
+  private activePromptEvaluations = 0;
+  private readonly promptEvaluationWaiters: Array<() => void> = [];
+
+  private async acquirePromptEvaluationSlot(): Promise<() => void> {
+    const limit = 3;
+    if (this.activePromptEvaluations >= limit) {
+      await new Promise<void>((resolve) => this.promptEvaluationWaiters.push(resolve));
+    }
+    this.activePromptEvaluations += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activePromptEvaluations -= 1;
+      this.promptEvaluationWaiters.shift()?.();
+    };
+  }
 
   private portfolioMode(): boolean {
     return this.yolo && this.yoloBatchSize > 1;
@@ -163,7 +187,7 @@ export class Orchestrator {
   }
 
   private portfolioReviewLimit(settings: BurnerState["settings"]): number {
-    return this.portfolioMode() ? Math.min(settings.maxReviewRounds, settings.portfolioReviewRounds) : settings.maxReviewRounds;
+    return this.portfolioMode() ? settings.portfolioReviewRounds : settings.maxReviewRounds;
   }
 
   private async recordCadenceBreach(): Promise<void> {
@@ -278,11 +302,17 @@ export class Orchestrator {
   }
 
   private async autoMergeNext(): Promise<boolean> {
-    const state = this.store.get();
+    let state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const cadenceNeedsSingleLeaf = (this.mergeCadenceDue(state) || this.portfolioCookDue(state)) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0;
-    const candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf);
+    let candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf);
     if (!candidate) return false;
+    if (candidate.kind === "agent" && this.portfolioMode()) {
+      if (!(await this.fullyValidateLeafForMerge(candidate.id, baseCommit))) return false;
+      state = this.store.get();
+      candidate = selectYoloMergeCandidate(state, baseCommit, true);
+      if (!candidate || candidate.kind !== "agent") return false;
+    }
     await this.store.addActivity({
       type: "pr",
       message: `YOLO approved PR #${candidate.prNumber} for merge`,
@@ -291,6 +321,39 @@ export class Orchestrator {
     if (candidate.kind === "composite") await this.mergeComposite(candidate.id);
     else await this.mergeAgent(candidate.id);
     return true;
+  }
+
+  private async fullyValidateLeafForMerge(runId: string, baseCommit: string): Promise<boolean> {
+    const state = this.store.get();
+    const run = state.agentRuns.find((item) => item.id === runId);
+    const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
+    if (!run?.prNumber || !run.prState || run.prState !== "open") return false;
+    const owner = `full-leaf-${run.id}`;
+    let worktree = "";
+    const createLock = await this.locks.acquire("git-metadata", `${owner}-create`);
+    try { worktree = await this.git.createExistingWorktree(owner, run.branch); }
+    finally { await createLock.release(); }
+    try {
+      const afterRuns = await this.runCandidateEvaluations("composite", worktree, run.id);
+      const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
+      if (afterRuns.length !== enabled.length || afterRuns.some((item) => item.status !== "completed" || item.score === undefined)) {
+        await this.store.addActivity({ type: "error", message: `Full merge validation failed for PR #${run.prNumber}`, detail: "The leaf remains open and will not be merged from screening scores." });
+        return false;
+      }
+      if (await this.git.resolveRef(state.settings.baseBranch) !== baseCommit) return false;
+      const deltas = this.calculateDeltas(this.store.get(), this.store.latestRuns(), afterRuns);
+      const impact = this.calculateImpact(this.store.get(), deltas);
+      await this.updateAgent(run.id, { deltas, impact });
+      await this.git.editPr(worktree, run.prNumber, idea?.title ?? run.branch, buildPrBody(idea?.description ?? "", run.lastMessage ?? "", deltas, impact, run.reviewRounds));
+      const { enabled: ids, commands } = yoloEvaluationSets(this.store.get());
+      const qualifies = isYoloCandidate(deltas, impact, ids, commands, state.settings.compositeAbsorbThreshold);
+      if (!qualifies) await this.store.addActivity({ type: "agent", message: `Leaf rejected by full merge validation: ${idea?.title ?? run.branch}`, detail: "At least one full evaluation regressed or total impact was not positive; the PR remains unmerged." });
+      return qualifies;
+    } finally {
+      const cleanupLock = await this.locks.acquire("git-metadata", `${owner}-cleanup`);
+      try { if (worktree) await this.git.removeWorktree(worktree); }
+      finally { await cleanupLock.release(); }
+    }
   }
 
   private async autoCookNext(): Promise<boolean> {
@@ -306,7 +369,7 @@ export class Orchestrator {
       leafIds,
       `YOLO generation ${generation}: ${leafIds.length} reviewed improvements`,
       `Automatically master-cooked from ${leafIds.length} independently authored, reviewed, and evaluated leaf pull requests on ${state.settings.baseBranch.slice(0, 80)}.${cookDue && leafIds.length < this.yoloBatchSize ? ` Burner shortened this batch early enough to honor the ${state.settings.mergeCadenceMinutes}-minute merge deadline.` : ""}`,
-      { makeLiving: false },
+      { makeLiving: true },
     );
     this.portfolioDraining = false;
     return true;
@@ -417,6 +480,9 @@ export class Orchestrator {
         completedAt,
         ...(quarantined ? { quarantinedAt: completedAt, quarantineReason: `No approval within ${this.portfolioReviewLimit(this.store.get().settings)} portfolio review rounds.` } : {}),
       });
+      if (quarantined) await this.publishAgentCheckpoint(idea, run.id, run.worktree, run.branch, state.settings).catch(async (checkpointError) => {
+        await this.store.addActivity({ type: "error", message: `Could not publish review checkpoint: ${idea.title}`, detail: errorMessage(checkpointError) });
+      });
       await this.finishIdea(idea.id, "failed");
       await this.store.addActivity({
         type: "error",
@@ -441,24 +507,9 @@ export class Orchestrator {
     compositeId?: string,
     evaluationIds?: readonly string[],
   ): Promise<EvaluationRun[]> {
-    const owner = id("evalsuite");
-    const callerOwnsCpuLock = Boolean(
-      agentRunId && this.store.get().agentRuns.find((run) => run.id === agentRunId)?.resources.includes("cpu-heavy"),
-    );
-    // Acquire the scarce CPU resource before the suite lock. Otherwise a normal
-    // candidate could hold evaluation-suite while waiting for a cpu-heavy agent,
-    // and that agent could deadlock waiting to evaluate before releasing its lease.
-    const cpuLock = callerOwnsCpuLock
-      ? undefined
-      : await this.locks.acquire("cpu-heavy", owner, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
-    let suiteLock: HeldLock | undefined;
-    try {
-      suiteLock = await this.locks.acquire("evaluation-suite", owner, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
-      return await this.runEvaluationSuite(context, cwd, agentRunId, compositeId, evaluationIds);
-    } finally {
-      await suiteLock?.release();
-      await cpuLock?.release();
-    }
+    const callerRun = agentRunId ? this.store.get().agentRuns.find((run) => run.id === agentRunId) : undefined;
+    const callerOwnsCpuLock = Boolean(callerRun?.resources.includes("cpu-heavy") && this.activeAgents.has(callerRun.ideaId));
+    return this.runEvaluationSuite(context, cwd, agentRunId, compositeId, evaluationIds, callerOwnsCpuLock);
   }
 
   async runBaselineEvaluations(context: "baseline" | "manual" = "manual"): Promise<EvaluationRun[]> {
@@ -521,6 +572,7 @@ export class Orchestrator {
     agentRunId?: string,
     compositeId?: string,
     evaluationIds?: readonly string[],
+    callerOwnsCpuLock = false,
   ): Promise<EvaluationRun[]> {
     const state = this.store.get();
     const selectedIds = evaluationIds ? new Set(evaluationIds) : undefined;
@@ -554,14 +606,21 @@ export class Orchestrator {
         const started = Date.now();
         await this.store.update((draft) => draft.evaluationRuns.push(run));
         this.events.emit("evaluation", { id: run.id, status: "running", evaluationId: evaluation.id });
+        const commandBacked = Boolean(evaluation.command || evaluation.screeningCommand);
+        let cpuLock: HeldLock | undefined;
         let commandLock: HeldLock | undefined;
+        let releasePromptSlot: (() => void) | undefined;
         try {
-          if (evaluation.command || evaluation.screeningCommand) {
+          if (commandBacked) {
+            if (!callerOwnsCpuLock) cpuLock = await this.locks.acquire("cpu-heavy", `${run.id}-cpu`, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
             commandLock = await this.locks.acquire(`command-evaluation-${evaluation.id}`, run.id, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
+          } else {
+            releasePromptSlot = await this.acquirePromptEvaluationSlot();
           }
           const evaluated = context === "agent" && !this.portfolioMode()
             ? { ...evaluation, screeningCommand: undefined }
             : evaluation;
+          run.attempts = 1;
           const output = await this.codex.evaluate(cwd, evaluated, state.settings, context);
           Object.assign(run, output, { status: "completed" as const, durationMs: Date.now() - started });
           await this.store.update((draft) => {
@@ -577,12 +636,16 @@ export class Orchestrator {
           });
           this.events.emit("evaluation", { id: run.id, status: "failed", error: run.error });
         } finally {
+          releasePromptSlot?.();
           await commandLock?.release();
+          await cpuLock?.release();
         }
         return run;
       };
-      const commandRuns = await mapLimit(evaluations.filter((evaluation) => evaluation.command || evaluation.screeningCommand), 1, evaluateOne);
-      const promptRuns = await mapLimit(evaluations.filter((evaluation) => !evaluation.command && !evaluation.screeningCommand), Math.min(state.settings.parallelism, 3), evaluateOne);
+      const [commandRuns, promptRuns] = await Promise.all([
+        mapLimit(evaluations.filter((evaluation) => evaluation.command || evaluation.screeningCommand), 1, evaluateOne),
+        mapLimit(evaluations.filter((evaluation) => !evaluation.command && !evaluation.screeningCommand), 3, evaluateOne),
+      ]);
       const runs = [...commandRuns, ...promptRuns];
       const succeeded = runs.filter((run) => run.status === "completed").length;
       await this.store.addActivity({
@@ -595,6 +658,37 @@ export class Orchestrator {
       this.runningEvaluations -= evaluations.length;
       this.events.emit("state", this.store.get());
     }
+  }
+
+  private async runCandidateEvaluations(
+    context: "agent" | "composite",
+    cwd: string,
+    agentRunId?: string,
+    compositeId?: string,
+  ): Promise<EvaluationRun[]> {
+    const enabledIds = this.store.get().evaluations.filter((evaluation) => evaluation.enabled).map((evaluation) => evaluation.id);
+    const latest = new Map<string, EvaluationRun>();
+    let pending: readonly string[] | undefined;
+    for (let pass = 1; pass <= 2; pass += 1) {
+      const runs = await this.runEvaluations(context, cwd, agentRunId, compositeId, pending);
+      for (const run of runs) latest.set(run.evaluationId, run);
+      pending = enabledIds.filter((evaluationId) => {
+        const run = latest.get(evaluationId);
+        return !run || run.status !== "completed" || run.score === undefined;
+      });
+      if (!pending.length) break;
+      if (pass < 2) {
+        await this.store.addActivity({
+          type: "evaluation",
+          message: `Retrying ${pending.length} incomplete candidate evaluation${pending.length === 1 ? "" : "s"}`,
+          detail: "Successful scores are retained; only missing evaluations will run again.",
+        });
+      }
+    }
+    return enabledIds.flatMap((evaluationId) => {
+      const run = latest.get(evaluationId);
+      return run ? [run] : [];
+    });
   }
 
   async plan(): Promise<Idea[]> {
@@ -706,7 +800,10 @@ export class Orchestrator {
     };
     await this.store.update((draft) => {
       draft.composites.push(composite);
-      if (makeLiving) draft.orchestrator.livingCompositeId = composite.id;
+      if (makeLiving) {
+        draft.orchestrator.livingCompositeId = composite.id;
+        for (const item of draft.composites) item.isLiving = item.id === composite.id;
+      }
     });
     await this.store.addActivity({
       type: "pr",
@@ -1084,27 +1181,31 @@ export class Orchestrator {
   }
 
   private findLivingComposite(state: BurnerState): CompositePr | undefined {
-    if (this.yolo && this.yoloBatchSize > 1) return undefined;
-    if (!state.settings.preferLivingComposite || !state.orchestrator.livingCompositeId) return undefined;
+    const portfolioMode = this.portfolioMode();
+    if ((!portfolioMode && !state.settings.preferLivingComposite) || !state.orchestrator.livingCompositeId) return undefined;
     const composite = state.composites.find((item) => item.id === state.orchestrator.livingCompositeId);
-    return composite?.status === "open" && composite.reviewApproved ? composite : undefined;
+    if (composite?.status !== "open" || !composite.reviewApproved) return undefined;
+    if (!portfolioMode) return composite;
+    const { enabled, commands } = yoloEvaluationSets(state);
+    return isYoloCandidate(composite.deltas, composite.impact, enabled, commands, state.settings.compositeAbsorbThreshold)
+      ? composite
+      : undefined;
   }
 
   private async ensureLivingComposite(): Promise<void> {
     await this.store.update((state) => {
-      if (this.yolo && this.yoloBatchSize > 1) {
-        state.orchestrator.livingCompositeId = undefined;
-        for (const item of state.composites) item.isLiving = false;
-        return;
-      }
-      if (!state.settings.preferLivingComposite) return;
+      const portfolioMode = this.portfolioMode();
+      if (!portfolioMode && !state.settings.preferLivingComposite) return;
+      const { enabled, commands } = yoloEvaluationSets(state);
+      const qualifies = (item: CompositePr) => item.status === "open" && item.reviewApproved &&
+        (!portfolioMode || isYoloCandidate(item.deltas, item.impact, enabled, commands, state.settings.compositeAbsorbThreshold));
       const current = state.orchestrator.livingCompositeId ? state.composites.find((item) => item.id === state.orchestrator.livingCompositeId) : undefined;
-      if (current && !["merged", "closed"].includes(current.status)) {
+      if (current && qualifies(current)) {
         for (const item of state.composites) item.isLiving = item.id === current.id;
         return;
       }
       const next = state.composites
-        .filter((item) => item.status === "open" && item.reviewApproved)
+        .filter(qualifies)
         .sort((a, b) => (b.compositeScore ?? -Infinity) - (a.compositeScore ?? -Infinity))[0];
       state.orchestrator.livingCompositeId = next?.id;
       for (const item of state.composites) item.isLiving = item.id === next?.id;
@@ -1114,9 +1215,9 @@ export class Orchestrator {
   private async resolveAgentBase(idea: Idea, state: BurnerState): Promise<AgentBase> {
     const portfolioMode = this.yolo && this.yoloBatchSize > 1;
     const living = this.findLivingComposite(state);
-    const requested = !portfolioMode && idea.baseCompositeId ? state.composites.find((item) => item.id === idea.baseCompositeId) : undefined;
+    const requested = idea.baseCompositeId ? state.composites.find((item) => item.id === idea.baseCompositeId) : undefined;
     const composite = requested?.status === "open" && requested.reviewApproved ? requested : living;
-    if (composite && state.settings.preferLivingComposite) {
+    if (composite && (portfolioMode || state.settings.preferLivingComposite)) {
       const ref = await this.git.fetchBranch(state.settings.remote, composite.branch);
       const commit = await this.git.resolveRef(ref);
       const baseline = this.store.latestCompositeRuns(composite.id);
@@ -1192,6 +1293,45 @@ export class Orchestrator {
     }
   }
 
+  private async publishAgentCheckpoint(
+    idea: Idea,
+    runId: string,
+    worktree: string,
+    branch: string,
+    settings: BurnerState["settings"],
+  ): Promise<void> {
+    const run = this.store.get().agentRuns.find((item) => item.id === runId);
+    if (!run || !worktree) return;
+    const last = run.reviewRounds.at(-1);
+    const findings = last?.findings.length
+      ? last.findings.map((finding) => `- **${finding.severity} · ${finding.title}** — ${finding.detail}${finding.file ? ` (${finding.file})` : ""}`).join("\n")
+      : "- Review did not approve within the configured checkpoint window.";
+    const body = [
+      "## Burner review checkpoint",
+      "",
+      idea.description,
+      "",
+      `This draft preserves substantial agent work after ${run.reviewRounds.length} review rounds. It is **not approved, fully evaluated, or eligible for YOLO merge**. Burner retained the author session and final findings so a retry can continue instead of losing the branch.`,
+      "",
+      "## Unresolved review findings",
+      "",
+      findings,
+    ].join("\n").slice(0, 60_000);
+    await this.git.push(worktree, settings.remote, branch);
+    let prNumber = run.prNumber;
+    let prUrl = run.prUrl;
+    if (prNumber) {
+      await this.git.editPr(worktree, prNumber, idea.title, body);
+      await this.git.markPrDraft(worktree, prNumber);
+    } else {
+      const pr = await this.git.openPr({ cwd: worktree, base: settings.baseBranch, branch, title: idea.title, body, draft: true });
+      prNumber = pr.number;
+      prUrl = pr.url;
+    }
+    if (prNumber) await this.git.markPrQuarantined(worktree, prNumber).catch(() => undefined);
+    await this.updateAgent(runId, { prNumber, prUrl, prState: prNumber ? "open" : undefined });
+  }
+
   private async runIdea(
     idea: Idea,
     base: AgentBase,
@@ -1223,6 +1363,7 @@ export class Orchestrator {
     await this.store.addActivity({ type: "agent", message: `Agent started: ${idea.title}`, detail: resources.length ? `Locks: ${resources.join(", ")}` : branch });
     this.events.emit("agent", { runId, status: "starting" });
     let worktree = "";
+    let retryEvaluation = false;
     try {
       const settings = this.store.get().settings;
       const rootStatus = await this.git.status();
@@ -1257,12 +1398,17 @@ export class Orchestrator {
     } catch (error) {
       const message = errorMessage(error);
       const quarantined = error instanceof PortfolioReviewLimitError;
+      retryEvaluation = error instanceof CandidateEvaluationError && (this.store.get().agentRuns.find((item) => item.id === runId)?.evaluationRetryCount ?? 0) < 1;
       const completedAt = now();
       await this.updateAgent(runId, {
         status: "failed",
         error: message,
         completedAt,
         ...(quarantined ? { quarantinedAt: completedAt, quarantineReason: `No approval within ${this.portfolioReviewLimit(this.store.get().settings)} portfolio review rounds.` } : {}),
+        ...(retryEvaluation ? { evaluationRetryCount: 1 } : {}),
+      });
+      if (quarantined && worktree) await this.publishAgentCheckpoint(idea, runId, worktree, branch, this.store.get().settings).catch(async (checkpointError) => {
+        await this.store.addActivity({ type: "error", message: `Could not publish review checkpoint: ${idea.title}`, detail: errorMessage(checkpointError) });
       });
       await this.finishIdea(idea.id, "failed");
       await this.store.addActivity({
@@ -1276,7 +1422,12 @@ export class Orchestrator {
       this.activeAgents.delete(idea.id);
       this.runtimeCache = undefined;
       this.events.emit("state", this.store.get());
-      if (this.store.get().orchestrator.enabled) {
+      if (retryEvaluation && this.store.get().orchestrator.enabled) {
+        void this.retryAgent(runId).catch(async (retryError) => {
+          await this.store.addActivity({ type: "error", message: `Automatic evaluation retry could not resume: ${idea.title}`, detail: errorMessage(retryError) });
+          if (this.yolo) void this.tick(false);
+        });
+      } else if (this.store.get().orchestrator.enabled) {
         if (this.yolo) void this.tick(false);
         else void this.schedule();
       }
@@ -1300,9 +1451,10 @@ export class Orchestrator {
     await this.updateAgent(runId, { lastMessage, authorThreadId: reviewed.threadId, reviewApproved: true });
     if (await this.git.resolveRef(base.ref) !== base.commit) throw new Error("The experiment base moved during the review loop. Retry this idea from the latest living line.");
     await this.updateAgent(runId, { status: "evaluating" });
-    const afterRuns = await this.runEvaluations("agent", worktree, runId);
+    const afterRuns = await this.runCandidateEvaluations("agent", worktree, runId);
+    const enabledCount = this.store.get().evaluations.filter((evaluation) => evaluation.enabled).length;
     const failedEvaluation = afterRuns.find((run) => run.status !== "completed" || run.score === undefined);
-    if (failedEvaluation) throw new Error("Candidate evaluation failed; Burner will not deliver a PR without complete before/after scores.");
+    if (failedEvaluation || afterRuns.length !== enabledCount) throw new CandidateEvaluationError("Candidate evaluation remained incomplete after targeted retries; Burner preserved the candidate and will retry its existing worktree once instead of publishing unverifiable scores.");
     const deltas = this.calculateDeltas(this.store.get(), base.baseline, afterRuns);
     const impact = this.calculateImpact(this.store.get(), deltas);
     await this.updateAgent(runId, { deltas, impact });
@@ -1412,20 +1564,70 @@ export class Orchestrator {
       await this.updateComposite(compositeId, { authorThreadId: author.threadId, updatedAt: now() });
       await this.publishCompositeDraft(worktree, compositeId, "integrating and awaiting independent review", settings);
       const reviewed = await this.reviewComposite(worktree, compositeId, composite.title, settings.baseBranch, author.threadId, settings);
-      await this.updateComposite(compositeId, { authorThreadId: reviewed.threadId, reviewApproved: true, status: "evaluating", updatedAt: now() });
+      let integrationThreadId = reviewed.threadId;
+      await this.updateComposite(compositeId, { authorThreadId: integrationThreadId, reviewApproved: true, status: "evaluating", updatedAt: now() });
       await this.publishCompositeDraft(worktree, compositeId, "recalculating every evaluation after review approval", settings);
 
       if (await this.git.resolveRef(settings.baseBranch) !== baseCommit) {
         throw new Error("BASE_CHANGED: the base branch moved while this composite was cooking; it will be rebuilt and reevaluated.");
       }
 
-      const afterRuns = await this.runEvaluations("composite", worktree, undefined, compositeId);
-      if (afterRuns.some((run) => run.status !== "completed" || run.score === undefined)) throw new Error("Composite evaluation failed; the combined PR will not be delivered without complete recalculated scores.");
-      state = this.store.get();
-      const deltas = this.calculateDeltas(state, baseline, afterRuns);
-      const impact = this.calculateImpact(state, deltas);
-      const scoreMap = new Map(afterRuns.filter((run) => run.score !== undefined).map((run) => [run.evaluationId, run.score!]));
-      const compositeScore = weightedScore(state.evaluations, scoreMap) ?? 0;
+      let afterRuns: EvaluationRun[] = [];
+      let deltas: ScoreDelta[] = [];
+      let impact = 0;
+      let compositeScore = 0;
+      for (let evaluationRevision = 1; evaluationRevision <= 3; evaluationRevision += 1) {
+        afterRuns = await this.runCandidateEvaluations("composite", worktree, undefined, compositeId);
+        state = this.store.get();
+        const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
+        const incomplete = enabled.filter((evaluation) => {
+          const run = afterRuns.find((item) => item.evaluationId === evaluation.id);
+          return !run || run.status !== "completed" || run.score === undefined;
+        });
+        deltas = incomplete.length ? [] : this.calculateDeltas(state, baseline, afterRuns);
+        impact = this.calculateImpact(state, deltas);
+        const regressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
+        const qualifies = !incomplete.length && !regressions.length && impact > settings.compositeAbsorbThreshold;
+        if (qualifies) {
+          const scoreMap = new Map(afterRuns.filter((run) => run.score !== undefined).map((run) => [run.evaluationId, run.score!]));
+          compositeScore = weightedScore(state.evaluations, scoreMap) ?? 0;
+          break;
+        }
+        if (evaluationRevision === 3) {
+          const reason = incomplete.length
+            ? `${incomplete.map((evaluation) => evaluation.name).join(", ")} remained incomplete`
+            : regressions.length
+              ? `${regressions.map((delta) => `${delta.name} ${delta.delta}`).join(", ")} regressed`
+              : `weighted impact ${impact.toFixed(1)} did not exceed ${settings.compositeAbsorbThreshold.toFixed(1)}`;
+          throw new Error(`Composite did not become monotonic after 3 evaluation-guided integration revisions: ${reason}.`);
+        }
+        const findings: ReviewResult["findings"] = [
+          ...incomplete.map((evaluation) => {
+            const run = afterRuns.find((item) => item.evaluationId === evaluation.id);
+            return { severity: "high" as const, title: `${evaluation.name} could not be evaluated`, detail: run?.error ?? "No completed score was produced. Diagnose the candidate behavior and ensure the evaluation can finish reliably.", file: "" };
+          }),
+          ...regressions.map((delta) => {
+            const run = afterRuns.find((item) => item.evaluationId === delta.evaluationId);
+            const suggestions = run?.suggestions?.join(" ");
+            return { severity: "high" as const, title: `${delta.name} regressed ${delta.before} → ${delta.after}`, detail: [delta.summary, suggestions].filter(Boolean).join(" ").slice(0, 2_000), file: "" };
+          }),
+        ];
+        if (!findings.length) findings.push({ severity: "medium", title: "Composite has no measurable monotonic gain", detail: `Weighted impact is ${impact.toFixed(1)}; improve at least one enabled evaluation without regressing another.`, file: "" });
+        await this.updateComposite(compositeId, { status: "revising", reviewApproved: false, updatedAt: now() });
+        await this.publishCompositeDraft(worktree, compositeId, `revising evaluation regressions (pass ${evaluationRevision})`, settings);
+        const revision = await this.codex.revise(worktree, integrationThreadId, {
+          approved: false,
+          summary: "The combined code passed review but failed its recalculated monotonic evaluation gate.",
+          findings,
+        }, settings);
+        integrationThreadId = revision.threadId;
+        if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: address composite evaluation pass ${evaluationRevision}`);
+        await this.updateComposite(compositeId, { authorThreadId: integrationThreadId, updatedAt: now() });
+        const rereviewed = await this.reviewComposite(worktree, compositeId, composite.title, settings.baseBranch, integrationThreadId, settings);
+        integrationThreadId = rereviewed.threadId;
+        await this.updateComposite(compositeId, { authorThreadId: integrationThreadId, reviewApproved: true, status: "evaluating", updatedAt: now() });
+        await this.publishCompositeDraft(worktree, compositeId, `reevaluating after integration revision ${evaluationRevision}`, settings);
+      }
       composite = state.composites.find((item) => item.id === compositeId)!;
       const body = buildCompositePrBody({
         description: composite.description,
@@ -1466,7 +1668,8 @@ export class Orchestrator {
       }
       const baseMoved = message.startsWith("BASE_CHANGED:");
       const currentMode = this.store.get().composites.find((item) => item.id === compositeId)?.rebuildMode;
-      await this.updateComposite(compositeId, { status: baseMoved ? "rebuilding" : "failed", rebuildMode: baseMoved ? "from_base" : currentMode, error: message.replace("BASE_CHANGED: ", ""), updatedAt: now() });
+      await this.updateComposite(compositeId, { status: baseMoved ? "rebuilding" : "failed", rebuildMode: baseMoved ? "from_base" : currentMode, ...(baseMoved ? {} : { isLiving: false }), error: message.replace("BASE_CHANGED: ", ""), updatedAt: now() });
+      if (!baseMoved) await this.ensureLivingComposite();
       await this.store.addActivity({ type: baseMoved ? "system" : "error", message: baseMoved ? "Composite queued for a fresh base" : "Composite build failed", detail: message.replace("BASE_CHANGED: ", "") });
     } finally {
       await lease.release();
@@ -1516,8 +1719,10 @@ export class Orchestrator {
     let currentThreadId = threadId;
     let message = "Composite integration complete.";
     const reviewLimit = this.portfolioReviewLimit(settings);
+    const priorRounds = this.store.get().composites.find((item) => item.id === compositeId)?.reviewRounds.length ?? 0;
     let lastReview: ReviewResult | undefined;
-    for (let roundNumber = 1; roundNumber <= reviewLimit; roundNumber += 1) {
+    for (let attempt = 1; attempt <= reviewLimit; attempt += 1) {
+      const roundNumber = priorRounds + attempt;
       await this.updateComposite(compositeId, { status: "reviewing", updatedAt: now() });
       const review = await this.codex.review(cwd, baseBranch, title, settings);
       lastReview = review;
@@ -1533,7 +1738,7 @@ export class Orchestrator {
         });
         return { message, threadId: currentThreadId };
       }
-      if (roundNumber === reviewLimit) break;
+      if (attempt === reviewLimit) break;
       await this.updateComposite(compositeId, { status: "revising", updatedAt: now() });
       const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), settings);
       currentThreadId = revision.threadId;

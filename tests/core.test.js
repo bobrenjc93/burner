@@ -154,6 +154,22 @@ test("command evaluations return deterministic structured scores without Codex",
   }
 });
 
+test("command evaluations reject fail-closed measurements instead of treating them as score zero", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-command-rejection-test-"));
+  const evaluator = join(root, "evaluate");
+  try {
+    await writeFile(evaluator, `#!/bin/sh\nprintf '%s\\n' '{"score":0,"summary":"Benchmark rejected: no timing score was accepted.","evidence":["resource limit"],"suggestions":[]}'\n`);
+    await chmod(evaluator, 0o755);
+    const settings = { parallelism: 1, evaluationIntervalMinutes: 30, orchestratorIntervalMinutes: 15, autoRun: false, autoCreatePrs: true, evaluatorModel: "", agentModel: "", baseBranch: "main", remote: "origin", defaultResources: [], maxReviewRounds: 12, portfolioReviewRounds: 12, mergeCadenceMinutes: 60, preferLivingComposite: true, compositeAbsorbThreshold: 0 };
+    await assert.rejects(
+      () => new CodexClient().evaluate(root, { id: "bench", name: "Benchmark", prompt: "Measure it", command: evaluator, weight: 1, enabled: true, createdAt: new Date().toISOString() }, settings, "manual"),
+      /inconclusive measurement.*Benchmark rejected/s,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("portfolio leaf screens are comparable and composites retain the full command", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-screening-eval-test-"));
   const full = join(root, "full");
@@ -479,7 +495,7 @@ test("PR bodies record review approval and recalculated composite scores", () =>
   assert.match(draft, /not mergeable until independent review and combined-code evaluation finish/);
 });
 
-test("YOLO merge selection prefers reviewed composites and rejects stale or deterministic regressions", () => {
+test("YOLO merge selection prefers reviewed composites and rejects every evaluation regression", () => {
   const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
   const deltas = [
     { evaluationId: "quality", name: "Quality", before: 70, after: 72, delta: 2 },
@@ -497,7 +513,7 @@ test("YOLO merge selection prefers reviewed composites and rejects stale or dete
   assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "agent", prNumber: 10, impact: 5 });
   assert.equal(selectYoloMergeCandidate(state, "new-base"), undefined);
   state.agentRuns[0].deltas = [{ ...deltas[0], delta: -0.1 }, deltas[1]];
-  assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "agent", prNumber: 10, impact: 5 });
+  assert.equal(selectYoloMergeCandidate(state, "base"), undefined);
   state.agentRuns[0].deltas = [deltas[0], { ...deltas[1], delta: -0.1 }];
   assert.equal(selectYoloMergeCandidate(state, "base"), undefined);
   state.agentRuns[0].deltas = [deltas[0]];
@@ -525,9 +541,13 @@ test("YOLO portfolio waits for a full leaf batch, ranks impact, and reserves com
   assert.deepEqual(selectYoloLeafBatch(state, "base", 3), []);
   state.agentRuns[1].quarantinedAt = new Date().toISOString();
   assert.deepEqual(selectYoloLeafBatch(state, "base", 3, 2), ["a4", "a1"]);
+  state.composites[0].status = "failed";
+  state.agentRuns[1].quarantinedAt = undefined;
+  state.agentRuns[2].baseCommit = "base";
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 3), ["a2", "a3", "a4"]);
 });
 
-test("YOLO portfolio automatically cooks a complete batch without creating a living line", async () => {
+test("YOLO portfolio automatically cooks a complete batch as an evolving living line", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-portfolio-test-"));
   try {
     const store = new StateStore(root);
@@ -550,7 +570,7 @@ test("YOLO portfolio automatically cooks a complete batch without creating a liv
     assert.equal(await orchestrator.autoCookNext(), true);
     assert.deepEqual(request[0], ["fast", "slow"]);
     assert.match(request[1], /YOLO generation 1/);
-    assert.deepEqual(request[3], { makeLiving: false });
+    assert.deepEqual(request[3], { makeLiving: true });
     assert.equal(store.get().orchestrator.livingCompositeId, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -616,9 +636,46 @@ test("YOLO cadence cooks a healthy partial batch and falls back to one reviewed 
     assert.equal(await orchestrator.shouldDrainForPortfolio(), true);
     orchestrator.activeAgents.clear();
     let merged;
+    orchestrator.fullyValidateLeafForMerge = async () => true;
     orchestrator.mergeAgent = async (id) => { merged = id; return {}; };
     assert.equal(await orchestrator.autoMergeNext(), true);
     assert.equal(merged, "a");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cadence-driven single leaves receive full evaluation validation before merge", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-full-leaf-validation-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    await store.update((state) => {
+      state.evaluations = [{ id: "bench", name: "Benchmark", prompt: "Measure", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp }];
+      state.evaluationRuns.push({ id: "baseline", evaluationId: "bench", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" });
+      state.ideas.push({ id: "idea", title: "Fast leaf", description: "Improve", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "leaf" });
+      state.agentRuns.push({ id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp, prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base", deltas: [{ evaluationId: "bench", name: "Benchmark", before: 80, after: 100, delta: 20, screening: true }], impact: 20, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
+    });
+    const edited = [];
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    orchestrator.git = {
+      createExistingWorktree: async () => root,
+      removeWorktree: async () => undefined,
+      resolveRef: async () => "base",
+      editPr: async (...args) => edited.push(args),
+    };
+    orchestrator.runCandidateEvaluations = async (context) => {
+      assert.equal(context, "composite");
+      return [{ id: "full", evaluationId: "bench", score: 95, summary: "full", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" }];
+    };
+    await orchestrator.locks.init();
+    assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), true);
+    const run = store.get().agentRuns[0];
+    assert.deepEqual(run.deltas.map(({ before, after, delta, screening }) => ({ before, after, delta, screening })), [{ before: 90, after: 95, delta: 5, screening: false }]);
+    assert.equal(edited.length, 1);
+    assert.doesNotMatch(edited[0][3], /leaf screen/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -703,6 +760,34 @@ test("YOLO portfolio opens a draft composite before review and bounds review rou
   }
 });
 
+test("review-budget exhaustion preserves leaf work as a quarantined draft PR", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-leaf-checkpoint-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.ideas.push({ id: "idea", title: "Large feature", description: "Keep the work", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "failed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "run" });
+      state.agentRuns.push({ id: "run", ideaId: "idea", status: "failed", branch: "burner/feature", worktree: root, startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], reviewRounds: [{ id: "review", round: 12, commit: "head", approved: false, summary: "Blocked", findings: [{ severity: "high", title: "Race", detail: "Fix the race", file: "src/app.ts" }], createdAt: timestamp }], reviewApproved: false });
+    });
+    const opened = [];
+    const quarantined = [];
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    orchestrator.git = {
+      push: async () => undefined,
+      openPr: async (options) => { opened.push(options); return { url: "https://example.test/pull/12", number: 12 }; },
+      markPrQuarantined: async (_cwd, number) => quarantined.push(number),
+    };
+    await orchestrator.publishAgentCheckpoint(store.get().ideas[0], "run", root, "burner/feature", store.get().settings);
+    assert.equal(opened[0].draft, true);
+    assert.match(opened[0].body, /not approved, fully evaluated, or eligible for YOLO merge/);
+    assert.deepEqual(quarantined, [12]);
+    assert.equal(store.get().agentRuns[0].prState, "open");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("YOLO portfolio drains active agents instead of refilling slots when a batch is ready", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-drain-test-"));
   try {
@@ -768,7 +853,7 @@ test("command-backed evaluations are serialized across concurrent candidates", a
   }
 });
 
-test("evaluation suites do not overlap and run command checks before prompt checks", async () => {
+test("prompt evaluations overlap across candidates while command checks remain independently locked", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-evaluation-suite-test-"));
   try {
     const store = new StateStore(root);
@@ -802,11 +887,8 @@ test("evaluation suites do not overlap and run command checks before prompt chec
       orchestrator.runEvaluations("agent", "suite-a", "agent-a"),
       orchestrator.runEvaluations("agent", "suite-b", "agent-b"),
     ]);
-    assert.equal(overlapped, false);
-    assert.ok(
-      JSON.stringify(order) === JSON.stringify(["suite-a:command", "suite-a:prompt", "suite-b:command", "suite-b:prompt"]) ||
-      JSON.stringify(order) === JSON.stringify(["suite-b:command", "suite-b:prompt", "suite-a:command", "suite-a:prompt"]),
-    );
+    assert.equal(overlapped, true);
+    assert.deepEqual(new Set(order), new Set(["suite-a:command", "suite-a:prompt", "suite-b:command", "suite-b:prompt"]));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -820,7 +902,7 @@ test("evaluation suites share cpu-heavy without deadlocking the owning agent", a
     const timestamp = new Date().toISOString();
     await store.update((state) => {
       state.evaluations = [{ id: "command", name: "Command", prompt: "Measure", command: "./benchmark", weight: 1, enabled: true, createdAt: timestamp }];
-      state.agentRuns.push({ id: "cpu-agent", resources: ["cpu-heavy"] });
+      state.agentRuns.push({ id: "cpu-agent", ideaId: "cpu-idea", resources: ["cpu-heavy"] });
     });
     const order = [];
     const orchestrator = new Orchestrator(root, store, new EventHub());
@@ -830,11 +912,12 @@ test("evaluation suites share cpu-heavy without deadlocking the owning agent", a
         order.push(cwd);
         const held = await orchestrator.locks.list();
         assert.ok(held.includes("cpu-heavy"));
-        assert.ok(held.includes("evaluation-suite"));
+        assert.ok(!held.includes("evaluation-suite"));
         return { score: 50, summary: "measured", evidence: [], suggestions: [] };
       },
     };
     await orchestrator.locks.init();
+    orchestrator.activeAgents.add("cpu-idea");
     const agentLease = await orchestrator.locks.acquire("cpu-heavy", "cpu-agent");
     let plainFinished = false;
     const plain = orchestrator.runEvaluations("agent", "plain-suite", "plain-agent").then(() => { plainFinished = true; });
@@ -843,8 +926,40 @@ test("evaluation suites share cpu-heavy without deadlocking the owning agent", a
     await orchestrator.runEvaluations("agent", "owned-suite", "cpu-agent");
     assert.deepEqual(order, ["owned-suite"]);
     await agentLease.release();
+    orchestrator.activeAgents.delete("cpu-idea");
     await plain;
     assert.deepEqual(order, ["owned-suite", "plain-suite"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("candidate evaluation recovery reruns only failed scores", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-evaluation-retry-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [
+        { id: "stable", name: "Stable", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "flaky", name: "Flaky", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+    });
+    const calls = { stable: 0, flaky: 0 };
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { head: async () => "candidate" };
+    orchestrator.codex = {
+      preflight: async () => undefined,
+      evaluate: async (_cwd, evaluation) => {
+        calls[evaluation.id] += 1;
+        if (evaluation.id === "flaky" && calls.flaky === 1) throw new Error("transient evaluator failure");
+        return { score: 80, summary: "complete", evidence: [], suggestions: [] };
+      },
+    };
+    const runs = await orchestrator.runCandidateEvaluations("agent", root, "agent");
+    assert.deepEqual(runs.map((run) => run.status), ["completed", "completed"]);
+    assert.deepEqual(calls, { stable: 1, flaky: 2 });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1063,12 +1178,12 @@ test("successful experiments bind to and incrementally evolve the living composi
     const evaluation = store.get().evaluations[0];
     await store.update((state) => {
       state.orchestrator.livingCompositeId = "living";
-      state.composites.push({ id: "living", title: "Year-long line", description: "", status: "open", branch: "burner/living", worktree: "", sources: [{ agentRunId: "seed-a", prNumber: 1, title: "A", branch: "a", kind: "pull_request" }, { agentRunId: "seed-b", prNumber: 2, title: "B", branch: "b", kind: "pull_request" }], deltas: [], compositeScore: 80, reviewRounds: [], reviewApproved: true, prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: true, pendingExperimentRunIds: [] });
+      state.composites.push({ id: "living", title: "Year-long line", description: "", status: "open", branch: "burner/living", worktree: "", sources: [{ agentRunId: "seed-a", prNumber: 1, title: "A", branch: "a", kind: "pull_request" }, { agentRunId: "seed-b", prNumber: 2, title: "B", branch: "b", kind: "pull_request" }], deltas: [{ evaluationId: evaluation.id, name: evaluation.name, before: 75, after: 80, delta: 5 }], impact: 5, compositeScore: 80, reviewRounds: [], reviewApproved: true, prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: true, pendingExperimentRunIds: [] });
       state.evaluationRuns.push({ id: "composite-eval", evaluationId: evaluation.id, score: 80, commit: "living-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "living" });
       state.agentRuns.push({ id: "experiment", ideaId: "idea", status: "evaluating", branch: "burner/experiment", worktree: "/tmp/worktree", startedAt: timestamp, deltas: [], impact: 4, resources: [], reviewRounds: [], reviewApproved: true, baseRef: "burner/living", baseCommit: "living-head", parentCompositeId: "living" });
     });
     const pushed = [];
-    const orchestrator = new Orchestrator(root, store, new EventHub());
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
     orchestrator.git = { fetchBranch: async () => "origin/burner/living", resolveRef: async () => "living-head", push: async (_cwd, _remote, branch) => pushed.push(branch) };
     const base = await orchestrator.resolveAgentBase({ id: "idea", title: "Experiment", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "manual", baseCompositeId: "living" }, store.get());
     assert.equal(base.compositeId, "living");
@@ -1097,19 +1212,22 @@ test("state persists evaluation configuration and excludes candidate scores from
       state.evaluationRuns.push(
         { id: "baseline", evaluationId: evaluation.id, score: 61, commit: "a", createdAt: "2026-01-01T00:00:00.000Z", durationMs: 1, status: "completed", context: "manual" },
         { id: "candidate", evaluationId: evaluation.id, score: 99, commit: "b", createdAt: "2026-01-02T00:00:00.000Z", durationMs: 1, status: "completed", context: "agent", error: "x".repeat(20_000) },
+        { id: "rejected-screen", evaluationId: evaluation.id, score: 0, summary: "Benchmark rejected: no timing score was accepted.", commit: "a", createdAt: "2026-01-03T00:00:00.000Z", durationMs: 1, status: "completed", context: "screening_baseline" },
       );
     });
     assert.equal(store.latestRuns().get(evaluation.id)?.score, 61);
+    assert.equal(store.latestScreeningRuns().has(evaluation.id), false);
     assert.ok(store.get().evaluationRuns.find((run) => run.id === "candidate").error.length <= 8_020);
     const reloaded = new StateStore(root);
     await reloaded.init();
     assert.equal(reloaded.get().projectName, root.split("/").at(-1));
     assert.equal(reloaded.get().version, 3);
-    assert.equal(reloaded.get().settings.maxReviewRounds, 8);
-    assert.equal(reloaded.get().settings.portfolioReviewRounds, 3);
+    assert.equal(reloaded.get().settings.maxReviewRounds, 12);
+    assert.equal(reloaded.get().settings.portfolioReviewRounds, 12);
     assert.equal(reloaded.get().settings.mergeCadenceMinutes, 60);
     assert.equal(reloaded.get().settings.parallelism, 1);
     assert.equal(reloaded.latestRuns().get(evaluation.id)?.score, 61);
+    assert.equal(reloaded.get().evaluationRuns.find((run) => run.id === "rejected-screen").status, "failed");
     assert.deepEqual(validateEvaluation({ name: " UX ", prompt: " Score it ", weight: 2 }), { name: "UX", prompt: "Score it", weight: 2, enabled: true });
     assert.deepEqual(validateEvaluation({ name: "Bench", prompt: "Score", command: " full ", screeningCommand: " quick " }), { name: "Bench", prompt: "Score", command: "full", screeningCommand: "quick", weight: 1, enabled: true });
     assert.throws(() => validateEvaluation({ name: "Bench", prompt: "Score", screeningCommand: "quick" }), /requires a full evaluation command/);
