@@ -398,7 +398,7 @@ export class Orchestrator {
     const cadenceDue = this.mergeCadenceDue(state);
     const cookDue = this.portfolioCookDue(state);
     const failedCurrentGeneration = state.composites.some((composite) => composite.status === "failed" && composite.baseCommit === baseCommit);
-    const cadenceNeedsSingleLeaf = ((cadenceDue || cookDue) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0) || ((cadenceDue || cookDue) && failedCurrentGeneration);
+    const cadenceNeedsSingleLeaf = failedCurrentGeneration || ((cadenceDue || cookDue) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0);
     let candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf);
     if (!candidate && (this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf)) {
       const leaf = eligibleYoloLeaves(state, baseCommit)[0];

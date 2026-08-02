@@ -1037,17 +1037,17 @@ test("composite prompt regressions use a persisted median without rerunning comm
   }
 });
 
-test("a failed current generation unlocks an early fully validated leaf fallback", async () => {
+test("a failed current generation immediately unlocks a fully validated leaf fallback before cook lead time", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-failed-generation-fallback-test-"));
   try {
     const store = new StateStore(root);
     await store.init();
     const timestamp = new Date().toISOString();
-    const old = new Date(Date.now() - 55 * 60_000).toISOString();
+    const freshWindow = new Date().toISOString();
     const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
     await store.update((state) => {
       state.settings.mergeCadenceMinutes = 60;
-      state.orchestrator.mergeWindowStartedAt = old;
+      state.orchestrator.mergeWindowStartedAt = freshWindow;
       state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
       state.ideas.push({ id: "idea", title: "Healthy leaf", description: "Improve", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "leaf" });
       state.agentRuns.push({ id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp, prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base", deltas: [{ evaluationId: "quality", name: "Quality", before: 50, after: 55, delta: 5 }], impact: 5, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
