@@ -758,6 +758,59 @@ test("cadence-driven single leaves receive full evaluation validation before mer
   }
 });
 
+test("cadence-driven leaf validation confirms prompt regressions with a median without rerunning commands", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-prompt-confirmation-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    await store.update((state) => {
+      state.evaluations = [
+        { id: "bench", name: "Benchmark", prompt: "Measure", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+      state.evaluationRuns.push(
+        { id: "baseline-bench", evaluationId: "bench", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" },
+        { id: "baseline-quality", evaluationId: "quality", score: 50, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" },
+      );
+      state.ideas.push({ id: "idea", title: "Stable leaf", description: "Improve", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "leaf" });
+      state.agentRuns.push({ id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp, prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base", deltas: [], impact: 1, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    orchestrator.git = {
+      createExistingWorktree: async () => root,
+      removeWorktree: async () => undefined,
+      resolveRef: async () => "base",
+      editPr: async () => undefined,
+    };
+    orchestrator.runCandidateEvaluations = async () => [
+      { id: "full-bench", evaluationId: "bench", score: 95, summary: "full", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" },
+      { id: "quality-first", evaluationId: "quality", score: 45, summary: "noisy low", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" },
+    ];
+    const confirmationScores = [50, 55];
+    let confirmationCalls = 0;
+    orchestrator.runEvaluations = async (context, _cwd, agentRunId, compositeId, evaluationIds) => {
+      assert.equal(context, "composite");
+      assert.equal(agentRunId, "leaf");
+      assert.equal(compositeId, undefined);
+      assert.deepEqual(evaluationIds, ["quality"], "the command-backed benchmark must not be rerun or averaged");
+      const score = confirmationScores[confirmationCalls++];
+      return [{ id: `quality-${confirmationCalls}`, evaluationId: "quality", score, summary: "confirmation", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" }];
+    };
+    await orchestrator.locks.init();
+    assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), true);
+    assert.equal(confirmationCalls, 2);
+    assert.deepEqual(store.get().agentRuns[0].deltas.map(({ evaluationId, delta }) => ({ evaluationId, delta })), [
+      { evaluationId: "bench", delta: 5 },
+      { evaluationId: "quality", delta: 0 },
+    ]);
+    assert.ok(store.get().activity.some((item) => item.message === "Confirming 1 prompt regression for PR #10"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("YOLO portfolio caps reviews, quarantines the implicated leaf, and queues smaller healthy partitions", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-quarantine-test-"));
   try {

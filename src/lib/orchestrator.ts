@@ -360,14 +360,43 @@ export class Orchestrator {
     try { worktree = await this.git.createExistingWorktree(owner, run.branch); }
     finally { await createLock.release(); }
     try {
-      const afterRuns = await this.runCandidateEvaluations("composite", worktree, run.id);
+      let afterRuns = await this.runCandidateEvaluations("composite", worktree, run.id);
       const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
       if (afterRuns.length !== enabled.length || afterRuns.some((item) => item.status !== "completed" || item.score === undefined)) {
         await this.store.addActivity({ type: "error", message: `Full merge validation failed for PR #${run.prNumber}`, detail: "The leaf remains open and will not be merged from screening scores." });
         return false;
       }
       if (await this.git.resolveRef(state.settings.baseBranch) !== baseCommit) return false;
-      const deltas = this.calculateDeltas(this.store.get(), this.store.latestRuns(), afterRuns);
+      const baseline = this.store.latestRuns();
+      let deltas = this.calculateDeltas(this.store.get(), baseline, afterRuns);
+      const promptRegressionIds = deltas
+        .filter((delta) => (delta.delta ?? 0) < 0 && !enabled.find((evaluation) => evaluation.id === delta.evaluationId)?.command)
+        .map((delta) => delta.evaluationId);
+      if (promptRegressionIds.length) {
+        const samples = new Map(promptRegressionIds.map((evaluationId) => [
+          evaluationId,
+          [afterRuns.find((item) => item.evaluationId === evaluationId)!],
+        ]));
+        await this.store.addActivity({
+          type: "evaluation",
+          message: `Confirming ${promptRegressionIds.length} prompt regression${promptRegressionIds.length === 1 ? "" : "s"} for PR #${run.prNumber}`,
+          detail: "Burner will use the median of three independent prompt scores; deterministic command results are never softened.",
+        });
+        for (let confirmation = 0; confirmation < 2; confirmation += 1) {
+          const confirmationRuns = await this.runEvaluations("composite", worktree, run.id, undefined, promptRegressionIds);
+          if (confirmationRuns.length !== promptRegressionIds.length || confirmationRuns.some((item) => item.status !== "completed" || item.score === undefined)) {
+            await this.store.addActivity({ type: "error", message: `Prompt confirmation failed for PR #${run.prNumber}`, detail: "The leaf remains open because a regression confirmation score was incomplete." });
+            return false;
+          }
+          for (const confirmationRun of confirmationRuns) samples.get(confirmationRun.evaluationId)!.push(confirmationRun);
+        }
+        const medians = new Map([...samples].map(([evaluationId, runs]) => [
+          evaluationId,
+          [...runs].sort((left, right) => left.score! - right.score!)[Math.floor(runs.length / 2)]!,
+        ]));
+        afterRuns = afterRuns.map((item) => medians.get(item.evaluationId) ?? item);
+        deltas = this.calculateDeltas(this.store.get(), baseline, afterRuns);
+      }
       const impact = this.calculateImpact(this.store.get(), deltas);
       await this.updateAgent(run.id, { deltas, impact });
       await this.git.editPr(worktree, run.prNumber, idea?.title ?? run.branch, buildPrBody(idea?.description ?? "", run.lastMessage ?? "", deltas, impact, run.reviewRounds));
