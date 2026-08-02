@@ -149,6 +149,18 @@ export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string,
     .sort((a, b) => b.impact - a.impact)[0];
 }
 
+export function shouldRefillIdeaQueue(
+  portfolioMode: boolean,
+  queuedIdeas: number,
+  parallelism: number,
+  activeAgents: number,
+  activeComposites: number,
+): boolean {
+  return portfolioMode
+    ? queuedIdeas === 0 && activeAgents === 0 && activeComposites === 0
+    : queuedIdeas < parallelism * 2;
+}
+
 export class Orchestrator {
   private readonly git: GitService;
   private readonly locks: LockManager;
@@ -1262,7 +1274,7 @@ export class Orchestrator {
         !refreshed.orchestrator.lastPlanningAt ||
         Date.now() - new Date(refreshed.orchestrator.lastPlanningAt).getTime() >= settings.orchestratorIntervalMinutes * 60_000;
       const queued = refreshed.ideas.filter((idea) => idea.status === "queued").length;
-      if (planningDue && queued < settings.parallelism * 2) await this.plan();
+      if (planningDue && shouldRefillIdeaQueue(this.portfolioMode(), queued, settings.parallelism, this.activeAgents.size, this.activeComposites.size)) await this.plan();
       if (!this.store.get().orchestrator.enabled && !force) return;
       await this.scheduleComposites();
       await this.schedule();

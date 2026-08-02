@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
+import { inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
@@ -217,6 +217,15 @@ test("benchmark-oriented ideas conservatively infer the shared CPU resource", ()
   assert.deepEqual(inferIdeaResources({ title: "Profile grouped queries", description: "Find hot paths", rationale: "Speed" }), ["cpu-heavy"]);
   assert.deepEqual(inferIdeaResources({ title: "Implement SQL NULL semantics", description: "Avoid special-casing benchmark queries", rationale: "Correctness" }), []);
   assert.deepEqual(inferIdeaResources({ title: "Improve SQL docs", description: "Add examples", rationale: "Clarity" }), []);
+});
+
+test("portfolio planning preserves the current generation until its queue and active work drain", () => {
+  assert.equal(shouldRefillIdeaQueue(true, 1, 1, 0, 0), false, "an existing queued leaf must not be displaced by replanning");
+  assert.equal(shouldRefillIdeaQueue(true, 0, 1, 1, 0), false, "an in-flight final leaf must finish before replenishment");
+  assert.equal(shouldRefillIdeaQueue(true, 0, 1, 0, 1), false, "a composite generation must finish before replenishment");
+  assert.equal(shouldRefillIdeaQueue(true, 0, 1, 0, 0), true, "an idle empty portfolio may refill");
+  assert.equal(shouldRefillIdeaQueue(false, 1, 1, 1, 0), true, "non-portfolio mode retains its queue watermark behavior");
+  assert.equal(shouldRefillIdeaQueue(false, 2, 1, 0, 0), false);
 });
 
 test("resuming the orchestrator does not force a redundant fresh baseline", async () => {
