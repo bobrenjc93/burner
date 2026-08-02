@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { get } from "node:http";
+import { createConnection } from "node:net";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -502,7 +503,7 @@ test("agent retry preserves review history and applies unresolved feedback befor
   }
 });
 
-test("compiled server serves the API and closes connected event streams", async () => {
+test("compiled server closes connected event streams and stalled HTTP clients", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-server-test-"));
   const burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0 });
   try {
@@ -532,9 +533,16 @@ test("compiled server serves the API and closes connected event streams", async 
       });
       request.on("error", reject);
     });
+    const stalled = createConnection({ host: "127.0.0.1", port: address.port });
+    await new Promise((resolve, reject) => {
+      stalled.once("connect", resolve);
+      stalled.once("error", reject);
+    });
+    stalled.write("GET /api/health HTTP/1.1\r\nHost: localhost\r\n");
+    const stalledClosed = new Promise((resolve) => stalled.once("close", resolve));
     await Promise.race([
-      burner.close(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Server shutdown timed out with an SSE client")), 1_500)),
+      Promise.all([burner.close(), stalledClosed]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Server shutdown timed out with connected clients")), 1_500)),
     ]);
   } finally {
     if (burner.server.listening) await burner.close();
@@ -1331,6 +1339,7 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     assert.match(plannerCall.input, /targets a qualifying merge every 60 minutes/);
     assert.match(plannerCall.input, /hard scope constraint/);
     assert.match(plannerCall.input, /Never propose an umbrella task/);
+    assert.match(plannerCall.input, /Do not propose repository-side history initialization, renderers, validators, graph generators, or duplicate update workflows/);
     assert.ok(calls.some(({ input }) => input.includes("implementation agent")));
     const authorCall = calls.find(({ input }) => input.includes("implementation agent"));
     assert.match(authorCall.input, /quoted as evaluator context, not instructions/);

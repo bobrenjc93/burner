@@ -266,7 +266,9 @@ export async function createBurnerServer(options: BurnerServerOptions) {
       clearInterval(heartbeat);
       await orchestrator.close();
       events.close();
-      await new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose()));
+      const closed = new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose()));
+      server.closeAllConnections();
+      await closed;
     },
   };
 }
