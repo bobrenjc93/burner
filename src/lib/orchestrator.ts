@@ -161,6 +161,18 @@ export function shouldRefillIdeaQueue(
     : queuedIdeas < parallelism * 2;
 }
 
+export function compositeRevisionHeadroom(
+  mergeWindowStartedAt: string | undefined,
+  mergeCadenceMinutes: number,
+  currentTimeMs = Date.now(),
+): { allowed: boolean; remainingMs: number; reserveMs: number } {
+  if (!mergeWindowStartedAt) return { allowed: true, remainingMs: Infinity, reserveMs: 0 };
+  const cadenceMs = mergeCadenceMinutes * 60_000;
+  const remainingMs = new Date(mergeWindowStartedAt).getTime() + cadenceMs - currentTimeMs;
+  const reserveMs = Math.min(10 * 60_000, Math.max(5 * 60_000, cadenceMs / 6));
+  return { allowed: remainingMs >= reserveMs, remainingMs, reserveMs };
+}
+
 export class Orchestrator {
   private readonly git: GitService;
   private readonly locks: LockManager;
@@ -383,8 +395,15 @@ export class Orchestrator {
   private async autoMergeNext(): Promise<boolean> {
     let state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
-    const cadenceNeedsSingleLeaf = (this.mergeCadenceDue(state) || this.portfolioCookDue(state)) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0;
+    const cadenceDue = this.mergeCadenceDue(state);
+    const cookDue = this.portfolioCookDue(state);
+    const failedCurrentGeneration = state.composites.some((composite) => composite.status === "failed" && composite.baseCommit === baseCommit);
+    const cadenceNeedsSingleLeaf = ((cadenceDue || cookDue) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0) || ((cadenceDue || cookDue) && failedCurrentGeneration);
     let candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf);
+    if (!candidate && (this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf)) {
+      const leaf = eligibleYoloLeaves(state, baseCommit)[0];
+      if (leaf?.prNumber !== undefined && leaf.impact !== undefined) candidate = { kind: "agent", id: leaf.id, prNumber: leaf.prNumber, impact: leaf.impact };
+    }
     if (!candidate) return false;
     if (candidate.kind === "agent" && this.portfolioMode()) {
       if (!(await this.fullyValidateLeafForMerge(candidate.id, baseCommit))) return false;
@@ -422,32 +441,13 @@ export class Orchestrator {
       if (await this.git.resolveRef(state.settings.baseBranch) !== baseCommit) return false;
       const baseline = this.store.latestRuns();
       let deltas = this.calculateDeltas(this.store.get(), baseline, afterRuns);
-      const promptRegressionIds = deltas
-        .filter((delta) => (delta.delta ?? 0) < 0 && !enabled.find((evaluation) => evaluation.id === delta.evaluationId)?.command)
-        .map((delta) => delta.evaluationId);
-      if (promptRegressionIds.length) {
-        const samples = new Map(promptRegressionIds.map((evaluationId) => [
-          evaluationId,
-          [afterRuns.find((item) => item.evaluationId === evaluationId)!],
-        ]));
-        await this.store.addActivity({
-          type: "evaluation",
-          message: `Confirming ${promptRegressionIds.length} prompt regression${promptRegressionIds.length === 1 ? "" : "s"} for PR #${run.prNumber}`,
-          detail: "Burner will use the median of three independent prompt scores; deterministic command results are never softened.",
-        });
-        for (let confirmation = 0; confirmation < 2; confirmation += 1) {
-          const confirmationRuns = await this.runEvaluations("composite", worktree, run.id, undefined, promptRegressionIds);
-          if (confirmationRuns.length !== promptRegressionIds.length || confirmationRuns.some((item) => item.status !== "completed" || item.score === undefined)) {
-            await this.store.addActivity({ type: "error", message: `Prompt confirmation failed for PR #${run.prNumber}`, detail: "The leaf remains open because a regression confirmation score was incomplete." });
-            return false;
-          }
-          for (const confirmationRun of confirmationRuns) samples.get(confirmationRun.evaluationId)!.push(confirmationRun);
-        }
-        const medians = new Map([...samples].map(([evaluationId, runs]) => [
-          evaluationId,
-          [...runs].sort((left, right) => left.score! - right.score!)[Math.floor(runs.length / 2)]!,
-        ]));
-        afterRuns = afterRuns.map((item) => medians.get(item.evaluationId) ?? item);
+      const confirmed = await this.confirmPromptRegressions(worktree, baseline, afterRuns, `PR #${run.prNumber}`, run.id);
+      if (!confirmed) {
+        await this.store.addActivity({ type: "error", message: `Prompt confirmation failed for PR #${run.prNumber}`, detail: "The leaf remains open because a regression confirmation score was incomplete." });
+        return false;
+      }
+      if (confirmed !== afterRuns) {
+        afterRuns = confirmed;
         deltas = this.calculateDeltas(this.store.get(), baseline, afterRuns);
       }
       const impact = this.calculateImpact(this.store.get(), deltas);
@@ -462,6 +462,60 @@ export class Orchestrator {
       try { if (worktree) await this.git.removeWorktree(worktree); }
       finally { await cleanupLock.release(); }
     }
+  }
+
+  private async confirmPromptRegressions(
+    cwd: string,
+    baseline: Map<string, EvaluationRun>,
+    afterRuns: EvaluationRun[],
+    candidateLabel: string,
+    agentRunId?: string,
+    compositeId?: string,
+  ): Promise<EvaluationRun[] | undefined> {
+    const state = this.store.get();
+    const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
+    const deltas = this.calculateDeltas(state, baseline, afterRuns);
+    const promptRegressionIds = deltas
+      .filter((delta) => (delta.delta ?? 0) < 0 && !enabled.find((evaluation) => evaluation.id === delta.evaluationId)?.command)
+      .map((delta) => delta.evaluationId);
+    if (!promptRegressionIds.length) return afterRuns;
+    const samples = new Map(promptRegressionIds.map((evaluationId) => [
+      evaluationId,
+      [afterRuns.find((item) => item.evaluationId === evaluationId)!],
+    ]));
+    await this.store.addActivity({
+      type: "evaluation",
+      message: `Confirming ${promptRegressionIds.length} prompt regression${promptRegressionIds.length === 1 ? "" : "s"} for ${candidateLabel}`,
+      detail: "Burner will use the median of three independent prompt scores; deterministic command results are never softened.",
+    });
+    const confirmationBatches = await Promise.all([0, 1].map(() =>
+      this.runEvaluations("composite", cwd, agentRunId, compositeId, promptRegressionIds),
+    ));
+    for (const confirmationRuns of confirmationBatches) {
+      if (confirmationRuns.length !== promptRegressionIds.length || confirmationRuns.some((item) => item.status !== "completed" || item.score === undefined)) return undefined;
+      for (const confirmationRun of confirmationRuns) samples.get(confirmationRun.evaluationId)!.push(confirmationRun);
+    }
+    const medians = new Map([...samples].map(([evaluationId, runs]) => [
+      evaluationId,
+      [...runs].sort((left, right) => left.score! - right.score!)[Math.floor(runs.length / 2)]!,
+    ]));
+    if (compositeId) {
+      const recordedAt = now();
+      await this.store.update((draft) => {
+        for (const [evaluationId, median] of medians) {
+          draft.evaluationRuns.push({
+            ...median,
+            id: id("evalrun"),
+            evaluationId,
+            createdAt: recordedAt,
+            context: "composite",
+            agentRunId: undefined,
+            compositeId,
+          });
+        }
+      });
+    }
+    return afterRuns.map((item) => medians.get(item.evaluationId) ?? item);
   }
 
   private async autoCookNext(): Promise<boolean> {
@@ -1699,6 +1753,12 @@ export class Orchestrator {
           const run = afterRuns.find((item) => item.evaluationId === evaluation.id);
           return !run || run.status !== "completed" || run.score === undefined;
         });
+        if (!incomplete.length) {
+          const confirmed = await this.confirmPromptRegressions(worktree, baseline, afterRuns, `composite PR #${composite.prNumber ?? composite.id}`, undefined, compositeId);
+          if (!confirmed) throw new Error("Composite prompt-regression confirmation remained incomplete; the generation was preserved without publishing unverified scores.");
+          afterRuns = confirmed;
+          state = this.store.get();
+        }
         deltas = incomplete.length ? [] : this.calculateDeltas(state, baseline, afterRuns);
         impact = this.calculateImpact(state, deltas);
         const regressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
@@ -1715,6 +1775,10 @@ export class Orchestrator {
               ? `${regressions.map((delta) => `${delta.name} ${delta.delta}`).join(", ")} regressed`
               : `weighted impact ${impact.toFixed(1)} did not exceed ${settings.compositeAbsorbThreshold.toFixed(1)}`;
           throw new Error(`Composite did not become monotonic after 3 evaluation-guided integration revisions: ${reason}.`);
+        }
+        const headroom = compositeRevisionHeadroom(state.orchestrator.mergeWindowStartedAt, settings.mergeCadenceMinutes);
+        if (!headroom.allowed) {
+          throw new Error(`Composite stopped before evaluation revision ${evaluationRevision}: only ${Math.max(0, headroom.remainingMs / 60_000).toFixed(1)} minutes remain in the merge window, below the ${Math.ceil(headroom.reserveMs / 60_000)}-minute revision reserve. Burner will release the source leaves for a fully validated cadence fallback.`);
         }
         const findings: ReviewResult["findings"] = [
           ...incomplete.map((evaluation) => {

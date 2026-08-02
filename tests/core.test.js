@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { compositeRevisionHeadroom, inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
@@ -226,6 +226,14 @@ test("portfolio planning preserves the current generation until its queue and ac
   assert.equal(shouldRefillIdeaQueue(true, 0, 1, 0, 0), true, "an idle empty portfolio may refill");
   assert.equal(shouldRefillIdeaQueue(false, 1, 1, 1, 0), true, "non-portfolio mode retains its queue watermark behavior");
   assert.equal(shouldRefillIdeaQueue(false, 2, 1, 0, 0), false);
+});
+
+test("composite evaluation revisions reserve enough merge-cadence headroom", () => {
+  const anchor = "2026-01-01T00:00:00.000Z";
+  const started = Date.parse(anchor);
+  assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 49 * 60_000), { allowed: true, remainingMs: 11 * 60_000, reserveMs: 10 * 60_000 });
+  assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 51 * 60_000), { allowed: false, remainingMs: 9 * 60_000, reserveMs: 10 * 60_000 });
+  assert.equal(compositeRevisionHeadroom(undefined, 60).allowed, true);
 });
 
 test("resuming the orchestrator does not force a redundant fresh baseline", async () => {
@@ -983,6 +991,77 @@ test("cadence-driven leaf validation confirms prompt regressions with a median w
       { evaluationId: "quality", delta: 0 },
     ]);
     assert.ok(store.get().activity.some((item) => item.message === "Confirming 1 prompt regression for PR #10"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("composite prompt regressions use a persisted median without rerunning commands", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-composite-prompt-confirmation-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [
+        { id: "bench", name: "Benchmark", prompt: "Measure", command: "full", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+      state.evaluationRuns.push(
+        { id: "baseline-bench", evaluationId: "bench", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" },
+        { id: "baseline-quality", evaluationId: "quality", score: 50, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" },
+      );
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    const calls = [];
+    const confirmationScores = [50, 55];
+    orchestrator.runEvaluations = async (context, _cwd, agentRunId, compositeId, evaluationIds) => {
+      calls.push({ context, agentRunId, compositeId, evaluationIds });
+      const score = confirmationScores.shift();
+      return [{ id: `confirmation-${calls.length}`, evaluationId: "quality", score, summary: "confirmation", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId }];
+    };
+    const initial = [
+      { id: "bench-after", evaluationId: "bench", score: 95, summary: "faster", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "combined" },
+      { id: "quality-after", evaluationId: "quality", score: 45, summary: "noisy low", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "combined" },
+    ];
+    const confirmed = await orchestrator.confirmPromptRegressions(root, store.latestRuns(), initial, "composite PR #99", undefined, "combined");
+    assert.equal(confirmed.find((run) => run.evaluationId === "quality").score, 50);
+    assert.equal(confirmed.find((run) => run.evaluationId === "bench").score, 95);
+    assert.equal(calls.length, 2);
+    assert.ok(calls.every((call) => call.context === "composite" && call.agentRunId === undefined && call.compositeId === "combined"));
+    assert.ok(calls.every((call) => JSON.stringify(call.evaluationIds) === JSON.stringify(["quality"])), "command-backed evaluations must not be confirmed or softened");
+    assert.equal(store.latestCompositeRuns("combined").get("quality").score, 50, "the promoted baseline must use the confirmed median");
+    assert.ok(store.get().activity.some((item) => item.message === "Confirming 1 prompt regression for composite PR #99"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed current generation unlocks an early fully validated leaf fallback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-failed-generation-fallback-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const old = new Date(Date.now() - 55 * 60_000).toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.mergeWindowStartedAt = old;
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.ideas.push({ id: "idea", title: "Healthy leaf", description: "Improve", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "leaf" });
+      state.agentRuns.push({ id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp, prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base", deltas: [{ evaluationId: "quality", name: "Quality", before: 50, after: 55, delta: 5 }], impact: 5, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
+      state.composites.push({ id: "failed", title: "Failed generation", description: "", status: "failed", branch: "burner/failed", worktree: "", baseCommit: "base", sources: [{ agentRunId: "leaf", prNumber: 10, title: "Healthy leaf", branch: "burner/leaf", kind: "pull_request" }], deltas: [], reviewRounds: [], createdAt: timestamp, updatedAt: timestamp, isLiving: false });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    let validated;
+    let merged;
+    orchestrator.fullyValidateLeafForMerge = async (id) => { validated = id; return true; };
+    orchestrator.mergeAgent = async (id) => { merged = id; return {}; };
+    assert.equal(await orchestrator.autoMergeNext(), true);
+    assert.equal(validated, "leaf");
+    assert.equal(merged, "leaf");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
