@@ -90,8 +90,13 @@ function isInconclusiveCommandOutput(output: EvaluationOutput): boolean {
 
 export class CodexClient {
   private unrestrictedArgsPromise?: Promise<string[]>;
+  private readonly abortController = new AbortController();
 
   constructor(private readonly onProgress?: (message: string) => void) {}
+
+  close(): void {
+    this.abortController.abort();
+  }
 
   async preflight(cwd: string): Promise<void> {
     await this.unrestrictedArgs(cwd);
@@ -136,6 +141,7 @@ export class CodexClient {
       cwd,
       env: { BURNER_EVALUATION_CONTEXT: context, BURNER_EVALUATION_NAME: evaluation.name },
       timeoutMs: 60 * 60 * 1000,
+      signal: this.abortController.signal,
       onStderr: (line) => this.onProgress?.(line),
     });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Evaluation command exited with ${result.exitCode}`);
@@ -166,6 +172,8 @@ export class CodexClient {
     existingIdeas: Idea[],
     settings: BurnerSettings,
   ): Promise<PlannedIdea[]> {
+    const cadenceMinutes = Math.max(5, settings.mergeCadenceMinutes ?? 60);
+    const implementationBudgetMinutes = Math.max(5, Math.floor(cadenceMinutes / 4));
     const evaluationContext = evaluations.map((evaluation) => {
       const run = latest.get(evaluation.id);
       return {
@@ -182,6 +190,9 @@ export class CodexClient {
     const prompt = [
       "You are Burner's improvement planner. Inspect this repository and propose a small set of concrete, independent changes that coding agents can implement on separate branches.",
       "Optimize the evaluation scores below. Prefer high-leverage, reviewable changes over broad rewrites. Do not duplicate existing ideas. Do not edit files.",
+      `Burner targets a qualifying merge every ${cadenceMinutes} minutes with ${settings.parallelism} parallel agent slot${settings.parallelism === 1 ? "" : "s"}. Each idea must be small enough for one author to implement, test, undergo repeated independent review, revise, and candidate-evaluate in about ${implementationBudgetMinutes} minutes.`,
+      "This is a hard scope constraint: each idea must deliver one narrow, coherent capability with at most three concrete acceptance outcomes. Decompose foundations into independently useful increments. Never propose an umbrella task such as building an entire engine, service, UI, persistence layer, or end-to-end product in one branch.",
+      "Treat failed or quarantined existing ideas as evidence that their scope was too large or risky. Replace them only with strictly smaller, non-overlapping increments; do not rephrase and resubmit the same scope.",
       "predictedImpact is an expected 0-100 relative impact used for queue ordering. evaluationIds must use only IDs supplied below.",
       "resources lists shared scarce resources only when required (examples: gpu, cpu-heavy, device-ios). Use an empty list for normal work. Ideas sharing a resource will not run concurrently.",
       `Evaluations:\n${JSON.stringify(evaluationContext, null, 2)}`,
@@ -249,6 +260,8 @@ export class CodexClient {
     const prompt = [
       "Act as an independent, rigorous reviewer. Review the complete branch diff against the base branch.",
       "Approve only when there are no material correctness, security, regression, race, lifecycle, or missing-test issues that should block merge.",
+      "Perform a comprehensive blocker pass now: inspect every changed subsystem against correctness boundaries, resource limits, public contracts, and tests, and report all material findings you can substantiate in this response. Do not deliberately defer a risk category to a later round.",
+      "Findings must be merge blockers caused by or exposed by this change, not optional hardening or unrelated feature requests. On later rounds, verify prior fixes and the complete current diff without inventing new scope.",
       "Do not edit files. Keep findings concrete and actionable. Approval must be false whenever any finding requires an author change.",
       `Change under review: ${title}`,
       `Base branch: ${baseBranch}. Inspect the complete diff from this base to HEAD before deciding.`,
@@ -390,7 +403,7 @@ export class CodexClient {
     const failures: string[] = [];
     for (const flags of candidates) {
       try {
-        const result = await runCommand("codex", [...flags, "exec", "--help"], { cwd, timeoutMs: 10_000 });
+        const result = await runCommand("codex", [...flags, "exec", "--help"], { cwd, timeoutMs: 10_000, signal: this.abortController.signal });
         const help = `${result.stdout}\n${result.stderr}`;
         if (result.exitCode === 0 && help.includes(UNRESTRICTED_FLAG)) return flags;
         failures.push(help.trim() || `codex exited with ${result.exitCode}`);
@@ -403,7 +416,7 @@ export class CodexClient {
 
   private async runCodex(args: string[], options: CodexCommandOptions): Promise<CommandResult> {
     const unrestrictedArgs = await this.unrestrictedArgs(options.cwd);
-    return runCommand("codex", [...unrestrictedArgs, ...args], options);
+    return runCommand("codex", [...unrestrictedArgs, ...args], { ...options, signal: this.abortController.signal });
   }
 
   private preflightError(detail: string): string {

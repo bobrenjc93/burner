@@ -20,7 +20,7 @@ burner --yolo
 - Runs as a CLI-launched local web server in the target repository.
 - Stores configuration and run history locally in `.burner/state.json`.
 - Evaluates arbitrary prompts with structured `codex exec` output.
-- Plans improvements from the latest evaluation evidence.
+- Plans cadence-sized improvements from the latest evaluation evidence, decomposing oversized or quarantined scopes before retrying them.
 - Runs coding agents in separate git worktrees and branches.
 - Limits concurrency globally and uses atomic file locks for scarce resources such as a GPU, simulator, or CPU-heavy test suite.
 - Re-runs every evaluation on a candidate branch, computes weighted before/after deltas, and stamps the exact table into the pull request body.
@@ -93,6 +93,8 @@ Use `--yolo-batch-size <n>` to choose a generation size from 1 to 100. A value o
 
 Portfolio mode treats the configured merge cadence as a health SLA. The default is 60 minutes. When the window expires, Burner cooks whatever healthy reviewed subset is available instead of waiting forever for ten leaves; if only one qualifying leaf exists, it may merge that leaf directly. A missed cadence emits a visible error activity and UI warning. Burner never bypasses review, complete evaluation coverage, positive weighted impact, or deterministic no-regression gates for a final merge merely to hit the clock.
 
+The cadence also constrains planning. Burner gives the planner an explicit per-leaf wall-clock budget and requires one narrow, independently useful capability with no more than three acceptance outcomes. Umbrella work such as an entire engine, service, persistence layer, UI, or end-to-end product must be decomposed. A failed or quarantined idea is supplied as negative planning evidence and may only return as strictly smaller, non-overlapping increments. Reviewers are likewise told to perform a comprehensive blocker pass and report all substantiated merge blockers immediately instead of serializing risk categories across avoidable rounds.
+
 YOLO reviews are bounded independently from manual work. The default portfolio checkpoint is twelve total author/reviewer rounds. The limit is cumulative across resumed loops and read live before every round, so lowering it also constrains work already in flight. A leaf that cannot clear that window is preserved as a visible draft PR with its unresolved findings and `burner-quarantined` label, so substantial work and its author session are not lost. If a composite exhausts the window, Burner maps reviewer file findings back to source branches, labels the strongest-overlap leaf `burner-quarantined`, retires the blocked draft, and repartitions the remaining healthy leaves into balanced recovery composites no larger than half the failed generation.
 
 Each leaf selected for a portfolio generation:
@@ -135,6 +137,8 @@ When a composite merges, Burner closes its included source PRs. It fast-forwards
 Every `codex exec` invocation uses `--dangerously-bypass-approvals-and-sandbox`, including authors, revision sessions, reviewers, planners, prompt evaluators, and composite integrators. These agents have unrestricted filesystem and command access as your user. Burner still instructs agents not to push or open PRs because the orchestrator owns those state transitions, but that instruction is not a security boundary.
 
 Command-backed evaluations are different: Burner starts their configured command directly as a local subprocess. The Codex flag does not affect them; they already inherit Burner's local permissions.
+
+Stopping Burner aborts active Codex process groups and their descendants before the CLI exits. A clean Ctrl+C therefore does not leave unrestricted authors, reviewers, planners, prompt evaluators, or composite integrators running in the background.
 
 Each idea may declare resource locks. Locks are acquired atomically under `.burner/locks`, in sorted order, and held for the full agent run. If any requested resource is busy, the idea stays queued. Git worktree mutations use a separate short-lived metadata lock.
 

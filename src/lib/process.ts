@@ -9,7 +9,7 @@ export type CommandResult = {
 export async function runCommand(
   command: string,
   args: string[],
-  options: { cwd: string; input?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; onStderr?: (line: string) => void },
+  options: { cwd: string; input?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; signal?: AbortSignal; onStderr?: (line: string) => void },
 ): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -22,19 +22,29 @@ export async function runCommand(
     let stderr = "";
     let settled = false;
     let timedOut = false;
+    let aborted = false;
     let timeout: NodeJS.Timeout | undefined;
     let forceKill: NodeJS.Timeout | undefined;
     let forceResolve: NodeJS.Timeout | undefined;
+    let abortListener: (() => void) | undefined;
     const clearTimers = () => {
       if (timeout) clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
       if (forceResolve) clearTimeout(forceResolve);
+      if (abortListener) options.signal?.removeEventListener("abort", abortListener);
     };
     const finish = (exitCode: number) => {
       if (settled) return;
       settled = true;
       clearTimers();
-      resolve({ stdout, stderr: timedOut ? `${stderr}${stderr && !stderr.endsWith("\n") ? "\n" : ""}Command timed out after ${options.timeoutMs}ms.` : stderr, exitCode: timedOut ? 124 : exitCode });
+      const termination = timedOut
+        ? `Command timed out after ${options.timeoutMs}ms.`
+        : aborted ? "Command aborted during Burner shutdown." : "";
+      resolve({
+        stdout,
+        stderr: termination ? `${stderr}${stderr && !stderr.endsWith("\n") ? "\n" : ""}${termination}` : stderr,
+        exitCode: timedOut ? 124 : aborted ? 130 : exitCode,
+      });
     };
     const killTree = (signal: NodeJS.Signals) => {
       try {
@@ -43,6 +53,21 @@ export async function runCommand(
       } catch {
         // The process group may already have exited between the timeout and signal.
       }
+    };
+    const terminate = (reason: "timeout" | "abort") => {
+      if (settled || timedOut || aborted) return;
+      timedOut = reason === "timeout";
+      aborted = reason === "abort";
+      killTree("SIGTERM");
+      forceKill = setTimeout(() => killTree("SIGKILL"), 5_000);
+      forceKill.unref();
+      forceResolve = setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.stdin.destroy();
+        finish(reason === "timeout" ? 124 : 130);
+      }, 6_000);
+      forceResolve.unref();
     };
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -61,20 +86,13 @@ export async function runCommand(
     if (options.input !== undefined) child.stdin.end(options.input);
     else child.stdin.end();
     if (options.timeoutMs) {
-      timeout = setTimeout(() => {
-        timedOut = true;
-        killTree("SIGTERM");
-        forceKill = setTimeout(() => killTree("SIGKILL"), 5_000);
-        forceKill.unref();
-        forceResolve = setTimeout(() => {
-          child.stdout.destroy();
-          child.stderr.destroy();
-          child.stdin.destroy();
-          finish(124);
-        }, 6_000);
-        forceResolve.unref();
-      }, options.timeoutMs);
+      timeout = setTimeout(() => terminate("timeout"), options.timeoutMs);
       timeout.unref();
+    }
+    if (options.signal) {
+      abortListener = () => terminate("abort");
+      if (options.signal.aborted) abortListener();
+      else options.signal.addEventListener("abort", abortListener, { once: true });
     }
   });
 }

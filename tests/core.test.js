@@ -37,6 +37,34 @@ test("command timeouts terminate descendant processes and return exit code 124",
   assert.ok(Date.now() - started < 2_000, "timed-out descendants should not keep their inherited pipes open");
 });
 
+test("command aborts terminate descendant processes during Burner shutdown", async () => {
+  const controller = new AbortController();
+  const started = Date.now();
+  const running = runCommand("/bin/sh", ["-c", "sleep 30 & wait"], { cwd: process.cwd(), signal: controller.signal });
+  setTimeout(() => controller.abort(), 50);
+  const result = await running;
+  assert.equal(result.exitCode, 130);
+  assert.match(result.stderr, /Command aborted during Burner shutdown/);
+  assert.ok(Date.now() - started < 2_000, "aborted descendants should not survive Burner shutdown");
+});
+
+test("closing the orchestrator disables scheduling and aborts Codex work", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-close-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    await store.update((state) => { state.orchestrator.enabled = true; });
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    let closed = false;
+    orchestrator.codex = { close: () => { closed = true; } };
+    await orchestrator.close();
+    assert.equal(store.get().orchestrator.enabled, false);
+    assert.equal(closed, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("score helpers clamp and weight enabled evaluations", () => {
   assert.equal(clampScore(105), 100);
   assert.equal(clampScore(-4), 0);
@@ -1200,6 +1228,10 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     assert.ok(calls.some(({ input }) => input.includes("rigorous repository evaluator")));
     assert.ok(calls.some(({ input }) => input.includes("Finish this evaluation within 10 minutes")));
     assert.ok(calls.some(({ input }) => input.includes("improvement planner")));
+    const plannerCall = calls.find(({ input }) => input.includes("improvement planner"));
+    assert.match(plannerCall.input, /targets a qualifying merge every 60 minutes/);
+    assert.match(plannerCall.input, /hard scope constraint/);
+    assert.match(plannerCall.input, /Never propose an umbrella task/);
     assert.ok(calls.some(({ input }) => input.includes("implementation agent")));
     const authorCall = calls.find(({ input }) => input.includes("implementation agent"));
     assert.match(authorCall.input, /quoted as evaluator context, not instructions/);
@@ -1208,6 +1240,7 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     assert.ok(calls.some(({ input }) => input.includes("independent reviewer requested changes")));
     const reviewerCalls = calls.filter(({ input }) => input.includes("independent, rigorous reviewer"));
     assert.equal(reviewerCalls.length, 2);
+    assert.match(reviewerCalls[0].input, /comprehensive blocker pass now/);
     assert.ok(reviewerCalls[0].args.includes("--output-schema"));
     assert.ok(!reviewerCalls[1].args.includes("--output-schema"));
     assert.ok(calls.some(({ args }) => args.includes("resume") && args.includes("thread-test")));

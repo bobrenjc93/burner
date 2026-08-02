@@ -271,6 +271,7 @@ export class Orchestrator {
     await this.store.update((state) => {
       state.orchestrator.enabled = false;
     });
+    this.codex.close();
   }
 
   async setEnabled(enabled: boolean): Promise<void> {
