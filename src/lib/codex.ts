@@ -91,8 +91,14 @@ function isInconclusiveCommandOutput(output: EvaluationOutput): boolean {
 export class CodexClient {
   private unrestrictedArgsPromise?: Promise<string[]>;
   private readonly abortController = new AbortController();
+  private readonly promptEvaluationTimeoutMs: number;
 
-  constructor(private readonly onProgress?: (message: string) => void) {}
+  constructor(
+    private readonly onProgress?: (message: string) => void,
+    options: { promptEvaluationTimeoutMs?: number } = {},
+  ) {
+    this.promptEvaluationTimeoutMs = Math.max(1, Math.min(15 * 60 * 1000, options.promptEvaluationTimeoutMs ?? 5 * 60 * 1000));
+  }
 
   close(): void {
     this.abortController.abort();
@@ -121,14 +127,14 @@ export class CodexClient {
     const prompt = [
       "You are a rigorous repository evaluator. Inspect the current repository state and answer the evaluation below.",
       "Base the score on concrete evidence from code, tests, configuration, and user-facing behavior. Do not edit any files.",
-      "Finish this evaluation within 10 minutes. Inspect targeted, representative evidence for every rubric category; do not exhaustively read every file or narrate intermediate progress.",
+      "Finish this evaluation within 4 minutes. Inspect targeted, representative evidence for every rubric category; do not exhaustively read every file or narrate intermediate progress.",
       "Use no more than 12 shell commands. Reserve enough time to return the required structured result; concise evidence is preferred over exhaustive evidence.",
       "A score of 100 means genuinely exceptional and production-ready. Be calibrated, concise, and actionable.",
       `Evaluation: ${evaluation.name}`,
       evaluation.prompt,
       `Context: ${context === "agent" || context === "composite" ? "This is a candidate branch; assess only its current state." : "This is the current project baseline."}`,
     ].join("\n\n");
-    const output = await this.structured<EvaluationOutput>(cwd, prompt, evaluationSchema, settings.evaluatorModel);
+    const output = await this.structured<EvaluationOutput>(cwd, prompt, evaluationSchema, settings.evaluatorModel, this.promptEvaluationTimeoutMs);
     return this.normalizeEvaluation(output);
   }
 
@@ -279,6 +285,7 @@ export class CodexClient {
     prompt: string,
     schema: object,
     model: string,
+    timeoutMs = 15 * 60 * 1000,
   ): Promise<T> {
     const tempDir = await mkdtemp(join(tmpdir(), "burner-codex-"));
     const schemaPath = join(tempDir, "schema.json");
@@ -290,7 +297,7 @@ export class CodexClient {
       let result = await this.runCodex(args, {
         cwd,
         input: prompt,
-        timeoutMs: 15 * 60 * 1000,
+        timeoutMs,
         onStderr: (line) => this.onProgress?.(line),
       });
       if (result.exitCode !== 0 && result.exitCode !== 124) {
@@ -300,7 +307,7 @@ export class CodexClient {
         result = await this.runCodex(fallbackArgs, {
           cwd,
           input: this.schemaFallbackPrompt(prompt, schema),
-          timeoutMs: 15 * 60 * 1000,
+          timeoutMs,
           onStderr: (line) => this.onProgress?.(line),
         });
       }

@@ -65,6 +65,28 @@ test("closing the orchestrator disables scheduling and aborts Codex work", async
   }
 });
 
+test("prompt evaluators fail early enough to leave targeted retry headroom", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-evaluator-timeout-test-"));
+  const bin = join(root, "bin");
+  await import("node:fs/promises").then((fs) => fs.mkdir(bin));
+  const executable = join(bin, "codex");
+  await writeFile(executable, `#!/usr/bin/env node\nconst args=process.argv.slice(2);if(args.includes("--help")){console.log("  --dangerously-bypass-approvals-and-sandbox  unrestricted");process.exit(0);}setTimeout(()=>{},30000);\n`);
+  await chmod(executable, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath}`;
+  try {
+    const codex = new CodexClient(undefined, { promptEvaluationTimeoutMs: 50 });
+    const evaluation = { id: "quality", name: "Quality", prompt: "Score quality", weight: 1, enabled: true, createdAt: new Date().toISOString() };
+    const settings = { parallelism: 1, evaluationIntervalMinutes: 30, orchestratorIntervalMinutes: 15, autoRun: false, autoCreatePrs: true, evaluatorModel: "", agentModel: "", baseBranch: "main", remote: "origin", defaultResources: [], maxReviewRounds: 8, portfolioReviewRounds: 8, mergeCadenceMinutes: 60, preferLivingComposite: true, compositeAbsorbThreshold: 0 };
+    const started = Date.now();
+    await assert.rejects(() => codex.evaluate(root, evaluation, settings, "manual"), /Command timed out after 50ms/);
+    assert.ok(Date.now() - started < 2_000, "a stuck evaluator must fail early enough for the suite's targeted retry");
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("score helpers clamp and weight enabled evaluations", () => {
   assert.equal(clampScore(105), 100);
   assert.equal(clampScore(-4), 0);
@@ -1226,7 +1248,7 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
       assert.ok(!args.some((arg) => /sandbox_mode|approval_policy|read-only|workspace-write/.test(arg)));
     }
     assert.ok(calls.some(({ input }) => input.includes("rigorous repository evaluator")));
-    assert.ok(calls.some(({ input }) => input.includes("Finish this evaluation within 10 minutes")));
+    assert.ok(calls.some(({ input }) => input.includes("Finish this evaluation within 4 minutes")));
     assert.ok(calls.some(({ input }) => input.includes("improvement planner")));
     const plannerCall = calls.find(({ input }) => input.includes("improvement planner"));
     assert.match(plannerCall.input, /targets a qualifying merge every 60 minutes/);
