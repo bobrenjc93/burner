@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { compositeRevisionHeadroom, inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentReviewCadenceHeadroom, compositeRevisionHeadroom, inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
@@ -256,6 +256,61 @@ test("composite evaluation revisions reserve enough merge-cadence headroom", () 
   assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 49 * 60_000), { allowed: true, remainingMs: 11 * 60_000, reserveMs: 10 * 60_000 });
   assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 51 * 60_000), { allowed: false, remainingMs: 9 * 60_000, reserveMs: 10 * 60_000 });
   assert.equal(compositeRevisionHeadroom(undefined, 60).allowed, true);
+});
+
+test("YOLO yields a long review loop while an approved fallback can still use the merge reserve", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-review-cadence-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const currentTime = Date.now();
+    const timestamp = new Date(currentTime).toISOString();
+    const approvedRound = { id: "approved-review", round: 1, commit: "fallback-head", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp };
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 41 * 60_000).toISOString();
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.agentRuns = [
+        {
+          id: "fallback", ideaId: "fallback-idea", status: "completed", branch: "burner/fallback", worktree: "", startedAt: timestamp, completedAt: timestamp,
+          prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base", deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 81, delta: 1 }],
+          impact: 1, resources: [], reviewRounds: [approvedRound], reviewApproved: true,
+        },
+        {
+          id: "current", ideaId: "current-idea", status: "reviewing", branch: "burner/current", worktree: root, startedAt: timestamp,
+          baseCommit: "base", deltas: [], resources: [], reviewRounds: [], reviewApproved: false,
+        },
+      ];
+    });
+
+    assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
+      allowed: false,
+      remainingMs: 19 * 60_000,
+      requiredMs: 20 * 60_000,
+    });
+
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    let reviewed = false;
+    orchestrator.codex = { review: async () => { reviewed = true; throw new Error("review should not start"); } };
+    await assert.rejects(
+      () => orchestrator.reviewAgent(root, "current", "Current", "main", "thread", store.get().settings),
+      /yielded its slot to preserve the merge cadence reserve/,
+    );
+    assert.equal(reviewed, false, "cadence yield must happen before another expensive review starts");
+
+    await store.update((state) => {
+      const fallback = state.agentRuns.find((run) => run.id === "fallback");
+      fallback.deltas = [{ evaluationId: "quality", name: "Quality", before: 80, after: 79, delta: -1 }];
+      fallback.impact = -1;
+    });
+    assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
+      allowed: true,
+      remainingMs: 19 * 60_000,
+      requiredMs: 0,
+    }, "a reviewed but regressing fallback must not cause Burner to abandon the only other candidate");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("resuming the orchestrator does not force a redundant fresh baseline", async () => {
