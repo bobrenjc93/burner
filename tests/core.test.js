@@ -865,6 +865,56 @@ test("YOLO starts a partial cook early enough for the observed full suite to mee
   }
 });
 
+test("YOLO cooks validated leaves before another observed leaf cycle can consume the merge reserve", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-authoring-headroom-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const now = Date.now();
+    const timestamp = new Date(now).toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    const leaf = (id, number, startedMinutesAgo, completedMinutesAgo) => ({
+      id,
+      ideaId: `idea-${id}`,
+      status: "completed",
+      branch: `branch-${id}`,
+      worktree: "",
+      startedAt: new Date(now - startedMinutesAgo * 60_000).toISOString(),
+      completedAt: new Date(now - completedMinutesAgo * 60_000).toISOString(),
+      prUrl: `https://example.test/pull/${number}`,
+      prNumber: number,
+      prState: "open",
+      baseCommit: "base",
+      deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 81, delta: 1 }],
+      impact: 1,
+      resources: [],
+      reviewRounds: [approvedRound],
+      reviewApproved: true,
+    });
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.mergeWindowStartedAt = new Date(now - 35 * 60_000).toISOString();
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.agentRuns = [leaf("first", 1, 30, 10), leaf("second", 2, 18, 1)];
+      state.ideas.push(
+        { id: "idea-first", title: "First", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "first" },
+        { id: "idea-second", title: "Second", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "second" },
+      );
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    assert.equal(orchestrator.mergeCadenceDue(), false);
+    assert.equal(orchestrator.portfolioCookDue(store.get(), "base"), true, "a recent 20-minute leaf must not be launched with only 25 minutes left");
+    let cooked;
+    orchestrator.createComposite = async (...args) => { cooked = args; return {}; };
+    assert.equal(await orchestrator.autoCookNext(), true);
+    assert.deepEqual(cooked[0], ["first", "second"]);
+    assert.match(cooked[2], /shortened this batch early enough/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("YOLO cadence cooks a healthy partial batch and falls back to one reviewed leaf", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-cadence-test-"));
   try {

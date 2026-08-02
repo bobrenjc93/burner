@@ -253,7 +253,7 @@ export class Orchestrator {
     return Boolean(anchor && Date.now() - new Date(anchor).getTime() >= state.settings.mergeCadenceMinutes * 60_000);
   }
 
-  private portfolioCookDue(state = this.store.get()): boolean {
+  private portfolioCookDue(state = this.store.get(), baseCommit?: string): boolean {
     if (!this.portfolioMode()) return false;
     const anchor = state.orchestrator.mergeWindowStartedAt;
     if (!anchor) return false;
@@ -267,8 +267,21 @@ export class Orchestrator {
       else promptMs = Math.max(promptMs, duration);
     }
     const observedLeadMs = commandMs + promptMs + 5 * 60_000;
-    const leadMs = Math.min(Math.max(5 * 60_000, observedLeadMs), Math.max(0, cadenceMs - 5 * 60_000));
-    return Date.now() - new Date(anchor).getTime() >= cadenceMs - leadMs;
+    const revisionReserveMs = compositeRevisionHeadroom(anchor, state.settings.mergeCadenceMinutes).reserveMs;
+    const leadMs = Math.min(Math.max(revisionReserveMs, observedLeadMs), Math.max(0, cadenceMs - 5 * 60_000));
+    const elapsedMs = Date.now() - new Date(anchor).getTime();
+    if (elapsedMs >= cadenceMs - leadMs) return true;
+    if (!baseCommit || selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0) return false;
+
+    const recentLeafDurations = state.agentRuns
+      .filter((run) => run.baseCommit === baseCommit && run.completedAt)
+      .sort((left, right) => new Date(right.completedAt!).getTime() - new Date(left.completedAt!).getTime())
+      .slice(0, 3)
+      .map((run) => new Date(run.completedAt!).getTime() - new Date(run.startedAt).getTime())
+      .filter((duration) => Number.isFinite(duration) && duration >= 0);
+    const estimatedLeafMs = Math.max(5 * 60_000, ...recentLeafDurations);
+    const remainingMs = cadenceMs - elapsedMs;
+    return remainingMs <= leadMs + estimatedLeafMs;
   }
 
   private portfolioReviewLimit(settings: BurnerState["settings"]): number {
@@ -396,7 +409,7 @@ export class Orchestrator {
     let state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const cadenceDue = this.mergeCadenceDue(state);
-    const cookDue = this.portfolioCookDue(state);
+    const cookDue = this.portfolioCookDue(state, baseCommit);
     const failedCurrentGeneration = state.composites.some((composite) => composite.status === "failed" && composite.baseCommit === baseCommit);
     const cadenceNeedsSingleLeaf = failedCurrentGeneration || ((cadenceDue || cookDue) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0);
     let candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf);
@@ -523,7 +536,7 @@ export class Orchestrator {
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const cadenceDue = this.mergeCadenceDue(state);
-    const cookDue = cadenceDue || this.portfolioCookDue(state);
+    const cookDue = cadenceDue || this.portfolioCookDue(state, baseCommit);
     const leafIds = selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, cookDue ? 2 : this.yoloBatchSize);
     if (!leafIds.length) return false;
     const generation = state.composites.length + 1;
@@ -542,7 +555,7 @@ export class Orchestrator {
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const cadenceDue = this.mergeCadenceDue(state);
-    const cookDue = cadenceDue || this.portfolioCookDue(state);
+    const cookDue = cadenceDue || this.portfolioCookDue(state, baseCommit);
     const eligible = eligibleYoloLeaves(state, baseCommit);
     const selected = cookDue
       ? eligible.slice(0, this.yoloBatchSize).map((run) => run.id)
