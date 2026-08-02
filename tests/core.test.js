@@ -873,6 +873,25 @@ test("YOLO portfolio waits for a full leaf batch, ranks impact, and reserves com
   assert.deepEqual(selectYoloLeafBatch(state, "base", 3), ["a2", "a3", "a4"]);
 });
 
+test("YOLO portfolio never recooks an identical failed source set", () => {
+  const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
+  const deltas = [{ evaluationId: "speed", name: "Speed", before: 80, after: 81, delta: 1 }];
+  const leaf = (id, impact) => ({ id, status: "completed", prState: "open", prNumber: Number(id.slice(1)), baseCommit: "base", reviewApproved: true, reviewRounds: [approvedRound], deltas, impact });
+  const source = (agentRunId) => ({ agentRunId, kind: "pull_request", branch: `branch-${agentRunId}` });
+  const state = {
+    settings: { compositeAbsorbThreshold: 0 },
+    evaluations: [{ id: "speed", enabled: true, command: "./benchmark" }],
+    composites: [{ id: "failed", status: "failed", baseCommit: "base", sources: [source("a1"), source("a2"), source("a3")] }],
+    agentRuns: [leaf("a1", 9), leaf("a2", 8), leaf("a3", 7)],
+  };
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 3), [], "the identical three-leaf tree must remain tombstoned");
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 3, 2), ["a1", "a2"], "deadline recovery may try a genuinely smaller tree");
+  state.agentRuns.push(leaf("a4", 6));
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 3), ["a1", "a2", "a4"], "new work may replace one failed source");
+  state.composites[0].baseCommit = "old-base";
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 3), ["a1", "a2", "a3"], "failed sets do not leak across base commits");
+});
+
 test("YOLO leaf batches tolerate negative prompt impact but never command regressions", () => {
   const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
   const state = {

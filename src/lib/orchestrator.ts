@@ -106,10 +106,35 @@ function eligibleYoloLeaves(state: BurnerState, baseCommit: string): AgentRun[] 
     .sort((a, b) => (b.impact ?? -Infinity) - (a.impact ?? -Infinity));
 }
 
+function sourceSetSignature(agentRunIds: readonly string[]): string {
+  return [...agentRunIds].sort().join("\u0000");
+}
+
+function failedYoloSourceSets(state: BurnerState, baseCommit: string): Set<string> {
+  return new Set(state.composites
+    .filter((composite) => composite.status === "failed" && composite.baseCommit === baseCommit && composite.sources.length >= 2)
+    .map((composite) => sourceSetSignature(composite.sources.map((source) => source.agentRunId))));
+}
+
 export function selectYoloLeafBatch(state: BurnerState, baseCommit: string, batchSize: number, minimumSize = batchSize): string[] {
   if (batchSize < 2 || minimumSize < 2) return [];
   const eligible = eligibleYoloLeaves(state, baseCommit);
-  return eligible.length >= minimumSize ? eligible.slice(0, batchSize).map((run) => run.id) : [];
+  if (eligible.length < minimumSize) return [];
+  const failedSourceSets = failedYoloSourceSets(state, baseCommit);
+  const maximumSize = Math.min(batchSize, eligible.length);
+  for (let size = maximumSize; size >= minimumSize; size -= 1) {
+    const indices = Array.from({ length: size }, (_unused, index) => index);
+    while (true) {
+      const ids = indices.map((index) => eligible[index]!.id);
+      if (!failedSourceSets.has(sourceSetSignature(ids))) return ids;
+      let cursor = size - 1;
+      while (cursor >= 0 && indices[cursor] === eligible.length - size + cursor) cursor -= 1;
+      if (cursor < 0) break;
+      indices[cursor] += 1;
+      for (let index = cursor + 1; index < size; index += 1) indices[index] = indices[index - 1]! + 1;
+    }
+  }
+  return [];
 }
 
 export function partitionReviewFallbacks(agentRunIds: string[], originalSize: number): string[][] {
