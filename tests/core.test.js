@@ -672,7 +672,8 @@ test("GitHub merge waits for the pushed head and retries transient not-mergeable
   const head = "0123456789abcdef0123456789abcdef01234567";
   const executable = join(bin, "gh");
   await writeFile(executable, `#!/usr/bin/env node
-const fs=require("fs");const args=process.argv.slice(2);const path=process.env.BURNER_TEST_GH_STATE;const state=fs.existsSync(path)?JSON.parse(fs.readFileSync(path,"utf8")):{views:0,merges:0};
+const fs=require("fs");const args=process.argv.slice(2);const path=process.env.BURNER_TEST_GH_STATE;const state=fs.existsSync(path)?JSON.parse(fs.readFileSync(path,"utf8")):{views:0,checkViews:0,merges:0};
+if(args[0]==="pr"&&args[1]==="view"&&args.includes("state,headRefOid,statusCheckRollup")){state.checkViews++;fs.writeFileSync(path,JSON.stringify(state));const pending=state.checkViews===1;const failed=process.env.BURNER_TEST_CHECK_FAIL==="1";const checks=process.env.BURNER_TEST_NO_CHECKS==="1"?[]:[{__typename:"CheckRun",name:"CI",status:pending?"IN_PROGRESS":"COMPLETED",conclusion:pending?null:failed?"FAILURE":"SUCCESS"}];console.log(JSON.stringify({state:"OPEN",headRefOid:process.env.BURNER_TEST_HEAD,statusCheckRollup:checks}));process.exit(0);}
 if(args[0]==="pr"&&args[1]==="view"){state.views++;fs.writeFileSync(path,JSON.stringify(state));const mergeable=process.env.BURNER_TEST_CONFLICT==="1"?"CONFLICTING":state.views===1?"UNKNOWN":"MERGEABLE";console.log(JSON.stringify({state:"OPEN",mergeable,headRefOid:process.env.BURNER_TEST_HEAD}));process.exit(0);}
 if(args[0]==="pr"&&args[1]==="merge"){state.merges++;fs.writeFileSync(path,JSON.stringify(state));if(state.merges===1){console.error("GraphQL: Pull Request is not mergeable (mergePullRequest)");process.exit(1);}process.exit(0);}
 process.exit(0);
@@ -683,17 +684,27 @@ process.exit(0);
   process.env.BURNER_TEST_GH_STATE = statePath;
   process.env.BURNER_TEST_HEAD = head;
   try {
-    const git = new GitService(root, join(root, ".burner"), { attempts: 4, intervalMs: 0, mergeAttempts: 2 });
+    const git = new GitService(root, join(root, ".burner"), { attempts: 4, intervalMs: 0, mergeAttempts: 2, checkAttempts: 4, noCheckGraceAttempts: 2 });
     await git.mergePr(root, 42, head);
-    assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")), { views: 3, merges: 2 });
+    assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")), { views: 3, checkViews: 3, merges: 2 });
     process.env.BURNER_TEST_CONFLICT = "1";
     await assert.rejects(() => git.mergePr(root, 43, head), /conflicts with its base branch/);
     assert.equal(JSON.parse(await readFile(statePath, "utf8")).merges, 2, "a real conflict must not call merge");
+    process.env.BURNER_TEST_CONFLICT = "0";
+    process.env.BURNER_TEST_CHECK_FAIL = "1";
+    await assert.rejects(() => git.mergePr(root, 44, head), /required check failed.*Burner will not merge a failing head/);
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).merges, 2, "a failed check must not call merge");
+    process.env.BURNER_TEST_CHECK_FAIL = "0";
+    process.env.BURNER_TEST_NO_CHECKS = "1";
+    await git.mergePr(root, 45, head);
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).merges, 3, "a repository with no checks may merge after the grace period");
   } finally {
     process.env.PATH = previousPath;
     delete process.env.BURNER_TEST_GH_STATE;
     delete process.env.BURNER_TEST_HEAD;
     delete process.env.BURNER_TEST_CONFLICT;
+    delete process.env.BURNER_TEST_CHECK_FAIL;
+    delete process.env.BURNER_TEST_NO_CHECKS;
     await rm(root, { recursive: true, force: true });
   }
 });

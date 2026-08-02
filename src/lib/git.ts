@@ -11,6 +11,21 @@ type PullRequestMergeStatus = {
   headRefOid: string;
 };
 
+type PullRequestCheck = {
+  __typename?: string;
+  name?: string;
+  context?: string;
+  status?: string;
+  conclusion?: string;
+  state?: string;
+};
+
+type PullRequestCheckStatus = {
+  state: "OPEN" | "CLOSED" | "MERGED";
+  headRefOid: string;
+  statusCheckRollup: PullRequestCheck[];
+};
+
 const wait = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 
 export class GitService {
@@ -19,7 +34,7 @@ export class GitService {
   constructor(
     readonly root: string,
     private readonly dataDir: string,
-    private readonly mergePolling: { attempts?: number; intervalMs?: number; mergeAttempts?: number } = {},
+    private readonly mergePolling: { attempts?: number; intervalMs?: number; mergeAttempts?: number; checkAttempts?: number; noCheckGraceAttempts?: number } = {},
   ) {}
 
   async status(): Promise<{ available: boolean; branch?: string; commit?: string; dirty?: boolean }> {
@@ -223,6 +238,7 @@ export class GitService {
         await this.markPrDisposition(cwd, number, "merged").catch(() => undefined);
         return;
       }
+      await this.waitForPrChecks(cwd, number, expectedHead);
       const result = await runCommand("gh", ["pr", "merge", String(number), "--merge"], { cwd, timeoutMs: 10 * 60 * 1000 });
       if (result.exitCode === 0) {
         await this.markPrDisposition(cwd, number, "merged").catch(() => undefined);
@@ -234,6 +250,50 @@ export class GitService {
       await wait(this.mergePolling.intervalMs ?? 2_500);
     }
     throw new Error(lastError || `Could not merge PR #${number}`);
+  }
+
+  private async waitForPrChecks(cwd: string, number: number, expectedHead: string): Promise<void> {
+    const attempts = this.mergePolling.checkAttempts ?? 120;
+    const noCheckGraceAttempts = Math.min(attempts, this.mergePolling.noCheckGraceAttempts ?? 4);
+    const intervalMs = this.mergePolling.intervalMs ?? 2_500;
+    let lastPending: string[] = [];
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const result = await runCommand(
+        "gh",
+        ["pr", "view", String(number), "--json", "state,headRefOid,statusCheckRollup"],
+        { cwd, timeoutMs: 2 * 60 * 1000 },
+      );
+      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not inspect PR #${number} checks`);
+      const status = JSON.parse(result.stdout) as PullRequestCheckStatus;
+      if (status.state === "MERGED") return;
+      if (status.state !== "OPEN") throw new Error(`PR #${number} is ${status.state.toLowerCase()} instead of open.`);
+      if (status.headRefOid !== expectedHead) {
+        if (attempt < attempts) { await wait(intervalMs); continue; }
+        throw new Error(`PR #${number} checks never observed expected head ${expectedHead.slice(0, 8)} (observed ${status.headRefOid?.slice(0, 8) || "unknown"}).`);
+      }
+      const checks = status.statusCheckRollup ?? [];
+      if (!checks.length) {
+        if (attempt >= noCheckGraceAttempts) return;
+        await wait(intervalMs);
+        continue;
+      }
+      const failures: string[] = [];
+      const pending: string[] = [];
+      for (const check of checks) {
+        const name = check.name ?? check.context ?? check.__typename ?? "unnamed check";
+        const outcome = String(check.conclusion ?? check.state ?? "").toUpperCase();
+        const execution = String(check.status ?? "").toUpperCase();
+        if (["SUCCESS", "NEUTRAL", "SKIPPED"].includes(outcome)) continue;
+        if (["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"].includes(outcome)) failures.push(name);
+        else if (execution === "COMPLETED") failures.push(name);
+        else pending.push(name);
+      }
+      if (failures.length) throw new Error(`PR #${number} required check${failures.length === 1 ? "" : "s"} failed at ${expectedHead.slice(0, 8)}: ${failures.join(", ")}. Burner will not merge a failing head.`);
+      if (!pending.length) return;
+      lastPending = pending;
+      if (attempt < attempts) await wait(intervalMs);
+    }
+    throw new Error(`PR #${number} checks did not finish at ${expectedHead.slice(0, 8)}: ${lastPending.join(", ") || "status unavailable"}.`);
   }
 
   private async waitForPrMergeability(cwd: string, number: number, expectedHead: string): Promise<PullRequestMergeStatus> {
