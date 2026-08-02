@@ -1054,6 +1054,71 @@ test("YOLO cadence cooks a healthy partial batch and falls back to one reviewed 
   }
 });
 
+test("hard composite merge-gate failures retire the unchanged head instead of retrying in a loop", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-composite-merge-gate-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp };
+    await store.update((state) => {
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.composites.push({
+        id: "composite", title: "Composite", description: "", status: "open", branch: "burner/composite", worktree: "", baseCommit: "base",
+        sources: [], deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 81, delta: 1 }], compositeScore: 81, impact: 1,
+        reviewRounds: [approvedRound], reviewApproved: true, prNumber: 234, prUrl: "https://example.test/pull/234", createdAt: timestamp, updatedAt: timestamp, isLiving: true,
+      });
+      state.orchestrator.livingCompositeId = "composite";
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    let attempts = 0;
+    orchestrator.mergeComposite = async () => { attempts += 1; throw new Error("required check failed at stamped-head"); };
+
+    assert.equal(await orchestrator.autoMergeNext(), true);
+    assert.equal(store.get().composites[0].status, "failed");
+    assert.equal(store.get().composites[0].isLiving, false);
+    assert.equal(store.get().orchestrator.livingCompositeId, undefined);
+    assert.match(store.get().composites[0].error, /required check failed/);
+    assert.equal(store.get().activity.filter((item) => item.message === "Merge gate blocked PR #234").length, 1);
+    assert.equal(await orchestrator.autoMergeNext(), false);
+    assert.equal(attempts, 1, "the same failed head must not be retried automatically");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("hard direct-leaf merge-gate failures quarantine the leaf instead of retrying in a loop", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-leaf-merge-gate-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp };
+    await store.update((state) => {
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.agentRuns.push({
+        id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp,
+        prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base",
+        deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 81, delta: 1 }], impact: 1, resources: [], reviewRounds: [approvedRound], reviewApproved: true,
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 1 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    let attempts = 0;
+    orchestrator.mergeAgent = async () => { attempts += 1; throw new Error("required check failed at stamped-head"); };
+
+    assert.equal(await orchestrator.autoMergeNext(), true);
+    assert.equal(store.get().agentRuns[0].status, "failed");
+    assert.ok(store.get().agentRuns[0].quarantinedAt);
+    assert.match(store.get().agentRuns[0].quarantineReason, /Merge gate rejected PR #10/);
+    assert.equal(await orchestrator.autoMergeNext(), false);
+    assert.equal(attempts, 1, "the same failed leaf head must not be retried automatically");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("cadence-driven single leaves receive full evaluation validation before merge", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-full-leaf-validation-test-"));
   try {

@@ -490,9 +490,41 @@ export class Orchestrator {
       message: `YOLO approved PR #${candidate.prNumber} for merge`,
       detail: `Reviewer approved; all enabled evaluations completed, deterministic checks did not regress, and weighted impact is +${candidate.impact.toFixed(1)}.`,
     });
-    if (candidate.kind === "composite") await this.mergeComposite(candidate.id);
-    else await this.mergeAgent(candidate.id);
+    try {
+      if (candidate.kind === "composite") await this.mergeComposite(candidate.id);
+      else await this.mergeAgent(candidate.id);
+    } catch (error) {
+      await this.recordMergeGateFailure(candidate, error);
+    }
     return true;
+  }
+
+  private async recordMergeGateFailure(candidate: YoloMergeCandidate, error: unknown): Promise<void> {
+    const message = errorMessage(error);
+    const timestamp = now();
+    await this.store.update((state) => {
+      if (candidate.kind === "composite") {
+        const composite = state.composites.find((item) => item.id === candidate.id);
+        if (!composite) return;
+        Object.assign(composite, { status: "failed", isLiving: false, error: message, updatedAt: timestamp });
+        if (state.orchestrator.livingCompositeId === composite.id) state.orchestrator.livingCompositeId = undefined;
+        return;
+      }
+      const run = state.agentRuns.find((item) => item.id === candidate.id);
+      if (!run) return;
+      Object.assign(run, {
+        status: "failed",
+        error: message,
+        completedAt: timestamp,
+        quarantinedAt: timestamp,
+        quarantineReason: `Merge gate rejected PR #${candidate.prNumber}: ${message}`,
+      });
+    });
+    await this.store.addActivity({
+      type: "error",
+      message: `Merge gate blocked PR #${candidate.prNumber}`,
+      detail: `${message} The unchanged head is retired from automatic merge selection; Burner will release eligible fallback work.`,
+    });
   }
 
   private async fullyValidateLeafForMerge(runId: string, baseCommit: string): Promise<boolean> {
