@@ -204,6 +204,14 @@ export function agentReviewCadenceHeadroom(
   return { allowed: headroom.remainingMs > requiredMs, remainingMs: headroom.remainingMs, requiredMs };
 }
 
+export function assertCompositeEvaluationRevisionChanged(startCommit: string, endCommit: string, evaluationRevision: number): void {
+  if (startCommit !== endCommit) return;
+  throw new Error(
+    `Composite evaluation revision ${evaluationRevision} produced no committed code change. ` +
+    "Burner will not resample an identical tree until prompt noise happens to pass; the generation is preserved for fail-closed recovery.",
+  );
+}
+
 export class Orchestrator {
   private readonly git: GitService;
   private readonly locks: LockManager;
@@ -1886,6 +1894,7 @@ export class Orchestrator {
         integrationThreadId = revision.threadId;
         await this.assertCandidateDoesNotOwnProgress(worktree, revisionStartCommit);
         if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: address composite evaluation pass ${evaluationRevision}`);
+        assertCompositeEvaluationRevisionChanged(revisionStartCommit, await this.git.head(worktree), evaluationRevision);
         await this.updateComposite(compositeId, { authorThreadId: integrationThreadId, updatedAt: now() });
         const rereviewed = await this.reviewComposite(worktree, compositeId, composite.title, settings.baseBranch, integrationThreadId, settings);
         integrationThreadId = rereviewed.threadId;

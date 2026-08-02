@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentReviewCadenceHeadroom, compositeRevisionHeadroom, inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, compositeRevisionHeadroom, inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
@@ -256,6 +256,14 @@ test("composite evaluation revisions reserve enough merge-cadence headroom", () 
   assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 49 * 60_000), { allowed: true, remainingMs: 11 * 60_000, reserveMs: 10 * 60_000 });
   assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 51 * 60_000), { allowed: false, remainingMs: 9 * 60_000, reserveMs: 10 * 60_000 });
   assert.equal(compositeRevisionHeadroom(undefined, 60).allowed, true);
+});
+
+test("composite evaluation revisions fail closed instead of resampling an unchanged tree", () => {
+  assert.doesNotThrow(() => assertCompositeEvaluationRevisionChanged("before", "after", 1));
+  assert.throws(
+    () => assertCompositeEvaluationRevisionChanged("same", "same", 2),
+    /will not resample an identical tree until prompt noise happens to pass/,
+  );
 });
 
 test("YOLO yields a long review loop while an approved fallback can still use the merge reserve", async () => {
