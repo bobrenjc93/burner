@@ -228,6 +228,28 @@ export class Orchestrator {
     throw new Error(`Codex changed protected parent repository '${protectedRepository.root}'; Burner paused without reverting external files.`);
   }
 
+  private async assertCandidateDoesNotOwnProgress(cwd: string, sinceCommit: string): Promise<void> {
+    const [changed, status, readmeDiff] = await Promise.all([
+      runCommand("git", ["diff", "--name-only", sinceCommit, "--"], { cwd, timeoutMs: 10_000 }),
+      runCommand("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd, timeoutMs: 10_000 }),
+      runCommand("git", ["diff", sinceCommit, "--", "README.md"], { cwd, timeoutMs: 10_000 }),
+    ]);
+    if (changed.exitCode !== 0 || status.exitCode !== 0 || readmeDiff.exitCode !== 0) {
+      throw new Error("Could not verify Burner-owned progress boundaries in the candidate worktree.");
+    }
+    const paths = new Set([
+      ...changed.stdout.split("\n").map((path) => path.trim()).filter(Boolean),
+      ...status.stdout.split("\n").map((line) => line.slice(3).split(" -> ").at(-1)?.trim()).filter((path): path is string => Boolean(path)),
+    ]);
+    const forbidden = [...paths].filter((path) =>
+      /^docs\/burner-evaluation-(?:history\.json|progress\.svg)$/.test(path) ||
+      /^\.github\/workflows\/.*evaluation[-_]progress/i.test(path) ||
+      /^(?:scripts|tests)\/.*evaluation[-_]progress/i.test(path));
+    const managedReadmeChanged = /burner-progress:(?:start|end)|Burner evaluation progress/i.test(readmeDiff.stdout);
+    if (!forbidden.length && !managedReadmeChanged) return;
+    throw new Error(`Candidate attempted to own Burner's merge-coupled evaluation progress${forbidden.length ? ` via ${forbidden.join(", ")}` : " via the managed README section"}. Burner rejected these changes before commit; it stamps canonical progress artifacts after final evaluation.`);
+  }
+
   private async acquirePromptEvaluationSlot(): Promise<() => void> {
     const limit = 3;
     if (this.activePromptEvaluations >= limit) {
@@ -627,6 +649,7 @@ export class Orchestrator {
       let authorThreadId = run.authorThreadId;
       let lastMessage = run.lastMessage ?? "";
       if (unresolvedReview && !unresolvedReview.approved && unresolvedReview.findings.length) {
+        const revisionStartCommit = await this.git.head(run.worktree);
         const revision = await this.codex.revise(run.worktree, authorThreadId, this.normalizeReview({
           approved: false,
           summary: unresolvedReview.summary,
@@ -634,6 +657,7 @@ export class Orchestrator {
         }), state.settings);
         authorThreadId = revision.threadId;
         lastMessage = revision.message;
+        await this.assertCandidateDoesNotOwnProgress(run.worktree, revisionStartCommit);
         if (await this.git.hasChanges(run.worktree)) await this.git.commit(run.worktree, "burner: address final review feedback before retry");
         unresolvedReview.authorResponse = revision.message;
         unresolvedReview.completedAt = now();
@@ -1566,6 +1590,7 @@ export class Orchestrator {
       const currentIdea = this.store.get().ideas.find((item) => item.id === idea.id) ?? idea;
       const authorStartCommit = await this.git.head(worktree);
       const author = await this.codex.implement(worktree, currentIdea, this.store.get().evaluations, settings);
+      await this.assertCandidateDoesNotOwnProgress(worktree, authorStartCommit);
       const lastMessage = author.message;
       await this.updateAgent(runId, { lastMessage, authorThreadId: author.threadId });
       const hasUncommittedChanges = await this.git.hasChanges(worktree);
@@ -1740,8 +1765,12 @@ export class Orchestrator {
         }
       }
 
+      await this.assertCandidateDoesNotOwnProgress(worktree, baseCommit);
+
       await this.publishCompositeDraft(worktree, compositeId, "integrating the combined source branches", settings);
+      const integrationStartCommit = await this.git.head(worktree);
       const author = await this.codex.integrateComposite(worktree, composite.title, sourcesToMerge.map((source) => source.title), settings);
+      await this.assertCandidateDoesNotOwnProgress(worktree, integrationStartCommit);
       if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: integrate ${composite.title}`);
       await this.updateComposite(compositeId, { authorThreadId: author.threadId, updatedAt: now() });
       await this.publishCompositeDraft(worktree, compositeId, "integrating and awaiting independent review", settings);
@@ -1807,12 +1836,14 @@ export class Orchestrator {
         if (!findings.length) findings.push({ severity: "medium", title: "Composite has no measurable monotonic gain", detail: `Weighted impact is ${impact.toFixed(1)}; improve at least one enabled evaluation without regressing another.`, file: "" });
         await this.updateComposite(compositeId, { status: "revising", reviewApproved: false, updatedAt: now() });
         await this.publishCompositeDraft(worktree, compositeId, `revising evaluation regressions (pass ${evaluationRevision})`, settings);
+        const revisionStartCommit = await this.git.head(worktree);
         const revision = await this.codex.revise(worktree, integrationThreadId, {
           approved: false,
           summary: "The combined code passed review but failed its recalculated monotonic evaluation gate.",
           findings,
         }, settings);
         integrationThreadId = revision.threadId;
+        await this.assertCandidateDoesNotOwnProgress(worktree, revisionStartCommit);
         if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: address composite evaluation pass ${evaluationRevision}`);
         await this.updateComposite(compositeId, { authorThreadId: integrationThreadId, updatedAt: now() });
         const rereviewed = await this.reviewComposite(worktree, compositeId, composite.title, settings.baseBranch, integrationThreadId, settings);
@@ -1895,9 +1926,11 @@ export class Orchestrator {
       const currentRounds = this.store.get().agentRuns.find((run) => run.id === runId)?.reviewRounds.length ?? 0;
       if (currentRounds >= this.portfolioReviewLimit(revisionSettings)) break;
       await this.updateAgent(runId, { status: "revising" });
+      const revisionStartCommit = await this.git.head(cwd);
       const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), revisionSettings);
       currentThreadId = revision.threadId;
       message = revision.message;
+      await this.assertCandidateDoesNotOwnProgress(cwd, revisionStartCommit);
       if (await this.git.hasChanges(cwd)) await this.git.commit(cwd, `burner: address review round ${roundNumber}`);
       round.authorResponse = revision.message;
       round.completedAt = now();
@@ -1939,9 +1972,11 @@ export class Orchestrator {
       const currentRounds = this.store.get().composites.find((item) => item.id === compositeId)?.reviewRounds.length ?? 0;
       if (currentRounds >= this.portfolioReviewLimit(revisionSettings)) break;
       await this.updateComposite(compositeId, { status: "revising", updatedAt: now() });
+      const revisionStartCommit = await this.git.head(cwd);
       const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), revisionSettings);
       currentThreadId = revision.threadId;
       message = revision.message;
+      await this.assertCandidateDoesNotOwnProgress(cwd, revisionStartCommit);
       if (await this.git.hasChanges(cwd)) await this.git.commit(cwd, `burner: address composite review round ${roundNumber}`);
       round.authorResponse = revision.message;
       round.completedAt = now();

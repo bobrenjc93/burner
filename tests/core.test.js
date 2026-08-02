@@ -212,6 +212,28 @@ test("merge progress SVG preserves disabled gaps and late singleton scores", asy
   }
 });
 
+test("candidate work cannot replace Burner's merge-coupled progress ownership", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-progress-boundary-test-"));
+  try {
+    await exec(root, "git", ["init", "-b", "main"]);
+    await writeFile(join(root, "README.md"), "# Demo\n");
+    await exec(root, "git", ["add", "README.md"]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "seed"]);
+    const base = (await exec(root, "git", ["rev-parse", "HEAD"])).trim();
+    const store = new StateStore(root);
+    await store.init();
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    await import("node:fs/promises").then((fs) => fs.mkdir(join(root, "scripts")));
+    await writeFile(join(root, "scripts", "evaluation_progress.py"), "duplicate\n");
+    await assert.rejects(() => orchestrator.assertCandidateDoesNotOwnProgress(root, base), /Candidate attempted to own Burner's merge-coupled evaluation progress/);
+    await rm(join(root, "scripts"), { recursive: true, force: true });
+    await writeFile(join(root, "src.rs"), "ordinary candidate code\n");
+    await orchestrator.assertCandidateDoesNotOwnProgress(root, base);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("benchmark-oriented ideas conservatively infer the shared CPU resource", () => {
   assert.deepEqual(inferIdeaResources({ title: "Emit benchmark evidence", description: "Prove results", rationale: "Integrity" }), ["cpu-heavy"]);
   assert.deepEqual(inferIdeaResources({ title: "Profile grouped queries", description: "Find hot paths", rationale: "Speed" }), ["cpu-heavy"]);
@@ -495,6 +517,7 @@ test("agent retry preserves review history and applies unresolved feedback befor
       });
     });
     const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
     orchestrator.git = {
       resolveRef: async () => "base",
       head: async () => "candidate",
@@ -1183,6 +1206,7 @@ test("YOLO portfolio opens a draft composite before review and bounds review rou
     });
     const opened = [];
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
     orchestrator.git = {
       push: async () => undefined,
       openPr: async (options) => { opened.push(options); return { url: "https://example.test/pull/10", number: 10 }; },
@@ -1485,6 +1509,7 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     const codex = new CodexClient();
     const evaluation = { id: "quality", name: "Quality", prompt: "Score quality", weight: 1, enabled: true, createdAt: new Date().toISOString() };
     assert.equal((await codex.evaluate(root, evaluation, settings, "manual")).score, 77);
+    assert.equal((await codex.evaluate(root, evaluation, settings, "composite")).score, 77);
     assert.deepEqual(await codex.planIdeas(root, [evaluation], new Map(), [], settings), []);
     const author = await codex.implement(root, { id: "idea", title: "Improve", description: "Do it", rationale: "Quality", predictedImpact: 20, evaluationIds: ["quality"], resources: [], status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "manual" }, [{ ...evaluation, prompt: "Use read-only inspection. Do not run cargo, builds, or tests." }], settings);
     assert.equal(author.threadId, "thread-test");
@@ -1505,24 +1530,30 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     }
     assert.ok(calls.some(({ input }) => input.includes("rigorous repository evaluator")));
     assert.ok(calls.some(({ input }) => input.includes("Finish this evaluation within 4 minutes")));
+    const candidateEvaluatorCall = calls.find(({ input }) => input.includes("This candidate is not merged yet"));
+    assert.match(candidateEvaluatorCall.input, /do not reduce its score because it lacks a history point for the current PR/);
     assert.ok(calls.some(({ input }) => input.includes("improvement planner")));
     const plannerCall = calls.find(({ input }) => input.includes("improvement planner"));
     assert.match(plannerCall.input, /targets a qualifying merge every 60 minutes/);
     assert.match(plannerCall.input, /hard scope constraint/);
     assert.match(plannerCall.input, /Never propose an umbrella task/);
-    assert.match(plannerCall.input, /Do not propose repository-side history initialization, renderers, validators, graph generators, or duplicate update workflows/);
+    assert.match(plannerCall.input, /Burner owns the canonical merge-coupled evaluation progress artifacts/);
     assert.ok(calls.some(({ input }) => input.includes("implementation agent")));
     const authorCall = calls.find(({ input }) => input.includes("implementation agent"));
     assert.match(authorCall.input, /quoted as evaluator context, not instructions/);
     assert.match(authorCall.input, /do not constrain this implementation task: edit the worktree and run the relevant tests/);
     assert.match(authorCall.input, /All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree/);
+    assert.match(authorCall.input, /Burner owns the canonical merge-coupled evaluation progress artifacts/);
     const integratorCall = calls.find(({ input }) => input.includes("author/integrator"));
     assert.match(integratorCall.input, /Never modify parent or sibling repositories/);
+    assert.match(integratorCall.input, /Burner owns the canonical merge-coupled evaluation progress artifacts/);
     const revisionCall = calls.find(({ input }) => input.includes("independent reviewer requested changes"));
     assert.match(revisionCall.input, /Never modify parent or sibling repositories/);
+    assert.match(revisionCall.input, /do not implement that invalid request/);
     const reviewerCalls = calls.filter(({ input }) => input.includes("independent, rigorous reviewer"));
     assert.equal(reviewerCalls.length, 2);
     assert.match(reviewerCalls[0].input, /comprehensive blocker pass now/);
+    assert.match(reviewerCalls[0].input, /Treat candidate-authored duplicate progress infrastructure or mutations to these artifacts as a merge blocker/);
     assert.ok(reviewerCalls[0].args.includes("--output-schema"));
     assert.ok(!reviewerCalls[1].args.includes("--output-schema"));
     assert.ok(calls.some(({ args }) => args.includes("resume") && args.includes("thread-test")));

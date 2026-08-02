@@ -7,6 +7,7 @@ import { clampScore, errorMessage, parseJsonObject } from "./utils.js";
 
 const UNRESTRICTED_FLAG = "--dangerously-bypass-approvals-and-sandbox";
 const META_DISABLE_SANDBOX_FLAG = "--dangerously-disable-osx-sandbox";
+const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation progress artifacts: the managed README section, docs/burner-evaluation-history.json, and docs/burner-evaluation-progress.svg. Burner injects them only after final candidate scores are known. Do not create or modify those artifacts, and do not add repository-side progress generators, validators, tests, or workflows.";
 type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
 
 const evaluationSchema = {
@@ -132,6 +133,9 @@ export class CodexClient {
       "Finish this evaluation within 4 minutes. Inspect targeted, representative evidence for every rubric category; do not exhaustively read every file or narrate intermediate progress.",
       "Use no more than 12 shell commands. Reserve enough time to return the required structured result; concise evidence is preferred over exhaustive evidence.",
       "A score of 100 means genuinely exceptional and production-ready. Be calibrated, concise, and actionable.",
+      context === "agent" || context === "composite"
+        ? `${PROGRESS_OWNERSHIP} This candidate is not merged yet, so do not reduce its score because it lacks a history point for the current PR. Assess only previously merged history; Burner will add the current point atomically after every final score is available.`
+        : "This is a baseline evaluation; assess the progress artifacts currently committed in the repository.",
       `Evaluation: ${evaluation.name}`,
       evaluation.prompt,
       `Context: ${context === "agent" || context === "composite" ? "This is a candidate branch; assess only its current state." : "This is the current project baseline."}`,
@@ -200,7 +204,7 @@ export class CodexClient {
       "Optimize the evaluation scores below. Prefer high-leverage, reviewable changes over broad rewrites. Do not duplicate existing ideas. Do not edit files.",
       `Burner targets a qualifying merge every ${cadenceMinutes} minutes with ${settings.parallelism} parallel agent slot${settings.parallelism === 1 ? "" : "s"}. Each idea must be small enough for one author to implement, test, undergo repeated independent review, revise, and candidate-evaluate in about ${implementationBudgetMinutes} minutes.`,
       "This is a hard scope constraint: each idea must deliver one narrow, coherent capability with at most three concrete acceptance outcomes. Decompose foundations into independently useful increments. Never propose an umbrella task such as building an entire engine, service, UI, persistence layer, or end-to-end product in one branch.",
-      "Burner itself owns the merge-coupled README progress section, evaluation-history JSON, and SVG graph and injects those canonical artifacts immediately before every merge. Do not propose repository-side history initialization, renderers, validators, graph generators, or duplicate update workflows; the first successful product merge will create and score those artifacts automatically.",
+      `${PROGRESS_OWNERSHIP} Do not propose duplicate progress infrastructure; the first successful product merge creates the artifacts automatically.`,
       "Treat failed or quarantined existing ideas as evidence that their scope was too large or risky. Replace them only with strictly smaller, non-overlapping increments; do not rephrase and resubmit the same scope.",
       "predictedImpact is an expected 0-100 relative impact used for queue ordering. evaluationIds must use only IDs supplied below.",
       "resources lists shared scarce resources only when required (examples: gpu, cpu-heavy, device-ios). Use an empty list for normal work. Ideas sharing a resource will not run concurrently.",
@@ -231,6 +235,7 @@ export class CodexClient {
       "Implement the improvement below completely. Inspect the repository first, follow its local instructions, keep the scope reviewable, and run the most relevant tests or checks.",
       "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree. You may inspect external contracts read-only; if compatibility requires an external producer change, keep this branch hermetic and report that dependency instead of editing it.",
       "Do not create branches, commit, push, open a pull request, or modify anything under .burner; Burner handles delivery after you finish.",
+      PROGRESS_OWNERSHIP,
       `Title: ${idea.title}`,
       `Task: ${idea.description}`,
       `Why it matters: ${idea.rationale}`,
@@ -249,6 +254,7 @@ export class CodexClient {
       "Inspect the combined changes, resolve incomplete integration, and run the most relevant tests. Preserve every included pull request's intent while removing duplication or incompatibilities.",
       "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree. External contracts may be inspected read-only only.",
       "Do not create branches, commit, push, open pull requests, or modify anything under .burner; Burner owns delivery.",
+      PROGRESS_OWNERSHIP,
       `Composite: ${title}`,
       `Included changes:\n${sourceTitles.map((source) => `- ${source}`).join("\n")}`,
       "In the final response, summarize integration changes and checks.",
@@ -261,6 +267,7 @@ export class CodexClient {
       "An independent reviewer requested changes. Address every finding in the current worktree, run relevant checks, and leave the branch ready for another review.",
       "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree. If a finding depends on external behavior, use hermetic fixtures or document the dependency; do not patch the external producer.",
       "Do not commit, push, or open a pull request; Burner handles git delivery.",
+      `${PROGRESS_OWNERSHIP} If feedback asks for a current unmerged PR history point or duplicate progress infrastructure, do not implement that invalid request; explain that Burner stamps the point after final evaluation instead.`,
       `Review summary: ${review.summary}`,
       `Findings:\n${review.findings.map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.title}${finding.file ? ` (${finding.file})` : ""}: ${finding.detail}`).join("\n")}`,
       "If a finding is invalid, verify that carefully and explain it, but make all justified fixes.",
@@ -275,6 +282,7 @@ export class CodexClient {
       "Perform a comprehensive blocker pass now: inspect every changed subsystem against correctness boundaries, resource limits, public contracts, and tests, and report all material findings you can substantiate in this response. Do not deliberately defer a risk category to a later round.",
       "Findings must be merge blockers caused by or exposed by this change, not optional hardening or unrelated feature requests. On later rounds, verify prior fixes and the complete current diff without inventing new scope.",
       "Do not edit files. Keep findings concrete and actionable. Approval must be false whenever any finding requires an author change.",
+      `${PROGRESS_OWNERSHIP} Treat candidate-authored duplicate progress infrastructure or mutations to these artifacts as a merge blocker. Do not require a history point for the current unmerged PR.`,
       `Change under review: ${title}`,
       `Base branch: ${baseBranch}. Inspect the complete diff from this base to HEAD before deciding.`,
     ].join("\n\n");
