@@ -92,12 +92,14 @@ export class CodexClient {
   private unrestrictedArgsPromise?: Promise<string[]>;
   private readonly abortController = new AbortController();
   private readonly promptEvaluationTimeoutMs: number;
+  private readonly afterInvocation?: () => Promise<void>;
 
   constructor(
     private readonly onProgress?: (message: string) => void,
-    options: { promptEvaluationTimeoutMs?: number } = {},
+    options: { promptEvaluationTimeoutMs?: number; afterInvocation?: () => Promise<void> } = {},
   ) {
     this.promptEvaluationTimeoutMs = Math.max(1, Math.min(15 * 60 * 1000, options.promptEvaluationTimeoutMs ?? 5 * 60 * 1000));
+    this.afterInvocation = options.afterInvocation;
   }
 
   close(): void {
@@ -226,6 +228,7 @@ export class CodexClient {
     const prompt = [
       "You are an implementation agent working in an isolated git worktree for Burner.",
       "Implement the improvement below completely. Inspect the repository first, follow its local instructions, keep the scope reviewable, and run the most relevant tests or checks.",
+      "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree. You may inspect external contracts read-only; if compatibility requires an external producer change, keep this branch hermetic and report that dependency instead of editing it.",
       "Do not create branches, commit, push, open a pull request, or modify anything under .burner; Burner handles delivery after you finish.",
       `Title: ${idea.title}`,
       `Task: ${idea.description}`,
@@ -243,6 +246,7 @@ export class CodexClient {
     const prompt = [
       "You are the author/integrator for a composite Burner pull request in an isolated git worktree.",
       "Inspect the combined changes, resolve incomplete integration, and run the most relevant tests. Preserve every included pull request's intent while removing duplication or incompatibilities.",
+      "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree. External contracts may be inspected read-only only.",
       "Do not create branches, commit, push, open pull requests, or modify anything under .burner; Burner owns delivery.",
       `Composite: ${title}`,
       `Included changes:\n${sourceTitles.map((source) => `- ${source}`).join("\n")}`,
@@ -254,6 +258,7 @@ export class CodexClient {
   async revise(cwd: string, threadId: string, review: ReviewResult, settings: BurnerSettings): Promise<SessionResult> {
     const prompt = [
       "An independent reviewer requested changes. Address every finding in the current worktree, run relevant checks, and leave the branch ready for another review.",
+      "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree. If a finding depends on external behavior, use hermetic fixtures or document the dependency; do not patch the external producer.",
       "Do not commit, push, or open a pull request; Burner handles git delivery.",
       `Review summary: ${review.summary}`,
       `Findings:\n${review.findings.map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.title}${finding.file ? ` (${finding.file})` : ""}: ${finding.detail}`).join("\n")}`,
@@ -423,7 +428,9 @@ export class CodexClient {
 
   private async runCodex(args: string[], options: CodexCommandOptions): Promise<CommandResult> {
     const unrestrictedArgs = await this.unrestrictedArgs(options.cwd);
-    return runCommand("codex", [...unrestrictedArgs, ...args], { ...options, signal: this.abortController.signal });
+    const result = await runCommand("codex", [...unrestrictedArgs, ...args], { ...options, signal: this.abortController.signal });
+    await this.afterInvocation?.();
+    return result;
   }
 
   private preflightError(detail: string): string {

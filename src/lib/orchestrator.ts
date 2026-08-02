@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { realpath } from "node:fs/promises";
 import type { AgentRun, BurnerState, CompositePr, CompositeSource, Evaluation, EvaluationRun, Idea, ReviewRound, RuntimeStatus, ScoreDelta } from "../types.js";
 import { CodexClient, type ReviewResult, type SessionResult } from "./codex.js";
 import { EventHub } from "./events.js";
@@ -164,6 +165,44 @@ export class Orchestrator {
   private portfolioDraining = false;
   private activePromptEvaluations = 0;
   private readonly promptEvaluationWaiters: Array<() => void> = [];
+  private protectedParentRepository?: { root: string; excludedTarget: string; snapshot: string };
+  private boundaryTripped = false;
+
+  private async repositorySnapshot(root: string, excludedTarget: string): Promise<string> {
+    const excludePathspec = `:(exclude)${excludedTarget}`;
+    const [status, diff] = await Promise.all([
+      runCommand("git", ["status", "--porcelain=v1", "--untracked-files=all", "--", ".", excludePathspec], { cwd: root, timeoutMs: 10_000 }),
+      runCommand("git", ["diff", "--binary", "HEAD", "--", ".", excludePathspec], { cwd: root, timeoutMs: 10_000 }),
+    ]);
+    if (status.exitCode !== 0 || diff.exitCode !== 0) throw new Error(`Could not snapshot protected parent repository '${root}'.`);
+    return `${status.stdout}\0${diff.stdout}`;
+  }
+
+  private async initializeProtectedParentRepository(): Promise<void> {
+    const parent = dirname(this.root);
+    const discovered = await runCommand("git", ["rev-parse", "--show-toplevel"], { cwd: parent, timeoutMs: 10_000 });
+    if (discovered.exitCode !== 0) return;
+    const outerRoot = await realpath(resolve(discovered.stdout.trim()));
+    const targetRoot = await realpath(resolve(this.root));
+    if (outerRoot === targetRoot || !targetRoot.startsWith(`${outerRoot}${sep}`)) return;
+    const excludedTarget = relative(outerRoot, targetRoot).split(sep).join("/");
+    this.protectedParentRepository = { root: outerRoot, excludedTarget, snapshot: await this.repositorySnapshot(outerRoot, excludedTarget) };
+  }
+
+  private async assertProtectedParentUnchanged(): Promise<void> {
+    const protectedRepository = this.protectedParentRepository;
+    if (!protectedRepository || this.boundaryTripped) return;
+    if (await this.repositorySnapshot(protectedRepository.root, protectedRepository.excludedTarget) === protectedRepository.snapshot) return;
+    this.boundaryTripped = true;
+    await this.store.update((state) => { state.orchestrator.enabled = false; });
+    await this.store.addActivity({
+      type: "error",
+      message: "Codex crossed the target worktree boundary",
+      detail: `A Codex invocation changed protected parent repository ${protectedRepository.root}. Burner paused immediately and left those external changes untouched for inspection.`,
+    });
+    this.events.emit("state", this.store.get());
+    throw new Error(`Codex changed protected parent repository '${protectedRepository.root}'; Burner paused without reverting external files.`);
+  }
 
   private async acquirePromptEvaluationSlot(): Promise<() => void> {
     const limit = 3;
@@ -242,10 +281,11 @@ export class Orchestrator {
     this.codex = new CodexClient((message) => {
       const clean = message.trim().slice(0, 800);
       if (clean) this.events.emit("progress", { message: clean });
-    });
+    }, { afterInvocation: () => this.assertProtectedParentUnchanged() });
   }
 
   async init(): Promise<void> {
+    await this.initializeProtectedParentRepository();
     await this.locks.init();
     const orphanedLocks = await this.locks.reapOrphans();
     if (orphanedLocks.length) {

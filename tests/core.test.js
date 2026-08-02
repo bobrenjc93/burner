@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { get } from "node:http";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -62,6 +62,35 @@ test("closing the orchestrator disables scheduling and aborts Codex work", async
     assert.equal(closed, true);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex external edits pause Burner without reverting the protected parent repository", async () => {
+  const outer = await mkdtemp(join(tmpdir(), "burner-parent-boundary-test-"));
+  const target = join(outer, "target");
+  try {
+    await exec(outer, "git", ["init", "-q"]);
+    await exec(outer, "git", ["config", "user.email", "burner@example.test"]);
+    await exec(outer, "git", ["config", "user.name", "Burner Test"]);
+    await writeFile(join(outer, ".gitignore"), "target/\n");
+    await writeFile(join(outer, "protected.txt"), "original\n");
+    await exec(outer, "git", ["add", ".gitignore", "protected.txt"]);
+    await exec(outer, "git", ["commit", "-qm", "seed"]);
+    await import("node:fs/promises").then((fs) => fs.mkdir(target));
+    const store = new StateStore(target);
+    await store.init();
+    await store.update((state) => { state.orchestrator.enabled = true; });
+    const orchestrator = new Orchestrator(target, store, new EventHub());
+    await orchestrator.initializeProtectedParentRepository();
+    assert.ok(orchestrator.protectedParentRepository, `expected ${outer} to protect nested target ${target}; git discovered ${(await exec(outer, "git", ["rev-parse", "--show-toplevel"])).trim()}`);
+    assert.equal(orchestrator.protectedParentRepository.root, await realpath(outer));
+    await writeFile(join(outer, "protected.txt"), "changed externally\n");
+    await assert.rejects(() => orchestrator.assertProtectedParentUnchanged(), /paused without reverting external files/);
+    assert.equal(store.get().orchestrator.enabled, false);
+    assert.equal(store.get().activity[0].message, "Codex crossed the target worktree boundary");
+    assert.equal(await readFile(join(outer, "protected.txt"), "utf8"), "changed externally\n");
+  } finally {
+    await rm(outer, { recursive: true, force: true });
   }
 });
 
@@ -131,6 +160,54 @@ test("merge progress artifacts deduplicate semantic baselines and PR retries", a
     assert.match(svg, /PR #12/);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("merge progress SVG preserves disabled gaps and late singleton scores", async () => {
+  const gapRoot = await mkdtemp(join(tmpdir(), "burner-progress-gap-test-"));
+  const singletonRoot = await mkdtemp(join(tmpdir(), "burner-progress-singleton-test-"));
+  const timestamp = "2026-01-01T00:00:00.000Z";
+  const quality = { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp };
+  const speed = { id: "speed", name: "Speed", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp };
+  try {
+    await writeFile(join(gapRoot, "README.md"), "# Demo\n");
+    await updateProgressArtifacts(gapRoot, [quality, speed], [
+      { key: "base:abc", commit: "abc", recordedAt: timestamp, label: "base abc", kind: "baseline", title: "main", scores: { quality: 60, speed: 70 } },
+    ]);
+    await updateProgressArtifacts(gapRoot, [{ ...quality, enabled: false }, speed], [
+      { key: "pr:1", recordedAt: "2026-01-02T00:00:00.000Z", label: "PR #1", kind: "leaf", prNumber: 1, title: "Disabled", scores: { speed: 72 } },
+    ]);
+    await updateProgressArtifacts(gapRoot, [quality, speed], [
+      { key: "pr:2", recordedAt: "2026-01-03T00:00:00.000Z", label: "PR #2", kind: "leaf", prNumber: 2, title: "Re-enabled", scores: { quality: 80, speed: 74 } },
+    ]);
+    const gapSvg = await readFile(join(gapRoot, "docs", "burner-evaluation-progress.svg"), "utf8");
+    assert.doesNotMatch(gapSvg, /points="70\.0,164\.4 1168\.0,109\.2"/);
+    assert.match(gapSvg, /points="70\.0,164\.4"[^>]+stroke="#ff6b35"/);
+    assert.match(gapSvg, /points="1168\.0,109\.2"[^>]+stroke="#ff6b35"/);
+
+    await writeFile(join(singletonRoot, "README.md"), "# Demo\n");
+    const points = [
+      { key: "base:abc", commit: "abc", recordedAt: timestamp, label: "base abc", kind: "baseline", title: "main", scores: { quality: 50 } },
+      ...Array.from({ length: 60 }, (_value, index) => ({
+        key: `pr:${index + 1}`,
+        recordedAt: `2026-01-02T00:00:${String(index).padStart(2, "0")}.000Z`,
+        label: `PR #${index + 1}`,
+        kind: "leaf",
+        prNumber: index + 1,
+        title: "Existing evaluation",
+        scores: { quality: 50 },
+      })),
+    ];
+    await updateProgressArtifacts(singletonRoot, [quality], points);
+    const late = { id: "late", name: "Late", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp };
+    await updateProgressArtifacts(singletonRoot, [quality, late], [
+      { key: "pr:61", recordedAt: "2026-01-03T00:00:00.000Z", label: "PR #61", kind: "leaf", prNumber: 61, title: "Late evaluation", scores: { quality: 55, late: 90 } },
+    ]);
+    const singletonSvg = await readFile(join(singletonRoot, "docs", "burner-evaluation-progress.svg"), "utf8");
+    assert.match(singletonSvg, /<circle cx="1168\.0" cy="81\.6" r="3\.5" fill="#7c5cff"\/>/);
+  } finally {
+    await rm(gapRoot, { recursive: true, force: true });
+    await rm(singletonRoot, { recursive: true, force: true });
   }
 });
 
@@ -1258,8 +1335,11 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     const authorCall = calls.find(({ input }) => input.includes("implementation agent"));
     assert.match(authorCall.input, /quoted as evaluator context, not instructions/);
     assert.match(authorCall.input, /do not constrain this implementation task: edit the worktree and run the relevant tests/);
-    assert.ok(calls.some(({ input }) => input.includes("author/integrator")));
-    assert.ok(calls.some(({ input }) => input.includes("independent reviewer requested changes")));
+    assert.match(authorCall.input, /All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree/);
+    const integratorCall = calls.find(({ input }) => input.includes("author/integrator"));
+    assert.match(integratorCall.input, /Never modify parent or sibling repositories/);
+    const revisionCall = calls.find(({ input }) => input.includes("independent reviewer requested changes"));
+    assert.match(revisionCall.input, /Never modify parent or sibling repositories/);
     const reviewerCalls = calls.filter(({ input }) => input.includes("independent, rigorous reviewer"));
     assert.equal(reviewerCalls.length, 2);
     assert.match(reviewerCalls[0].input, /comprehensive blocker pass now/);

@@ -92,10 +92,23 @@ function renderSvg(history: ProgressHistory): string {
     : [...new Set(Array.from({ length: 8 }, (_value, index) => Math.round(index * (history.points.length - 1) / 7)))];
   const xLabels = labelIndexes.map((index) => `<text x="${x(index)}" y="${top + plotHeight + 28}" text-anchor="middle" class="axis">${escapeXml(history.points[index]!.label)}</text>`).join("");
   const lines = evaluationEntries.map(([evaluationId, evaluation]) => {
-    const points = history.points.flatMap((point, index) => Number.isFinite(point.scores[evaluationId]) ? [`${x(index).toFixed(1)},${y(point.scores[evaluationId]!).toFixed(1)}`] : []);
-    if (!points.length) return "";
-    const dots = history.points.length <= 60 ? points.map((point) => { const [cx, cy] = point.split(","); return `<circle cx="${cx}" cy="${cy}" r="3.5" fill="${evaluation.color}"/>`; }).join("") : "";
-    return `<polyline points="${points.join(" ")}" fill="none" stroke="${evaluation.color}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>${dots}`;
+    const segments: string[][] = [];
+    let segment: string[] = [];
+    for (const [index, point] of history.points.entries()) {
+      const score = point.scores[evaluationId];
+      if (Number.isFinite(score)) segment.push(`${x(index).toFixed(1)},${y(score!).toFixed(1)}`);
+      else if (segment.length) {
+        segments.push(segment);
+        segment = [];
+      }
+    }
+    if (segment.length) segments.push(segment);
+    return segments.map((points) => {
+      const dots = history.points.length <= 60 || points.length === 1
+        ? points.map((point) => { const [cx, cy] = point.split(","); return `<circle cx="${cx}" cy="${cy}" r="3.5" fill="${evaluation.color}"/>`; }).join("")
+        : "";
+      return `<polyline points="${points.join(" ")}" fill="none" stroke="${evaluation.color}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>${dots}`;
+    }).join("");
   }).join("");
   const legend = evaluationEntries.map(([_evaluationId, evaluation], index) => {
     const column = index % 2;
