@@ -983,8 +983,8 @@ export class Orchestrator {
   async mergeComposite(compositeId: string): Promise<void> {
     const composite = this.store.get().composites.find((item) => item.id === compositeId);
     if (!composite?.prNumber || composite.status !== "open") throw new Error("Only an open composite pull request can be merged.");
-    await this.stampProgressBeforeMerge("composite", composite.id);
-    await this.git.mergePr(this.root, composite.prNumber);
+    const expectedHead = await this.stampProgressBeforeMerge("composite", composite.id);
+    await this.git.mergePr(this.root, composite.prNumber, expectedHead);
     await this.store.addActivity({ type: "pr", message: `Merge requested: ${composite.title}`, detail: `Waiting for GitHub to merge PR #${composite.prNumber}.` });
     await this.syncPullRequests(true);
   }
@@ -992,14 +992,14 @@ export class Orchestrator {
   async mergeAgent(runId: string): Promise<AgentRun> {
     const run = this.store.get().agentRuns.find((item) => item.id === runId);
     if (!run?.prNumber || run.status !== "completed" || run.prState !== "open") throw new Error("Only an open, completed agent pull request can be merged.");
-    await this.stampProgressBeforeMerge("agent", run.id);
-    await this.git.mergePr(this.root, run.prNumber);
+    const expectedHead = await this.stampProgressBeforeMerge("agent", run.id);
+    await this.git.mergePr(this.root, run.prNumber, expectedHead);
     await this.store.addActivity({ type: "pr", message: `Merge requested for PR #${run.prNumber}`, detail: "Synchronizing the base branch before any new agents start." });
     await this.syncPullRequests(true);
     return this.store.get().agentRuns.find((item) => item.id === runId)!;
   }
 
-  private async stampProgressBeforeMerge(kind: "agent" | "composite", candidateId: string): Promise<void> {
+  private async stampProgressBeforeMerge(kind: "agent" | "composite", candidateId: string): Promise<string> {
     const state = this.store.get();
     const candidate = kind === "agent"
       ? state.agentRuns.find((item) => item.id === candidateId)
@@ -1031,21 +1031,29 @@ export class Orchestrator {
     points.push({ key: `pr:${prNumber}`, recordedAt, label: `PR #${prNumber}`, kind: kind === "agent" ? "leaf" : "composite", prNumber, title, scores });
     const owner = `progress-${candidateId}`;
     let worktree = "";
+    let expectedHead = "";
+    let changed = false;
     const createLock = await this.locks.acquire("git-metadata", `${owner}-create`);
     try { worktree = await this.git.createExistingWorktree(owner, candidate.branch); }
     finally { await createLock.release(); }
     try {
       await updateProgressArtifacts(worktree, state.evaluations, points);
       if (await this.git.hasChanges(worktree)) {
+        changed = true;
         await this.git.commit(worktree, `burner: record evaluation progress for PR #${prNumber}`);
         await this.git.push(worktree, state.settings.remote, candidate.branch);
       }
+      expectedHead = await this.git.head(worktree);
     } finally {
       const cleanupLock = await this.locks.acquire("git-metadata", `${owner}-cleanup`);
       try { if (worktree) await this.git.removeWorktree(worktree); }
       finally { await cleanupLock.release(); }
     }
-    await this.store.addActivity({ type: "evaluation", message: `Progress graph updated for PR #${prNumber}`, detail: "README.md, SVG, and raw evaluation history were committed to the merge candidate." });
+    if (changed) {
+      await this.store.addActivity({ type: "evaluation", message: `Progress graph updated for PR #${prNumber}`, detail: "README.md, SVG, and raw evaluation history were committed to the merge candidate." });
+    }
+    if (!expectedHead) throw new Error(`Could not resolve the pushed head for PR #${prNumber} after recording progress.`);
+    return expectedHead;
   }
 
   async retryComposite(compositeId: string): Promise<void> {

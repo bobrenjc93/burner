@@ -213,8 +213,8 @@ export class GitService {
     await this.markPrDisposition(cwd, number, disposition).catch(() => undefined);
   }
 
-  async mergePr(cwd: string, number: number): Promise<void> {
-    const expectedHead = await this.head(cwd);
+  async mergePr(cwd: string, number: number, expectedHead: string): Promise<void> {
+    if (!expectedHead.trim()) throw new Error(`Cannot merge PR #${number} without its exact pushed head commit.`);
     const mergeAttempts = this.mergePolling.mergeAttempts ?? 3;
     let lastError = "";
     for (let attempt = 1; attempt <= mergeAttempts; attempt += 1) {

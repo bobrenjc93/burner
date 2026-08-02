@@ -638,7 +638,7 @@ test("GitHub merge waits for the pushed head and retries transient not-mergeable
   await writeFile(join(root, "README.md"), "# Test\n");
   await exec(root, "git", ["add", "."]);
   await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "base"]);
-  const head = (await exec(root, "git", ["rev-parse", "HEAD"])).trim();
+  const head = "0123456789abcdef0123456789abcdef01234567";
   const executable = join(bin, "gh");
   await writeFile(executable, `#!/usr/bin/env node
 const fs=require("fs");const args=process.argv.slice(2);const path=process.env.BURNER_TEST_GH_STATE;const state=fs.existsSync(path)?JSON.parse(fs.readFileSync(path,"utf8")):{views:0,merges:0};
@@ -653,16 +653,49 @@ process.exit(0);
   process.env.BURNER_TEST_HEAD = head;
   try {
     const git = new GitService(root, join(root, ".burner"), { attempts: 4, intervalMs: 0, mergeAttempts: 2 });
-    await git.mergePr(root, 42);
+    await git.mergePr(root, 42, head);
     assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")), { views: 3, merges: 2 });
     process.env.BURNER_TEST_CONFLICT = "1";
-    await assert.rejects(() => git.mergePr(root, 43), /conflicts with its base branch/);
+    await assert.rejects(() => git.mergePr(root, 43, head), /conflicts with its base branch/);
     assert.equal(JSON.parse(await readFile(statePath, "utf8")).merges, 2, "a real conflict must not call merge");
   } finally {
     process.env.PATH = previousPath;
     delete process.env.BURNER_TEST_GH_STATE;
     delete process.env.BURNER_TEST_HEAD;
     delete process.env.BURNER_TEST_CONFLICT;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("leaf and composite merges poll the exact post-stamp candidate head", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-merge-head-plumbing-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.composites.push({
+        id: "composite", title: "Combined", description: "Combined work", status: "open", branch: "burner/composite", worktree: "",
+        sources: [], deltas: [], reviewRounds: [], reviewApproved: true, prNumber: 42, prUrl: "https://example.test/pull/42",
+        createdAt: timestamp, updatedAt: timestamp, isLiving: true,
+      });
+      state.agentRuns.push({
+        id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp,
+        prNumber: 43, prUrl: "https://example.test/pull/43", prState: "open", deltas: [], resources: [], reviewRounds: [], reviewApproved: true,
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    const merged = [];
+    orchestrator.stampProgressBeforeMerge = async (kind) => `${kind}-post-stamp-head`;
+    orchestrator.git = { mergePr: async (...args) => merged.push(args) };
+    orchestrator.syncPullRequests = async () => undefined;
+    await orchestrator.mergeComposite("composite");
+    await orchestrator.mergeAgent("leaf");
+    assert.deepEqual(merged, [
+      [root, 42, "composite-post-stamp-head"],
+      [root, 43, "agent-post-stamp-head"],
+    ]);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
