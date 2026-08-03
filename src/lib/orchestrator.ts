@@ -56,7 +56,7 @@ function isYoloCandidate(
   strictPromptRegressions = true,
   requireImpactThreshold = true,
 ): impact is number {
-  if (!Number.isFinite(impact) || (requireImpactThreshold && impact! <= threshold)) return false;
+  if (!Number.isFinite(impact) || (requireImpactThreshold && impact! < threshold)) return false;
   const byEvaluation = new Map(deltas.map((delta) => [delta.evaluationId, delta]));
   const complete = [...enabledEvaluationIds].every((evaluationId) => {
     const delta = byEvaluation.get(evaluationId)?.delta;
@@ -2046,10 +2046,10 @@ export class Orchestrator {
     await this.updateAgent(runId, { deltas, impact });
     if (base.compositeId) {
       const regressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
-      if (impact <= settings.compositeAbsorbThreshold || regressions.length) {
+      if (impact < settings.compositeAbsorbThreshold || regressions.length) {
         await this.updateAgent(runId, { status: "rejected", completedAt: now() });
         await this.finishIdea(idea.id, "completed");
-        await this.store.addActivity({ type: "agent", message: `Experiment rejected: ${idea.title}`, detail: regressions.length ? `${regressions.length} evaluation regression${regressions.length === 1 ? "" : "s"}; living line unchanged.` : `Impact ${impact.toFixed(1)} did not clear the ${settings.compositeAbsorbThreshold.toFixed(1)} absorption threshold.` });
+        await this.store.addActivity({ type: "agent", message: `Experiment rejected: ${idea.title}`, detail: regressions.length ? `${regressions.length} evaluation regression${regressions.length === 1 ? "" : "s"}; living line unchanged.` : `Impact ${impact.toFixed(1)} did not reach the ${settings.compositeAbsorbThreshold.toFixed(1)} absorption threshold.` });
         return;
       }
       await this.absorbExperiment(base.compositeId, runId, idea, worktree, branch, impact, settings);
@@ -2183,7 +2183,7 @@ export class Orchestrator {
         deltas = incomplete.length ? [] : this.calculateDeltas(state, baseline, afterRuns);
         impact = this.calculateImpact(state, deltas);
         const regressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
-        const qualifies = !incomplete.length && !regressions.length && impact > settings.compositeAbsorbThreshold;
+        const qualifies = !incomplete.length && !regressions.length && impact >= settings.compositeAbsorbThreshold;
         if (qualifies) {
           const scoreMap = new Map(afterRuns.filter((run) => run.score !== undefined).map((run) => [run.evaluationId, run.score!]));
           compositeScore = weightedScore(state.evaluations, scoreMap) ?? 0;
@@ -2194,7 +2194,7 @@ export class Orchestrator {
             ? `${incomplete.map((evaluation) => evaluation.name).join(", ")} remained incomplete`
             : regressions.length
               ? `${regressions.map((delta) => `${delta.name} ${delta.delta}`).join(", ")} regressed`
-              : `weighted impact ${impact.toFixed(1)} did not exceed ${settings.compositeAbsorbThreshold.toFixed(1)}`;
+              : `weighted impact ${impact.toFixed(1)} did not reach ${settings.compositeAbsorbThreshold.toFixed(1)}`;
           throw new Error(`Composite did not become monotonic after 3 evaluation-guided integration revisions: ${reason}.`);
         }
         const headroom = compositeRevisionHeadroom(state.orchestrator.mergeWindowStartedAt, settings.mergeCadenceMinutes);

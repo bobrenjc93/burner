@@ -1009,7 +1009,7 @@ test("PR bodies record review approval and recalculated composite scores", () =>
   assert.match(draft, /not mergeable until independent review and combined-code evaluation finish/);
 });
 
-test("YOLO merge selection prefers reviewed composites and rejects every evaluation regression", () => {
+test("YOLO merge selection prefers reviewed composites, accepts threshold-equal monotonic work, and rejects every regression", () => {
   const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
   const deltas = [
     { evaluationId: "quality", name: "Quality", before: 70, after: 72, delta: 2 },
@@ -1026,6 +1026,13 @@ test("YOLO merge selection prefers reviewed composites and rejects every evaluat
   assert.equal(selectYoloMergeCandidate(state, "base", false), undefined);
   assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "agent", prNumber: 10, impact: 5 });
   assert.equal(selectYoloMergeCandidate(state, "new-base"), undefined);
+  state.agentRuns[0].impact = 0;
+  state.agentRuns[0].deltas = deltas.map((delta) => ({ ...delta, after: delta.before, delta: 0 }));
+  assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "agent", prNumber: 10, impact: 0 });
+  state.settings.compositeAbsorbThreshold = 0.1;
+  assert.equal(selectYoloMergeCandidate(state, "base"), undefined);
+  state.settings.compositeAbsorbThreshold = 0;
+  state.agentRuns[0].impact = 5;
   state.agentRuns[0].deltas = [{ ...deltas[0], delta: -0.1 }, deltas[1]];
   assert.equal(selectYoloMergeCandidate(state, "base"), undefined);
   state.agentRuns[0].deltas = [deltas[0], { ...deltas[1], delta: -0.1 }];
