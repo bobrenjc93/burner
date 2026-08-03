@@ -410,13 +410,13 @@ export class Orchestrator {
     return this.mergeCadenceDue(state) || Boolean(state.orchestrator.lastMergeCadenceAlertAt);
   }
 
-  private cadenceRecoveryTailExhausted(state = this.store.get()): boolean {
-    return Boolean(state.orchestrator.lastMergeCadenceAlertAt) &&
+  private cadenceCompositeTailExhausted(state = this.store.get()): boolean {
+    return this.portfolioMode() &&
       !compositeRevisionHeadroom(state.orchestrator.mergeWindowStartedAt, state.settings.mergeCadenceMinutes).allowed;
   }
 
   private cadenceLeafValidationTailExhausted(state = this.store.get()): boolean {
-    return Boolean(state.orchestrator.lastMergeCadenceAlertAt) &&
+    return this.portfolioMode() &&
       !leafValidationHeadroom(state.orchestrator.mergeWindowStartedAt, state.settings.mergeCadenceMinutes).allowed;
   }
 
@@ -800,7 +800,7 @@ export class Orchestrator {
   private async autoCookNext(): Promise<boolean> {
     if (this.yoloBatchSize < 2) return false;
     const state = this.store.get();
-    if (this.cadenceRecoveryTailExhausted(state)) return false;
+    if (this.cadenceCompositeTailExhausted(state)) return false;
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const cadenceDue = this.mergeCadenceUrgent(state);
     const cookDue = cadenceDue || this.portfolioCookDue(state, baseCommit);
@@ -1611,7 +1611,7 @@ export class Orchestrator {
         if (await this.autoMergeNext()) return;
         if (await this.autoCookNext()) return;
       }
-      if (this.portfolioMode() && this.cadenceRecoveryTailExhausted(this.store.get())) return;
+      if (this.cadenceCompositeTailExhausted(this.store.get())) return;
       if (await this.shouldDrainForPortfolio()) return;
       const settings = initial.settings;
       const evaluationDue =

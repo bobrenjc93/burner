@@ -1238,6 +1238,9 @@ test("YOLO cadence cooks a healthy partial batch and falls back to one reviewed 
     orchestrator.git = { resolveRef: async () => "base" };
     let cooked;
     orchestrator.createComposite = async (...args) => { cooked = args; return {}; };
+    assert.equal(orchestrator.mergeCadenceDue(), true);
+    await orchestrator.recordCadenceBreach();
+    assert.equal(orchestrator.mergeCadenceDue(), false, "the real tick opens a fresh bounded window before recovery work starts");
     assert.equal(await orchestrator.autoMergeNext(), false);
     assert.equal(await orchestrator.autoCookNext(), true);
     assert.deepEqual(cooked[0], ["a", "b"]);
@@ -1572,7 +1575,7 @@ test("cadence fallback skips an unchanged rejected leaf and validates the next c
   }
 });
 
-test("late cadence recovery waits for cached leaf validation but still merges a cached-qualified leaf", async () => {
+test("late cadence tail waits for cached leaf validation but still merges a cached-qualified leaf", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-late-leaf-validation-test-"));
   try {
     const store = new StateStore(root);
@@ -1583,7 +1586,6 @@ test("late cadence recovery waits for cached leaf validation but still merges a 
     await store.update((state) => {
       state.settings.mergeCadenceMinutes = 60;
       state.orchestrator.mergeWindowStartedAt = new Date(Date.now() - 43 * 60_000).toISOString();
-      state.orchestrator.lastMergeCadenceAlertAt = state.orchestrator.mergeWindowStartedAt;
       state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
       state.ideas.push({ id: "idea", title: "Healthy leaf", description: "Improve", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "leaf" });
       state.agentRuns.push({
@@ -1615,7 +1617,7 @@ test("late cadence recovery waits for cached leaf validation but still merges a 
   }
 });
 
-test("late cadence recovery holds new composites and agent dispatch for the next window", async () => {
+test("late cadence tail holds new composites and agent dispatch before or after a breach", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-late-recovery-hold-test-"));
   try {
     const store = new StateStore(root);
@@ -1624,13 +1626,12 @@ test("late cadence recovery holds new composites and agent dispatch for the next
     await store.update((state) => {
       state.settings.mergeCadenceMinutes = 60;
       state.orchestrator.mergeWindowStartedAt = new Date(Date.now() - 40 * 60_000).toISOString();
-      state.orchestrator.lastMergeCadenceAlertAt = state.orchestrator.mergeWindowStartedAt;
       state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     let cooked = false;
     orchestrator.createComposite = async () => { cooked = true; return {}; };
-    assert.equal(orchestrator.cadenceRecoveryTailExhausted(), true);
+    assert.equal(orchestrator.cadenceCompositeTailExhausted(), true);
     assert.equal(await orchestrator.autoCookNext(), false);
     assert.equal(cooked, false);
   } finally {
