@@ -390,6 +390,11 @@ export class Orchestrator {
     return this.mergeCadenceDue(state) || Boolean(state.orchestrator.lastMergeCadenceAlertAt);
   }
 
+  private cadenceRecoveryTailExhausted(state = this.store.get()): boolean {
+    return Boolean(state.orchestrator.lastMergeCadenceAlertAt) &&
+      !compositeRevisionHeadroom(state.orchestrator.mergeWindowStartedAt, state.settings.mergeCadenceMinutes).allowed;
+  }
+
   private portfolioCookDue(state = this.store.get(), baseCommit?: string): boolean {
     if (!this.portfolioMode()) return false;
     const anchor = state.orchestrator.mergeWindowStartedAt;
@@ -557,8 +562,15 @@ export class Orchestrator {
     const cadenceNeedsSingleLeaf = failedCurrentGeneration || ((cadenceDue || cookDue) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0);
     let candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf);
     if (!candidate && (this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf)) {
-      const leaf = eligibleYoloLeaves(state, baseCommit)[0];
-      if (leaf?.prNumber !== undefined && leaf.impact !== undefined) candidate = { kind: "agent", id: leaf.id, prNumber: leaf.prNumber, impact: leaf.impact };
+      const evaluationFingerprint = fullMergeValidationFingerprint(state);
+      for (const leaf of eligibleYoloLeaves(state, baseCommit)) {
+        const candidateCommit = await this.git.resolveRef(leaf.branch);
+        if (cachedFullMergeValidationResult(leaf, baseCommit, candidateCommit, evaluationFingerprint) === false) continue;
+        if (leaf.prNumber !== undefined && leaf.impact !== undefined) {
+          candidate = { kind: "agent", id: leaf.id, prNumber: leaf.prNumber, impact: leaf.impact };
+          break;
+        }
+      }
     }
     if (!candidate) return false;
     if (candidate.kind === "agent" && this.portfolioMode()) {
@@ -743,6 +755,7 @@ export class Orchestrator {
   private async autoCookNext(): Promise<boolean> {
     if (this.yoloBatchSize < 2) return false;
     const state = this.store.get();
+    if (this.cadenceRecoveryTailExhausted(state)) return false;
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const cadenceDue = this.mergeCadenceUrgent(state);
     const cookDue = cadenceDue || this.portfolioCookDue(state, baseCommit);
@@ -1553,6 +1566,7 @@ export class Orchestrator {
         if (await this.autoMergeNext()) return;
         if (await this.autoCookNext()) return;
       }
+      if (this.portfolioMode() && this.cadenceRecoveryTailExhausted(this.store.get())) return;
       if (await this.shouldDrainForPortfolio()) return;
       const settings = initial.settings;
       const evaluationDue =

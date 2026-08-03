@@ -1452,6 +1452,75 @@ test("a failed current generation immediately unlocks a fully validated leaf fal
   }
 });
 
+test("cadence fallback skips an unchanged rejected leaf and validates the next candidate", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-fallback-skip-rejected-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    const fingerprint = JSON.stringify({ threshold: 0, evaluations: [{ id: "quality", name: "Quality", prompt: "Score", weight: 1 }] });
+    const leaf = (id, number, commit, impact) => ({
+      id, ideaId: `idea-${id}`, status: "completed", branch: `burner/${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp,
+      prNumber: number, prUrl: `https://example.test/pull/${number}`, prState: "open", baseCommit: "base",
+      deltas: [{ evaluationId: "quality", name: "Quality", before: 50, after: 45, delta: -5 }], impact, resources: [],
+      reviewRounds: [approvedRound], reviewApproved: true,
+      ...(id === "first" ? { fullMergeValidation: { baseCommit: "base", candidateCommit: commit, evaluationFingerprint: fingerprint, qualified: false, completedAt: timestamp } } : {}),
+    });
+    await store.update((state) => {
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.ideas.push(
+        { id: "idea-first", title: "First", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "first" },
+        { id: "idea-second", title: "Second", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "second" },
+      );
+      state.agentRuns.push(leaf("first", 10, "first-head", -1), leaf("second", 11, "second-head", -2));
+      state.composites.push({ id: "failed", title: "Failed", description: "", status: "failed", branch: "burner/failed", worktree: "", baseCommit: "base", sources: [], deltas: [], reviewRounds: [], createdAt: timestamp, updatedAt: timestamp, isLiving: false });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { resolveRef: async (ref) => ref === "main" ? "base" : ref === "burner/first" ? "first-head" : "second-head" };
+    let validated;
+    let merged;
+    orchestrator.fullyValidateLeafForMerge = async (id) => {
+      validated = id;
+      await store.update((state) => {
+        const run = state.agentRuns.find((item) => item.id === id);
+        run.deltas = [{ evaluationId: "quality", name: "Quality", before: 50, after: 55, delta: 5 }];
+        run.impact = 5;
+      });
+      return true;
+    };
+    orchestrator.mergeAgent = async (id) => { merged = id; return {}; };
+    assert.equal(await orchestrator.autoMergeNext(), true);
+    assert.equal(validated, "second");
+    assert.equal(merged, "second");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("late cadence recovery holds new composites and agent dispatch for the next window", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-late-recovery-hold-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.mergeWindowStartedAt = new Date(Date.now() - 40 * 60_000).toISOString();
+      state.orchestrator.lastMergeCadenceAlertAt = state.orchestrator.mergeWindowStartedAt;
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    let cooked = false;
+    orchestrator.createComposite = async () => { cooked = true; return {}; };
+    assert.equal(orchestrator.cadenceRecoveryTailExhausted(), true);
+    assert.equal(await orchestrator.autoCookNext(), false);
+    assert.equal(cooked, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("YOLO portfolio caps reviews, quarantines the implicated leaf, and queues smaller healthy partitions", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-quarantine-test-"));
   try {
