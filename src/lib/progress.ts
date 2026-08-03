@@ -58,6 +58,26 @@ function collapseDuplicateBaselines(points: ProgressPoint[]): ProgressPoint[] {
   return collapsed;
 }
 
+function scoreMapsEqual(left: Record<string, number>, right: Record<string, number>): boolean {
+  const leftIds = Object.keys(left).sort();
+  const rightIds = Object.keys(right).sort();
+  return leftIds.length === rightIds.length &&
+    leftIds.every((evaluationId, index) => evaluationId === rightIds[index] && left[evaluationId] === right[evaluationId]);
+}
+
+function collapseRedundantBaselinePoints(points: ProgressPoint[]): ProgressPoint[] {
+  const collapsed: ProgressPoint[] = [];
+  for (const point of collapseDuplicateBaselines(points)) {
+    const previous = collapsed.at(-1);
+    // After a Burner merge, the next candidate's base scores are exactly the
+    // preceding PR point. Do not turn that unchanged state into a second dot.
+    // A changed evaluation registry or out-of-band base score remains visible.
+    if (point.kind === "baseline" && previous && scoreMapsEqual(previous.scores, point.scores)) continue;
+    collapsed.push(point);
+  }
+  return collapsed;
+}
+
 function emptyHistory(): ProgressHistory {
   return { version: 1, evaluations: {}, points: [] };
 }
@@ -139,7 +159,7 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
 
 export async function updateProgressArtifacts(cwd: string, evaluations: Evaluation[], newPoints: ProgressPoint[]): Promise<ProgressHistory> {
   const history = await readHistory(cwd);
-  history.points = collapseDuplicateBaselines(history.points);
+  history.points = collapseRedundantBaselinePoints(history.points);
   for (const evaluation of evaluations.filter((item) => item.enabled)) {
     const existing = history.evaluations[evaluation.id];
     history.evaluations[evaluation.id] = { name: evaluation.name, color: existing?.color ?? COLORS[Object.keys(history.evaluations).length % COLORS.length]! };
@@ -161,7 +181,7 @@ export async function updateProgressArtifacts(cwd: string, evaluations: Evaluati
     }
     else history.points.push(point);
   }
-  history.points = collapseDuplicateBaselines(history.points);
+  history.points = collapseRedundantBaselinePoints(history.points);
   await atomicWrite(join(cwd, HISTORY_PATH), `${JSON.stringify(history, null, 2)}\n`);
   await atomicWrite(join(cwd, GRAPH_PATH), renderSvg(history));
   const readmePath = join(cwd, "README.md");

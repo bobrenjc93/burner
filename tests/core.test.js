@@ -146,19 +146,47 @@ test("merge progress artifacts deduplicate semantic baselines and PR retries", a
       { key: "base:abc", commit: "abc", recordedAt: "2026-01-02T12:00:00.000Z", label: "base abc", kind: "baseline", title: "main", scores: { quality: 61, speed: 71 } },
       { key: "pr:12", recordedAt: "2026-01-03T00:00:00.000Z", label: "PR #12", kind: "composite", prNumber: 12, title: "Combined", scores: { quality: 76, speed: 81 } },
     ]);
+    await updateProgressArtifacts(root, evaluations, [
+      { key: "base:def", commit: "def", recordedAt: "2026-01-04T00:00:00.000Z", label: "base def", kind: "baseline", title: "main", scores: { quality: 76, speed: 81 } },
+      { key: "pr:13", recordedAt: "2026-01-04T00:00:00.000Z", label: "PR #13", kind: "composite", prNumber: 13, title: "Next", scores: { quality: 80, speed: 84 } },
+    ]);
     const readme = await readFile(join(root, "README.md"), "utf8");
     const history = JSON.parse(await readFile(join(root, "docs", "burner-evaluation-history.json"), "utf8"));
     const svg = await readFile(join(root, "docs", "burner-evaluation-progress.svg"), "utf8");
     assert.match(readme, /burner-progress:start/);
     assert.match(readme, /burner-evaluation-progress\.svg/);
-    assert.equal(history.points.length, 2);
+    assert.equal(history.points.length, 3);
     assert.equal(history.points[0].key, "baseline:abc");
     assert.equal(history.points[0].recordedAt, timestamp);
     assert.equal(history.points[0].scores.quality, 61);
     assert.equal(history.points[1].recordedAt, "2026-01-02T00:00:00.000Z");
     assert.equal(history.points[1].scores.quality, 76);
+    assert.equal(history.points[2].key, "pr:13");
+    assert.ok(!history.points.some((point) => point.key === "base:def"), "an unchanged post-merge base must not add a flat duplicate dot");
     assert.match(svg, /Quality/);
     assert.match(svg, /PR #12/);
+    assert.match(svg, /PR #13/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("progress keeps a base point when the evaluation registry changes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-progress-registry-test-"));
+  try {
+    await writeFile(join(root, "README.md"), "# Demo\n");
+    const timestamp = "2026-01-01T00:00:00.000Z";
+    const quality = { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp };
+    await updateProgressArtifacts(root, [quality], [
+      { key: "base:abc", commit: "abc", recordedAt: timestamp, label: "base abc", kind: "baseline", title: "main", scores: { quality: 60 } },
+      { key: "pr:1", recordedAt: "2026-01-02T00:00:00.000Z", label: "PR #1", kind: "composite", prNumber: 1, title: "First", scores: { quality: 70 } },
+    ]);
+    const integrity = { id: "integrity", name: "Integrity", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp };
+    const history = await updateProgressArtifacts(root, [quality, integrity], [
+      { key: "base:def", commit: "def", recordedAt: "2026-01-03T00:00:00.000Z", label: "base def", kind: "baseline", title: "main", scores: { quality: 70, integrity: 85 } },
+      { key: "pr:2", recordedAt: "2026-01-03T00:00:00.000Z", label: "PR #2", kind: "composite", prNumber: 2, title: "Second", scores: { quality: 75, integrity: 90 } },
+    ]);
+    assert.deepEqual(history.points.map((point) => point.key), ["base:abc", "pr:1", "base:def", "pr:2"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
