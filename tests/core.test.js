@@ -302,6 +302,9 @@ test("unchanged leaves reuse both accepted and rejected full merge validation", 
     fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: false, completedAt },
   }, baseCommit, candidateCommit, evaluationFingerprint), false, "a rejected unchanged leaf must not launch the full suite again");
   assert.equal(cachedFullMergeValidationResult({
+    fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: false, completedAt },
+  }, baseCommit, candidateCommit, evaluationFingerprint, true), true, "cached scores are reinterpreted when qualification semantics change");
+  assert.equal(cachedFullMergeValidationResult({
     fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: true, completedAt },
   }, baseCommit, candidateCommit, evaluationFingerprint), true);
   assert.equal(cachedFullMergeValidationResult({

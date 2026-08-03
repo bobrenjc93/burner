@@ -75,6 +75,13 @@ function yoloEvaluationSets(state: BurnerState): { enabled: Set<string>; command
   };
 }
 
+function currentlyQualifiesForYoloMerge(state: BurnerState, run: Pick<AgentRun, "deltas" | "impact">): boolean | undefined {
+  const { enabled, commands } = yoloEvaluationSets(state);
+  if (!enabled.size || !Number.isFinite(run.impact)) return undefined;
+  if (![...enabled].every((evaluationId) => run.deltas.some((delta) => delta.evaluationId === evaluationId && Number.isFinite(delta.delta)))) return undefined;
+  return isYoloCandidate(run.deltas, run.impact, enabled, commands, state.settings.compositeAbsorbThreshold);
+}
+
 function isAuthoritativeFullBaseline(evaluation: Evaluation, run: EvaluationRun | undefined, commit: string): boolean {
   return run?.commit === commit && (Boolean(evaluation.command) || (run.promptSampleCount ?? 0) >= 3);
 }
@@ -244,10 +251,11 @@ export function cachedFullMergeValidationResult(
   baseCommit: string,
   candidateCommit: string,
   evaluationFingerprint: string,
+  currentQualification?: boolean,
 ): boolean | undefined {
   const cached = run.fullMergeValidation;
   if (!cached || cached.baseCommit !== baseCommit || cached.candidateCommit !== candidateCommit || cached.evaluationFingerprint !== evaluationFingerprint) return undefined;
-  return cached.qualified;
+  return currentQualification ?? cached.qualified;
 }
 
 function fullMergeValidationFingerprint(state: BurnerState): string {
@@ -594,7 +602,7 @@ export class Orchestrator {
       const evaluationFingerprint = fullMergeValidationFingerprint(state);
       for (const leaf of eligibleYoloLeaves(state, baseCommit)) {
         const candidateCommit = await this.git.resolveRef(leaf.branch);
-        if (cachedFullMergeValidationResult(leaf, baseCommit, candidateCommit, evaluationFingerprint) === false) continue;
+        if (cachedFullMergeValidationResult(leaf, baseCommit, candidateCommit, evaluationFingerprint, currentlyQualifiesForYoloMerge(state, leaf)) === false) continue;
         if (leaf.prNumber !== undefined && leaf.impact !== undefined) {
           candidate = { kind: "agent", id: leaf.id, prNumber: leaf.prNumber, impact: leaf.impact };
           break;
@@ -607,7 +615,7 @@ export class Orchestrator {
         const evaluationFingerprint = fullMergeValidationFingerprint(state);
         const cachedCandidate = (await Promise.all(eligibleYoloLeaves(state, baseCommit).map(async (leaf) => {
           const candidateCommit = await this.git.resolveRef(leaf.branch);
-          return cachedFullMergeValidationResult(leaf, baseCommit, candidateCommit, evaluationFingerprint) === true
+          return cachedFullMergeValidationResult(leaf, baseCommit, candidateCommit, evaluationFingerprint, currentlyQualifiesForYoloMerge(state, leaf)) === true
             ? leaf
             : undefined;
         }))).find((leaf) => leaf !== undefined);
@@ -677,7 +685,7 @@ export class Orchestrator {
     if (!run?.prNumber || !run.prState || run.prState !== "open") return false;
     const candidateCommit = await this.git.resolveRef(run.branch);
     const evaluationFingerprint = fullMergeValidationFingerprint(state);
-    const cached = cachedFullMergeValidationResult(run, baseCommit, candidateCommit, evaluationFingerprint);
+    const cached = cachedFullMergeValidationResult(run, baseCommit, candidateCommit, evaluationFingerprint, currentlyQualifiesForYoloMerge(state, run));
     if (cached !== undefined) return cached;
     const owner = `full-leaf-${run.id}`;
     let worktree = "";
