@@ -881,6 +881,15 @@ export class Orchestrator {
     return runs;
   }
 
+  private missingBaselineEvaluations(baseCommit: string, state = this.store.get()): Evaluation[] {
+    const fullBaseline = this.store.latestRuns();
+    const screeningBaseline = this.store.latestScreeningRuns();
+    return state.evaluations.filter((evaluation) => evaluation.enabled && (
+      fullBaseline.get(evaluation.id)?.commit !== baseCommit ||
+      Boolean(evaluation.screeningCommand && screeningBaseline.get(evaluation.id)?.commit !== baseCommit)
+    ));
+  }
+
   private async promoteMergedCompositeBaseline(compositeId: string, baseCommit: string): Promise<boolean> {
     const state = this.store.get();
     const composite = state.composites.find((item) => item.id === compositeId);
@@ -1505,6 +1514,16 @@ export class Orchestrator {
         await this.runBaselineEvaluations("baseline");
       }
       const refreshed = this.store.get();
+      const dispatchBaseCommit = await this.git.resolveRef(refreshed.settings.baseBranch);
+      const missingBaseline = this.missingBaselineEvaluations(dispatchBaseCommit, refreshed);
+      if (missingBaseline.length) {
+        await this.store.addActivity({
+          type: "error",
+          message: "Agent scheduling deferred: baseline incomplete",
+          detail: `Burner will retry ${missingBaseline.map((evaluation) => evaluation.name).join(", ")} before planning or dispatching repository work.`,
+        });
+        return;
+      }
       if (!refreshed.orchestrator.enabled && !force) return;
       const configuredLiving = refreshed.orchestrator.livingCompositeId ? refreshed.composites.find((item) => item.id === refreshed.orchestrator.livingCompositeId) : undefined;
       if (!(this.yolo && this.yoloBatchSize > 1) && refreshed.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") {

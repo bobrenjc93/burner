@@ -541,6 +541,30 @@ test("baseline recovery reruns only evaluations missing at the current commit", 
   }
 });
 
+test("incomplete baselines block planning and agent dispatch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-baseline-dispatch-barrier-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { resolveRef: async () => "base" };
+    orchestrator.syncPullRequests = async () => undefined;
+    orchestrator.runBaselineEvaluations = async () => [];
+    let plans = 0;
+    let schedules = 0;
+    orchestrator.plan = async () => { plans += 1; return []; };
+    orchestrator.schedule = async () => { schedules += 1; };
+    orchestrator.scheduleComposites = async () => { schedules += 1; };
+    await orchestrator.tick(true);
+    assert.equal(plans, 0);
+    assert.equal(schedules, 0);
+    assert.equal(store.get().agentRuns.length, 0);
+    assert.match(store.get().activity[0].message, /baseline incomplete/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("resource locks are exclusive and recover after release", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-lock-test-"));
   try {
