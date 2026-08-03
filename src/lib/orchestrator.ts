@@ -425,7 +425,9 @@ export class Orchestrator {
     const state = this.store.get();
     if (!this.mergeCadenceDue(state)) return;
     const lastAlert = state.orchestrator.lastMergeCadenceAlertAt;
-    if (lastAlert && Date.now() - new Date(lastAlert).getTime() < state.settings.mergeCadenceMinutes * 60_000) return;
+    const anchor = state.orchestrator.mergeWindowStartedAt;
+    const alertHasRecoveryWindow = Boolean(lastAlert && anchor && new Date(anchor).getTime() >= new Date(lastAlert).getTime());
+    if (lastAlert && alertHasRecoveryWindow && Date.now() - new Date(lastAlert).getTime() < state.settings.mergeCadenceMinutes * 60_000) return;
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const reviewedLeaves = state.agentRuns.filter((run) =>
       run.status === "completed" && run.prState === "open" && run.baseCommit === baseCommit && finalReviewApproved(run.reviewApproved, run.reviewRounds));

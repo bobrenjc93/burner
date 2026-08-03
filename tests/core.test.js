@@ -1070,6 +1070,7 @@ test("a missed merge cadence opens a bounded recovery window without losing urge
     await store.update((state) => {
       state.settings.mergeCadenceMinutes = 60;
       state.orchestrator.mergeWindowStartedAt = new Date(Date.now() - 61 * 60_000).toISOString();
+      state.orchestrator.lastMergeCadenceAlertAt = new Date(Date.now() - 30 * 60_000).toISOString();
       state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
