@@ -1196,6 +1196,20 @@ test("YOLO cooks validated leaves before another observed leaf cycle can consume
     assert.equal(await orchestrator.autoCookNext(), true);
     assert.deepEqual(cooked[0], ["first", "second"]);
     assert.match(cooked[2], /shortened this batch early enough/);
+
+    await store.update((state) => {
+      state.orchestrator.mergeWindowStartedAt = new Date(now - 20 * 60_000).toISOString();
+      for (const run of state.agentRuns) {
+        run.startedAt = new Date(now - 6 * 60_000).toISOString();
+        run.completedAt = new Date(now - 1 * 60_000).toISOString();
+      }
+      state.agentRuns.push({
+        id: "failed", ideaId: "idea-failed", status: "failed", branch: "branch-failed", worktree: "",
+        startedAt: new Date(now - 50 * 60_000).toISOString(), completedAt: new Date(now - 1 * 60_000).toISOString(),
+        baseCommit: "base", deltas: [], resources: [], reviewRounds: [], error: "interrupted",
+      });
+    });
+    assert.equal(orchestrator.portfolioCookDue(store.get(), "base"), false, "a failed 49-minute run must not force two healthy 5-minute leaves into an early partial batch");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

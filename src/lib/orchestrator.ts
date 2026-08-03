@@ -441,7 +441,7 @@ export class Orchestrator {
     if (!baseCommit || selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0) return false;
 
     const recentLeafDurations = state.agentRuns
-      .filter((run) => run.baseCommit === baseCommit && run.completedAt)
+      .filter((run) => run.status === "completed" && run.baseCommit === baseCommit && run.completedAt)
       .sort((left, right) => new Date(right.completedAt!).getTime() - new Date(left.completedAt!).getTime())
       .slice(0, 3)
       .map((run) => new Date(run.completedAt!).getTime() - new Date(run.startedAt).getTime())
