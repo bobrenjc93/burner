@@ -670,9 +670,35 @@ export class Orchestrator {
       message: `Confirming ${promptRegressionIds.length} prompt regression${promptRegressionIds.length === 1 ? "" : "s"} for ${candidateLabel}`,
       detail: "Burner will use the median of three independent prompt scores; deterministic command results are never softened.",
     });
-    const confirmationBatches = await Promise.all([0, 1].map(() =>
+    const initialConfirmationBatches = await Promise.all([0, 1].map(() =>
       this.runEvaluations("composite", cwd, agentRunId, compositeId, promptRegressionIds),
     ));
+    const incompleteBatchIds = initialConfirmationBatches.map((confirmationRuns) =>
+      promptRegressionIds.filter((evaluationId) => {
+        const run = confirmationRuns.find((item) => item.evaluationId === evaluationId);
+        return !run || run.status !== "completed" || run.score === undefined;
+      }),
+    );
+    const retryCount = incompleteBatchIds.reduce((total, evaluationIds) => total + evaluationIds.length, 0);
+    if (retryCount) {
+      await this.store.addActivity({
+        type: "evaluation",
+        message: `Retrying ${retryCount} incomplete prompt confirmation sample${retryCount === 1 ? "" : "s"} for ${candidateLabel}`,
+        detail: "Only missing samples are retried once; the candidate remains fail-closed if any retry is incomplete.",
+      });
+    }
+    const confirmationBatches = await Promise.all(initialConfirmationBatches.map(async (confirmationRuns, index) => {
+      const incompleteIds = incompleteBatchIds[index]!;
+      if (!incompleteIds.length) return confirmationRuns;
+      const retries = await this.runEvaluations("composite", cwd, agentRunId, compositeId, incompleteIds);
+      const completed = new Map(confirmationRuns
+        .filter((item) => item.status === "completed" && item.score !== undefined)
+        .map((item) => [item.evaluationId, item]));
+      for (const retry of retries) {
+        if (retry.status === "completed" && retry.score !== undefined) completed.set(retry.evaluationId, retry);
+      }
+      return promptRegressionIds.map((evaluationId) => completed.get(evaluationId)).filter((item): item is EvaluationRun => Boolean(item));
+    }));
     for (const confirmationRuns of confirmationBatches) {
       if (confirmationRuns.length !== promptRegressionIds.length || confirmationRuns.some((item) => item.status !== "completed" || item.score === undefined)) return undefined;
       for (const confirmationRun of confirmationRuns) samples.get(confirmationRun.evaluationId)!.push(confirmationRun);

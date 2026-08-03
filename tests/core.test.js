@@ -1348,6 +1348,50 @@ test("composite prompt regressions use a persisted median without rerunning comm
   }
 });
 
+test("prompt regression confirmation retries only incomplete samples once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-prompt-confirmation-retry-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [
+        { id: "quality", name: "Quality", prompt: "Score quality", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "integrity", name: "Integrity", prompt: "Score integrity", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+      state.evaluationRuns.push(
+        { id: "baseline-quality", evaluationId: "quality", score: 80, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" },
+        { id: "baseline-integrity", evaluationId: "integrity", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" },
+      );
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    const calls = [];
+    orchestrator.runEvaluations = async (_context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+      calls.push(evaluationIds);
+      if (calls.length === 1) return [
+        { id: "quality-a", evaluationId: "quality", score: 80, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" },
+        { id: "integrity-timeout", evaluationId: "integrity", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "failed", error: "timed out", context: "composite" },
+      ];
+      if (calls.length === 2) return [
+        { id: "quality-b", evaluationId: "quality", score: 85, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" },
+        { id: "integrity-b", evaluationId: "integrity", score: 90, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" },
+      ];
+      return [{ id: "integrity-retry", evaluationId: "integrity", score: 95, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" }];
+    };
+    const initial = [
+      { id: "quality-low", evaluationId: "quality", score: 75, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" },
+      { id: "integrity-low", evaluationId: "integrity", score: 85, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" },
+    ];
+    const confirmed = await orchestrator.confirmPromptRegressions(root, store.latestRuns(), initial, "PR #10", "leaf");
+    assert.deepEqual(calls, [["quality", "integrity"], ["quality", "integrity"], ["integrity"]]);
+    assert.equal(confirmed.find((run) => run.evaluationId === "quality").score, 80);
+    assert.equal(confirmed.find((run) => run.evaluationId === "integrity").score, 90);
+    assert.ok(store.get().activity.some((item) => item.message === "Retrying 1 incomplete prompt confirmation sample for PR #10"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a failed current generation immediately unlocks a fully validated leaf fallback before cook lead time", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-failed-generation-fallback-test-"));
   try {
