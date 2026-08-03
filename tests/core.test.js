@@ -216,7 +216,8 @@ test("candidate work cannot replace Burner's merge-coupled progress ownership", 
   const root = await mkdtemp(join(tmpdir(), "burner-progress-boundary-test-"));
   try {
     await exec(root, "git", ["init", "-b", "main"]);
-    await writeFile(join(root, "README.md"), "# Demo\n");
+    const managedReadme = "# Demo\n\n<!-- burner-progress:start -->\n## Burner evaluation progress\n\n![Burner evaluation progress](docs/burner-evaluation-progress.svg)\n<!-- burner-progress:end -->\n";
+    await writeFile(join(root, "README.md"), managedReadme);
     await exec(root, "git", ["add", "README.md"]);
     await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "seed"]);
     const base = (await exec(root, "git", ["rev-parse", "HEAD"])).trim();
@@ -227,6 +228,12 @@ test("candidate work cannot replace Burner's merge-coupled progress ownership", 
     await writeFile(join(root, "scripts", "evaluation_progress.py"), "duplicate\n");
     await assert.rejects(() => orchestrator.assertCandidateDoesNotOwnProgress(root, base), /Candidate attempted to own Burner's merge-coupled evaluation progress/);
     await rm(join(root, "scripts"), { recursive: true, force: true });
+    const documentedReadme = managedReadme.replace("<!-- burner-progress:start -->", "## Catalog queries\n\nOrdinary candidate documentation.\n\n<!-- burner-progress:start -->");
+    await writeFile(join(root, "README.md"), documentedReadme);
+    await orchestrator.assertCandidateDoesNotOwnProgress(root, base);
+    await writeFile(join(root, "README.md"), documentedReadme.replace("docs/burner-evaluation-progress.svg", "candidate-owned.svg"));
+    await assert.rejects(() => orchestrator.assertCandidateDoesNotOwnProgress(root, base), /managed README section/);
+    await writeFile(join(root, "README.md"), documentedReadme);
     await writeFile(join(root, "src.rs"), "ordinary candidate code\n");
     await orchestrator.assertCandidateDoesNotOwnProgress(root, base);
   } finally {

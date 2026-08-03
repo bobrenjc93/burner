@@ -1,5 +1,5 @@
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { realpath } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import type { AgentRun, BurnerState, CompositePr, CompositeSource, Evaluation, EvaluationRun, Idea, ReviewRound, RuntimeStatus, ScoreDelta } from "../types.js";
 import { CodexClient, type ReviewResult, type SessionResult } from "./codex.js";
 import { EventHub } from "./events.js";
@@ -317,12 +317,13 @@ export class Orchestrator {
   }
 
   private async assertCandidateDoesNotOwnProgress(cwd: string, sinceCommit: string): Promise<void> {
-    const [changed, status, readmeDiff] = await Promise.all([
+    const [changed, status, baseReadme, currentReadme] = await Promise.all([
       runCommand("git", ["diff", "--name-only", sinceCommit, "--"], { cwd, timeoutMs: 10_000 }),
       runCommand("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd, timeoutMs: 10_000 }),
-      runCommand("git", ["diff", sinceCommit, "--", "README.md"], { cwd, timeoutMs: 10_000 }),
+      runCommand("git", ["show", `${sinceCommit}:README.md`], { cwd, timeoutMs: 10_000 }),
+      readFile(join(cwd, "README.md"), "utf8").catch(() => ""),
     ]);
-    if (changed.exitCode !== 0 || status.exitCode !== 0 || readmeDiff.exitCode !== 0) {
+    if (changed.exitCode !== 0 || status.exitCode !== 0) {
       throw new Error("Could not verify Burner-owned progress boundaries in the candidate worktree.");
     }
     const paths = new Set([
@@ -333,7 +334,16 @@ export class Orchestrator {
       /^docs\/burner-evaluation-(?:history\.json|progress\.svg)$/.test(path) ||
       /^\.github\/workflows\/.*evaluation[-_]progress/i.test(path) ||
       /^(?:scripts|tests)\/.*evaluation[-_]progress/i.test(path));
-    const managedReadmeChanged = /burner-progress:(?:start|end)|Burner evaluation progress/i.test(readmeDiff.stdout);
+    const managedProgressBlock = (readme: string): string | undefined => {
+      const startMarker = "<!-- burner-progress:start -->";
+      const endMarker = "<!-- burner-progress:end -->";
+      const start = readme.indexOf(startMarker);
+      const end = readme.indexOf(endMarker);
+      if (start < 0 && end < 0) return undefined;
+      if (start < 0 || end < start) return `malformed:${readme}`;
+      return readme.slice(start, end + endMarker.length);
+    };
+    const managedReadmeChanged = managedProgressBlock(baseReadme.exitCode === 0 ? baseReadme.stdout : "") !== managedProgressBlock(currentReadme);
     if (!forbidden.length && !managedReadmeChanged) return;
     throw new Error(`Candidate attempted to own Burner's merge-coupled evaluation progress${forbidden.length ? ` via ${forbidden.join(", ")}` : " via the managed README section"}. Burner rejected these changes before commit; it stamps canonical progress artifacts after final evaluation.`);
   }
