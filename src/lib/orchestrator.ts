@@ -209,6 +209,30 @@ export function compositeRevisionHeadroom(
   return { allowed: remainingMs >= reserveMs, remainingMs, reserveMs };
 }
 
+export function cachedFullMergeValidationResult(
+  run: Pick<AgentRun, "fullMergeValidation">,
+  baseCommit: string,
+  candidateCommit: string,
+  evaluationFingerprint: string,
+): boolean | undefined {
+  const cached = run.fullMergeValidation;
+  if (!cached || cached.baseCommit !== baseCommit || cached.candidateCommit !== candidateCommit || cached.evaluationFingerprint !== evaluationFingerprint) return undefined;
+  return cached.qualified;
+}
+
+function fullMergeValidationFingerprint(state: BurnerState): string {
+  return JSON.stringify({
+    threshold: state.settings.compositeAbsorbThreshold,
+    evaluations: state.evaluations.filter((evaluation) => evaluation.enabled).map((evaluation) => ({
+      id: evaluation.id,
+      name: evaluation.name,
+      prompt: evaluation.prompt,
+      command: evaluation.command,
+      weight: evaluation.weight,
+    })),
+  });
+}
+
 export function agentReviewCadenceHeadroom(
   state: BurnerState,
   baseCommit: string,
@@ -557,6 +581,10 @@ export class Orchestrator {
     const run = state.agentRuns.find((item) => item.id === runId);
     const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
     if (!run?.prNumber || !run.prState || run.prState !== "open") return false;
+    const candidateCommit = await this.git.resolveRef(run.branch);
+    const evaluationFingerprint = fullMergeValidationFingerprint(state);
+    const cached = cachedFullMergeValidationResult(run, baseCommit, candidateCommit, evaluationFingerprint);
+    if (cached !== undefined) return cached;
     const owner = `full-leaf-${run.id}`;
     let worktree = "";
     const createLock = await this.locks.acquire("git-metadata", `${owner}-create`);
@@ -582,10 +610,14 @@ export class Orchestrator {
         deltas = this.calculateDeltas(this.store.get(), baseline, afterRuns);
       }
       const impact = this.calculateImpact(this.store.get(), deltas);
-      await this.updateAgent(run.id, { deltas, impact });
-      await this.git.editPr(worktree, run.prNumber, idea?.title ?? run.branch, buildPrBody(idea?.description ?? "", run.lastMessage ?? "", deltas, impact, run.reviewRounds));
       const { enabled: ids, commands } = yoloEvaluationSets(this.store.get());
       const qualifies = isYoloCandidate(deltas, impact, ids, commands, state.settings.compositeAbsorbThreshold);
+      await this.updateAgent(run.id, {
+        deltas,
+        impact,
+        fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: qualifies, completedAt: now() },
+      });
+      await this.git.editPr(worktree, run.prNumber, idea?.title ?? run.branch, buildPrBody(idea?.description ?? "", run.lastMessage ?? "", deltas, impact, run.reviewRounds));
       if (!qualifies) await this.store.addActivity({ type: "agent", message: `Leaf rejected by full merge validation: ${idea?.title ?? run.branch}`, detail: "At least one full evaluation regressed or total impact was not positive; the PR remains unmerged." });
       return qualifies;
     } finally {

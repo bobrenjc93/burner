@@ -112,6 +112,13 @@ export type AgentRun = {
   quarantinedAt?: string;
   quarantineReason?: string;
   evaluationRetryCount?: number;
+  fullMergeValidation?: {
+    baseCommit: string;
+    candidateCommit: string;
+    evaluationFingerprint: string;
+    qualified: boolean;
+    completedAt: string;
+  };
 };
 
 export type CompositeSource = {

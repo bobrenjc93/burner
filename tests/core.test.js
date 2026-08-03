@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, compositeRevisionHeadroom, inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
@@ -256,6 +256,55 @@ test("composite evaluation revisions reserve enough merge-cadence headroom", () 
   assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 49 * 60_000), { allowed: true, remainingMs: 11 * 60_000, reserveMs: 10 * 60_000 });
   assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 51 * 60_000), { allowed: false, remainingMs: 9 * 60_000, reserveMs: 10 * 60_000 });
   assert.equal(compositeRevisionHeadroom(undefined, 60).allowed, true);
+});
+
+test("unchanged leaves reuse both accepted and rejected full merge validation", () => {
+  const baseCommit = "base-commit";
+  const candidateCommit = "candidate-commit";
+  const evaluationFingerprint = "evaluation-fingerprint";
+  const completedAt = "2026-01-01T00:00:00.000Z";
+  assert.equal(cachedFullMergeValidationResult({
+    fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: false, completedAt },
+  }, baseCommit, candidateCommit, evaluationFingerprint), false, "a rejected unchanged leaf must not launch the full suite again");
+  assert.equal(cachedFullMergeValidationResult({
+    fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: true, completedAt },
+  }, baseCommit, candidateCommit, evaluationFingerprint), true);
+  assert.equal(cachedFullMergeValidationResult({
+    fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: false, completedAt },
+  }, "new-base", candidateCommit, evaluationFingerprint), undefined, "a new baseline requires fresh validation");
+  assert.equal(cachedFullMergeValidationResult({
+    fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: false, completedAt },
+  }, baseCommit, "revised-candidate", evaluationFingerprint), undefined, "a revised leaf requires fresh validation");
+  assert.equal(cachedFullMergeValidationResult({
+    fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: false, completedAt },
+  }, baseCommit, candidateCommit, "changed-evaluations"), undefined, "changed evaluation policy requires fresh validation");
+});
+
+test("cached leaf merge validation bypasses the full evaluation suite", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-leaf-validation-cache-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [];
+      state.agentRuns = [{
+        id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp,
+        prNumber: 1, prState: "open", baseCommit: "base", deltas: [], resources: [], reviewRounds: [],
+        fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: JSON.stringify({ threshold: 0, evaluations: [] }), qualified: false, completedAt: timestamp },
+      }];
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { resolveRef: async () => "candidate" };
+    let evaluationSuites = 0;
+    orchestrator.runCandidateEvaluations = async () => { evaluationSuites += 1; throw new Error("cache miss"); };
+    assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), false);
+    await store.update((state) => { state.agentRuns[0].fullMergeValidation.qualified = true; });
+    assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), true);
+    assert.equal(evaluationSuites, 0, "neither cached result should rerun all evaluations");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("composite evaluation revisions fail closed instead of resampling an unchanged tree", () => {
