@@ -25,6 +25,8 @@ export type EvaluationRun = {
   context: "baseline" | "screening_baseline" | "agent" | "composite" | "manual";
   agentRunId?: string;
   compositeId?: string;
+  /** Number of independent prompt samples represented by this persisted median. */
+  promptSampleCount?: number;
 };
 
 export type Idea = {

@@ -732,69 +732,109 @@ export class Orchestrator {
       .filter((delta) => (delta.delta ?? 0) !== 0 && !enabled.find((evaluation) => evaluation.id === delta.evaluationId)?.command)
       .map((delta) => delta.evaluationId);
     if (!promptChangeIds.length) return afterRuns;
-    const samples = new Map(promptChangeIds.map((evaluationId) => [
-      evaluationId,
-      [afterRuns.find((item) => item.evaluationId === evaluationId)!],
-    ]));
+    const baselineConfirmationIds = promptChangeIds.filter((evaluationId) =>
+      (baseline.get(evaluationId)?.promptSampleCount ?? 1) < 3,
+    );
     await this.store.addActivity({
       type: "evaluation",
       message: `Confirming ${promptChangeIds.length} prompt change${promptChangeIds.length === 1 ? "" : "s"} for ${candidateLabel}`,
-      detail: "Burner will use the median of three independent prompt scores for gains and regressions; deterministic command results are never softened.",
+      detail: baselineConfirmationIds.length
+        ? "Burner will compare median-of-three prompt scores on both the baseline and candidate so a single noisy baseline cannot manufacture a gain or regression; deterministic command results are never softened."
+        : "Burner will compare the candidate median-of-three with the cached baseline median-of-three; deterministic command results are never softened.",
     });
-    const initialConfirmationBatches = await Promise.all([0, 1].map(() =>
-      this.runEvaluations("composite", cwd, agentRunId, compositeId, promptChangeIds),
-    ));
-    const incompleteBatchIds = initialConfirmationBatches.map((confirmationRuns) =>
-      promptChangeIds.filter((evaluationId) => {
-        const run = confirmationRuns.find((item) => item.evaluationId === evaluationId);
-        return !run || run.status !== "completed" || run.score === undefined;
-      }),
-    );
-    const retryCount = incompleteBatchIds.reduce((total, evaluationIds) => total + evaluationIds.length, 0);
-    if (retryCount) {
-      await this.store.addActivity({
-        type: "evaluation",
-        message: `Retrying ${retryCount} incomplete prompt confirmation sample${retryCount === 1 ? "" : "s"} for ${candidateLabel}`,
-        detail: "Only missing samples are retried once; the candidate remains fail-closed if any retry is incomplete.",
-      });
-    }
-    const confirmationBatches = await Promise.all(initialConfirmationBatches.map(async (confirmationRuns, index) => {
-      const incompleteIds = incompleteBatchIds[index]!;
-      if (!incompleteIds.length) return confirmationRuns;
-      const retries = await this.runEvaluations("composite", cwd, agentRunId, compositeId, incompleteIds);
-      const completed = new Map(confirmationRuns
-        .filter((item) => item.status === "completed" && item.score !== undefined)
-        .map((item) => [item.evaluationId, item]));
-      for (const retry of retries) {
-        if (retry.status === "completed" && retry.score !== undefined) completed.set(retry.evaluationId, retry);
+    const collectMedians = async (
+      context: EvaluationRun["context"],
+      runCwd: string,
+      evaluationIds: string[],
+      seeds: Map<string, EvaluationRun>,
+      retryLabel: string,
+      runAgentId?: string,
+      runCompositeId?: string,
+    ): Promise<Map<string, EvaluationRun> | undefined> => {
+      if (!evaluationIds.length) return new Map();
+      const initialConfirmationBatches = await Promise.all([0, 1].map(() =>
+        this.runEvaluations(context, runCwd, runAgentId, runCompositeId, evaluationIds),
+      ));
+      const incompleteBatchIds = initialConfirmationBatches.map((confirmationRuns) =>
+        evaluationIds.filter((evaluationId) => {
+          const run = confirmationRuns.find((item) => item.evaluationId === evaluationId);
+          return !run || run.status !== "completed" || run.score === undefined;
+        }),
+      );
+      const retryCount = incompleteBatchIds.reduce((total, evaluationIds) => total + evaluationIds.length, 0);
+      if (retryCount) {
+        await this.store.addActivity({
+          type: "evaluation",
+          message: `Retrying ${retryCount} incomplete prompt confirmation sample${retryCount === 1 ? "" : "s"} for ${retryLabel}`,
+          detail: "Only missing samples are retried once; the candidate remains fail-closed if any retry is incomplete.",
+        });
       }
-      return promptChangeIds.map((evaluationId) => completed.get(evaluationId)).filter((item): item is EvaluationRun => Boolean(item));
-    }));
-    for (const confirmationRuns of confirmationBatches) {
-      if (confirmationRuns.length !== promptChangeIds.length || confirmationRuns.some((item) => item.status !== "completed" || item.score === undefined)) return undefined;
-      for (const confirmationRun of confirmationRuns) samples.get(confirmationRun.evaluationId)!.push(confirmationRun);
-    }
-    const medians = new Map([...samples].map(([evaluationId, runs]) => [
-      evaluationId,
-      [...runs].sort((left, right) => left.score! - right.score!)[Math.floor(runs.length / 2)]!,
-    ]));
-    if (compositeId) {
-      const recordedAt = now();
-      await this.store.update((draft) => {
-        for (const [evaluationId, median] of medians) {
-          draft.evaluationRuns.push({
-            ...median,
-            id: id("evalrun"),
-            evaluationId,
-            createdAt: recordedAt,
-            context: "composite",
-            agentRunId: undefined,
-            compositeId,
-          });
+      const confirmationBatches = await Promise.all(initialConfirmationBatches.map(async (confirmationRuns, index) => {
+        const incompleteIds = incompleteBatchIds[index]!;
+        if (!incompleteIds.length) return confirmationRuns;
+        const retries = await this.runEvaluations(context, runCwd, runAgentId, runCompositeId, incompleteIds);
+        const completed = new Map(confirmationRuns
+          .filter((item) => item.status === "completed" && item.score !== undefined)
+          .map((item) => [item.evaluationId, item]));
+        for (const retry of retries) {
+          if (retry.status === "completed" && retry.score !== undefined) completed.set(retry.evaluationId, retry);
         }
-      });
-    }
-    return afterRuns.map((item) => medians.get(item.evaluationId) ?? item);
+        return evaluationIds.map((evaluationId) => completed.get(evaluationId)).filter((item): item is EvaluationRun => Boolean(item));
+      }));
+      const samples = new Map(evaluationIds.map((evaluationId) => [evaluationId, [seeds.get(evaluationId)!]]));
+      for (const confirmationRuns of confirmationBatches) {
+        if (confirmationRuns.length !== evaluationIds.length || confirmationRuns.some((item) => item.status !== "completed" || item.score === undefined)) return undefined;
+        for (const confirmationRun of confirmationRuns) samples.get(confirmationRun.evaluationId)!.push(confirmationRun);
+      }
+      for (const [evaluationId, runs] of samples) {
+        const seed = seeds.get(evaluationId);
+        if (!seed || seed.status !== "completed" || seed.score === undefined || runs.some((run) => run.commit !== seed.commit)) return undefined;
+      }
+      return new Map([...samples].map(([evaluationId, runs]) => {
+        const median = [...runs].sort((left, right) => left.score! - right.score!)[Math.floor(runs.length / 2)]!;
+        return [evaluationId, { ...median, promptSampleCount: 3 }];
+      }));
+    };
+    const candidateSeeds = new Map(promptChangeIds.map((evaluationId) => [
+      evaluationId,
+      afterRuns.find((item) => item.evaluationId === evaluationId)!,
+    ]));
+    const baselineSeeds = new Map(baselineConfirmationIds.map((evaluationId) => [evaluationId, baseline.get(evaluationId)!]));
+    const [candidateMedians, baselineMedians] = await Promise.all([
+      collectMedians("composite", cwd, promptChangeIds, candidateSeeds, candidateLabel, agentRunId, compositeId),
+      collectMedians("baseline", this.root, baselineConfirmationIds, baselineSeeds, `${candidateLabel} baseline`),
+    ]);
+    if (!candidateMedians || !baselineMedians) return undefined;
+    for (const [evaluationId, median] of baselineMedians) baseline.set(evaluationId, median);
+    const recordedAt = now();
+    await this.store.update((draft) => {
+      for (const [evaluationId, median] of baselineMedians) {
+        draft.evaluationRuns.push({
+          ...median,
+          id: id("evalrun"),
+          evaluationId,
+          createdAt: recordedAt,
+          context: "baseline",
+          agentRunId: undefined,
+          compositeId: undefined,
+          promptSampleCount: 3,
+        });
+      }
+      if (!compositeId) return;
+      for (const [evaluationId, median] of candidateMedians) {
+        draft.evaluationRuns.push({
+          ...median,
+          id: id("evalrun"),
+          evaluationId,
+          createdAt: recordedAt,
+          context: "composite",
+          agentRunId: undefined,
+          compositeId,
+          promptSampleCount: 3,
+        });
+      }
+    });
+    return afterRuns.map((item) => candidateMedians.get(item.evaluationId) ?? item);
   }
 
   private async autoCookNext(): Promise<boolean> {

@@ -1361,7 +1361,7 @@ test("cadence-driven single leaves receive full evaluation validation before mer
   }
 });
 
-test("cadence-driven leaf validation confirms prompt regressions with a median without rerunning commands", async () => {
+test("cadence-driven leaf validation symmetrically confirms prompt changes without rerunning commands", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-prompt-confirmation-test-"));
   try {
     const store = new StateStore(root);
@@ -1391,24 +1391,36 @@ test("cadence-driven leaf validation confirms prompt regressions with a median w
       { id: "full-bench", evaluationId: "bench", score: 95, summary: "full", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" },
       { id: "quality-first", evaluationId: "quality", score: 45, summary: "noisy low", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" },
     ];
-    const confirmationScores = [50, 55];
-    let confirmationCalls = 0;
+    const candidateScores = [50, 55];
+    const baselineScores = [50, 45];
+    const confirmationCalls = [];
     orchestrator.runEvaluations = async (context, _cwd, agentRunId, compositeId, evaluationIds) => {
+      assert.deepEqual(evaluationIds, ["quality"], "the command-backed benchmark must not be rerun or averaged");
+      confirmationCalls.push({ context, agentRunId, compositeId });
+      if (context === "baseline") {
+        assert.equal(agentRunId, undefined);
+        assert.equal(compositeId, undefined);
+        const score = baselineScores.shift();
+        return [{ id: `baseline-quality-${confirmationCalls.length}`, evaluationId: "quality", score, summary: "baseline confirmation", commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" }];
+      }
       assert.equal(context, "composite");
       assert.equal(agentRunId, "leaf");
       assert.equal(compositeId, undefined);
-      assert.deepEqual(evaluationIds, ["quality"], "the command-backed benchmark must not be rerun or averaged");
-      const score = confirmationScores[confirmationCalls++];
-      return [{ id: `quality-${confirmationCalls}`, evaluationId: "quality", score, summary: "confirmation", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" }];
+      const score = candidateScores.shift();
+      return [{ id: `quality-${confirmationCalls.length}`, evaluationId: "quality", score, summary: "candidate confirmation", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" }];
     };
     await orchestrator.locks.init();
     assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), true);
-    assert.equal(confirmationCalls, 2);
+    assert.equal(confirmationCalls.filter((call) => call.context === "composite").length, 2);
+    assert.equal(confirmationCalls.filter((call) => call.context === "baseline").length, 2);
     assert.deepEqual(store.get().agentRuns[0].deltas.map(({ evaluationId, delta }) => ({ evaluationId, delta })), [
       { evaluationId: "bench", delta: 5 },
       { evaluationId: "quality", delta: 0 },
     ]);
+    assert.equal(store.latestRuns().get("quality").score, 50);
+    assert.equal(store.latestRuns().get("quality").promptSampleCount, 3);
     assert.ok(store.get().activity.some((item) => item.message === "Confirming 1 prompt change for PR #10"));
+    assert.ok(store.get().activity.some((item) => item.detail.includes("both the baseline and candidate")));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1427,7 +1439,7 @@ test("composite prompt gains use a persisted median without rerunning commands",
       ];
       state.evaluationRuns.push(
         { id: "baseline-bench", evaluationId: "bench", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" },
-        { id: "baseline-quality", evaluationId: "quality", score: 50, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" },
+        { id: "baseline-quality", evaluationId: "quality", score: 50, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3 },
       );
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
@@ -1455,6 +1467,52 @@ test("composite prompt gains use a persisted median without rerunning commands",
   }
 });
 
+test("a confirmed baseline median prevents a noisy single sample from inventing a regression", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-symmetric-baseline-confirmation-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [{ id: "integrity", name: "Integrity", prompt: "Score integrity", weight: 1, enabled: true, createdAt: timestamp }];
+      state.evaluationRuns.push({ id: "baseline-high", evaluationId: "integrity", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    const candidateScores = [85, 90];
+    const baselineScores = [85, 85];
+    const calls = [];
+    orchestrator.runEvaluations = async (context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+      assert.deepEqual(evaluationIds, ["integrity"]);
+      calls.push(context);
+      const baseline = context === "baseline";
+      const score = (baseline ? baselineScores : candidateScores).shift();
+      return [{
+        id: `${context}-${calls.length}`,
+        evaluationId: "integrity",
+        score,
+        summary: "confirmation",
+        commit: baseline ? "base" : "candidate",
+        createdAt: timestamp,
+        durationMs: 1,
+        status: "completed",
+        context,
+      }];
+    };
+    const baseline = store.latestRuns();
+    const initial = [{ id: "candidate-low", evaluationId: "integrity", score: 85, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" }];
+    const confirmed = await orchestrator.confirmPromptChanges(root, baseline, initial, "composite PR #99", undefined, "combined");
+    assert.equal(confirmed.find((run) => run.evaluationId === "integrity").score, 85);
+    assert.equal(baseline.get("integrity").score, 85, "comparison must use the confirmed baseline median, not its noisy first sample");
+    assert.equal(baseline.get("integrity").promptSampleCount, 3);
+    assert.equal(store.latestRuns().get("integrity").score, 85);
+    assert.equal(store.latestRuns().get("integrity").promptSampleCount, 3);
+    assert.equal(calls.filter((context) => context === "baseline").length, 2);
+    assert.equal(calls.filter((context) => context === "composite").length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("prompt change confirmation retries only incomplete samples once", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-prompt-confirmation-retry-test-"));
   try {
@@ -1467,8 +1525,8 @@ test("prompt change confirmation retries only incomplete samples once", async ()
         { id: "integrity", name: "Integrity", prompt: "Score integrity", weight: 1, enabled: true, createdAt: timestamp },
       ];
       state.evaluationRuns.push(
-        { id: "baseline-quality", evaluationId: "quality", score: 80, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" },
-        { id: "baseline-integrity", evaluationId: "integrity", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" },
+        { id: "baseline-quality", evaluationId: "quality", score: 80, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3 },
+        { id: "baseline-integrity", evaluationId: "integrity", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3 },
       );
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
