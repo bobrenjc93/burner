@@ -37,6 +37,13 @@ export class GitService {
     private readonly mergePolling: { attempts?: number; intervalMs?: number; mergeAttempts?: number; checkAttempts?: number; noCheckGraceAttempts?: number } = {},
   ) {}
 
+  private async prepareWorktreePath(path: string, worktreesDir: string): Promise<void> {
+    await mkdir(worktreesDir, { recursive: true });
+    await rm(path, { recursive: true, force: true });
+    const prune = await runCommand("git", ["worktree", "prune", "--expire", "now"], { cwd: this.root });
+    if (prune.exitCode !== 0) throw new Error(prune.stderr.trim() || "Could not prune stale worktree registrations");
+  }
+
   async status(): Promise<{ available: boolean; branch?: string; commit?: string; dirty?: boolean }> {
     const inside = await runCommand("git", ["rev-parse", "--is-inside-work-tree"], { cwd: this.root }).catch(() => undefined);
     if (!inside || inside.exitCode !== 0) return { available: false };
@@ -78,8 +85,7 @@ export class GitService {
   async createWorktree(runId: string, branch: string, baseBranch: string): Promise<string> {
     const worktreesDir = join(this.dataDir, "worktrees");
     const path = join(worktreesDir, runId);
-    await mkdir(worktreesDir, { recursive: true });
-    await rm(path, { recursive: true, force: true });
+    await this.prepareWorktreePath(path, worktreesDir);
     const result = await runCommand("git", ["worktree", "add", "-b", branch, path, baseBranch], { cwd: this.root });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not create worktree");
     return path;
@@ -88,8 +94,7 @@ export class GitService {
   async createDetachedWorktree(runId: string, ref: string): Promise<string> {
     const worktreesDir = join(this.dataDir, "worktrees");
     const path = join(worktreesDir, runId);
-    await mkdir(worktreesDir, { recursive: true });
-    await rm(path, { recursive: true, force: true });
+    await this.prepareWorktreePath(path, worktreesDir);
     const result = await runCommand("git", ["worktree", "add", "--detach", path, ref], { cwd: this.root });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not create planning worktree at ${ref}`);
     return path;
@@ -98,8 +103,7 @@ export class GitService {
   async createRebuildWorktree(runId: string, branch: string, baseBranch: string): Promise<string> {
     const worktreesDir = join(this.dataDir, "worktrees");
     const path = join(worktreesDir, runId);
-    await mkdir(worktreesDir, { recursive: true });
-    await rm(path, { recursive: true, force: true });
+    await this.prepareWorktreePath(path, worktreesDir);
     const add = await runCommand("git", ["worktree", "add", path, branch], { cwd: this.root });
     if (add.exitCode !== 0) throw new Error(add.stderr.trim() || "Could not recreate composite worktree");
     const reset = await runCommand("git", ["reset", "--hard", baseBranch], { cwd: path });
@@ -110,8 +114,7 @@ export class GitService {
   async createExistingWorktree(runId: string, branch: string): Promise<string> {
     const worktreesDir = join(this.dataDir, "worktrees");
     const path = join(worktreesDir, runId);
-    await mkdir(worktreesDir, { recursive: true });
-    await rm(path, { recursive: true, force: true });
+    await this.prepareWorktreePath(path, worktreesDir);
     const add = await runCommand("git", ["worktree", "add", path, branch], { cwd: this.root });
     if (add.exitCode !== 0) throw new Error(add.stderr.trim() || "Could not check out the living composite worktree");
     return path;

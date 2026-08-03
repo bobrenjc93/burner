@@ -765,7 +765,10 @@ test("git service assembles source branches into an actual composite worktree", 
     const evolving = await git.createExistingWorktree("evolving", "burner/composite-test");
     assert.equal((await git.mergeBranch(evolving, "burner/experiment-test")).merged, true);
     assert.equal(await import("node:fs/promises").then((fs) => fs.readFile(join(evolving, "experiment.txt"), "utf8")), "win\n");
-    await git.removeWorktree(evolving);
+    await rm(evolving, { recursive: true, force: true });
+    const recovered = await git.createExistingWorktree("evolving", "burner/composite-test");
+    assert.equal(await import("node:fs/promises").then((fs) => fs.readFile(join(recovered, "experiment.txt"), "utf8")), "win\n", "missing but registered worktrees must self-heal");
+    await git.removeWorktree(recovered);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
