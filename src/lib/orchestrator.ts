@@ -382,6 +382,10 @@ export class Orchestrator {
     return Boolean(anchor && Date.now() - new Date(anchor).getTime() >= state.settings.mergeCadenceMinutes * 60_000);
   }
 
+  private mergeCadenceUrgent(state = this.store.get()): boolean {
+    return this.mergeCadenceDue(state) || Boolean(state.orchestrator.lastMergeCadenceAlertAt);
+  }
+
   private portfolioCookDue(state = this.store.get(), baseCommit?: string): boolean {
     if (!this.portfolioMode()) return false;
     const anchor = state.orchestrator.mergeWindowStartedAt;
@@ -426,11 +430,15 @@ export class Orchestrator {
     const reviewedLeaves = state.agentRuns.filter((run) =>
       run.status === "completed" && run.prState === "open" && run.baseCommit === baseCommit && finalReviewApproved(run.reviewApproved, run.reviewRounds));
     const eligibleLeaves = eligibleYoloLeaves(state, baseCommit);
-    await this.store.update((draft) => { draft.orchestrator.lastMergeCadenceAlertAt = now(); });
+    const breachedAt = now();
+    await this.store.update((draft) => {
+      draft.orchestrator.lastMergeCadenceAlertAt = breachedAt;
+      draft.orchestrator.mergeWindowStartedAt = breachedAt;
+    });
     await this.store.addActivity({
       type: "error",
       message: "Merge cadence missed",
-      detail: `No qualifying merge completed within ${state.settings.mergeCadenceMinutes} minutes. ${reviewedLeaves.length} reviewed open leaf PR${reviewedLeaves.length === 1 ? " is" : "s are"} available; ${eligibleLeaves.length} ${eligibleLeaves.length === 1 ? "is" : "are"} batch-eligible after completeness, impact, command-regression, quarantine, and reservation checks. Burner will shorten the next batch and preserve strict full-composite validation.`,
+      detail: `No qualifying merge completed within ${state.settings.mergeCadenceMinutes} minutes. ${reviewedLeaves.length} reviewed open leaf PR${reviewedLeaves.length === 1 ? " is" : "s are"} available; ${eligibleLeaves.length} ${eligibleLeaves.length === 1 ? "is" : "are"} batch-eligible after completeness, impact, command-regression, quarantine, and reservation checks. Burner opened a fresh bounded recovery window, will shorten the next batch, and will preserve strict full-composite validation.`,
     });
   }
 
@@ -537,7 +545,7 @@ export class Orchestrator {
   private async autoMergeNext(): Promise<boolean> {
     let state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
-    const cadenceDue = this.mergeCadenceDue(state);
+    const cadenceDue = this.mergeCadenceUrgent(state);
     const cookDue = this.portfolioCookDue(state, baseCommit);
     const failedCurrentGeneration = state.composites.some((composite) => composite.status === "failed" && composite.baseCommit === baseCommit);
     const cadenceNeedsSingleLeaf = failedCurrentGeneration || ((cadenceDue || cookDue) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0);
@@ -730,7 +738,7 @@ export class Orchestrator {
     if (this.yoloBatchSize < 2) return false;
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
-    const cadenceDue = this.mergeCadenceDue(state);
+    const cadenceDue = this.mergeCadenceUrgent(state);
     const cookDue = cadenceDue || this.portfolioCookDue(state, baseCommit);
     const leafIds = selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, cookDue ? 2 : this.yoloBatchSize);
     if (!leafIds.length) return false;
@@ -749,7 +757,7 @@ export class Orchestrator {
     if (!this.yolo || this.yoloBatchSize < 2 || this.activeAgents.size === 0 || this.activeComposites.size > 0) return false;
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
-    const cadenceDue = this.mergeCadenceDue(state);
+    const cadenceDue = this.mergeCadenceUrgent(state);
     const cookDue = cadenceDue || this.portfolioCookDue(state, baseCommit);
     const eligible = eligibleYoloLeaves(state, baseCommit);
     const selected = cookDue

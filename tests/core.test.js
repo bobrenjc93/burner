@@ -1061,6 +1061,32 @@ test("YOLO starts a partial cook early enough for the observed full suite to mee
   }
 });
 
+test("a missed merge cadence opens a bounded recovery window without losing urgency", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-cadence-recovery-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.mergeWindowStartedAt = new Date(Date.now() - 61 * 60_000).toISOString();
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    assert.equal(orchestrator.mergeCadenceDue(), true);
+    await orchestrator.recordCadenceBreach();
+    const recovered = store.get();
+    assert.equal(recovered.orchestrator.mergeWindowStartedAt, recovered.orchestrator.lastMergeCadenceAlertAt);
+    assert.equal(orchestrator.mergeCadenceDue(), false, "the new recovery window must have revision headroom");
+    assert.equal(orchestrator.mergeCadenceUrgent(), true, "recovery must still prioritize a shortened cook or leaf fallback");
+    assert.equal(compositeRevisionHeadroom(recovered.orchestrator.mergeWindowStartedAt, 60).allowed, true);
+    assert.match(recovered.activity[0].detail, /fresh bounded recovery window/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("YOLO cooks validated leaves before another observed leaf cycle can consume the merge reserve", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-authoring-headroom-test-"));
   try {
