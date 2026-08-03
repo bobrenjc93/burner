@@ -569,6 +569,48 @@ test("portfolio merge clock starts after full and screening baselines", async ()
   }
 });
 
+test("prompt baselines are median-confirmed before the cadence clock starts and then reused", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-baseline-median-clock-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score quality", weight: 1, enabled: true, createdAt: timestamp }];
+      state.evaluationRuns.push({ id: "baseline-seed", evaluationId: "quality", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" });
+      state.orchestrator.lastEvaluationAt = undefined;
+      state.orchestrator.mergeWindowStartedAt = undefined;
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    const calls = [];
+    orchestrator.runEvaluations = async (context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+      assert.equal(store.get().orchestrator.mergeWindowStartedAt, undefined, "the clock must remain stopped during every confirmation attempt");
+      calls.push({ context, evaluationIds });
+      if (calls.length === 1) return [{ id: "timeout", evaluationId: "quality", commit: "base", createdAt: timestamp, durationMs: 1, status: "failed", error: "timed out", context: "baseline" }];
+      const score = calls.length === 2 ? 85 : 80;
+      return [{ id: `sample-${calls.length}`, evaluationId: "quality", score, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" }];
+    };
+    await orchestrator.runBaselineEvaluations("baseline");
+    assert.deepEqual(calls, [
+      { context: "baseline", evaluationIds: ["quality"] },
+      { context: "baseline", evaluationIds: ["quality"] },
+      { context: "baseline", evaluationIds: ["quality"] },
+    ]);
+    assert.equal(store.latestRuns().get("quality").score, 85);
+    assert.equal(store.latestRuns().get("quality").promptSampleCount, 3);
+    assert.ok(store.get().orchestrator.lastEvaluationAt);
+    assert.ok(store.get().orchestrator.mergeWindowStartedAt);
+    assert.ok(store.get().activity.some((item) => item.message === "Retrying 1 incomplete prompt confirmation sample for the baseline"));
+    const anchoredAt = store.get().orchestrator.mergeWindowStartedAt;
+    await orchestrator.runBaselineEvaluations("baseline");
+    assert.equal(calls.length, 3, "a persisted baseline median must not be sampled again");
+    assert.equal(store.get().orchestrator.mergeWindowStartedAt, anchoredAt);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("baseline recovery reruns only evaluations missing at the current commit", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-partial-baseline-test-"));
   try {
@@ -580,14 +622,14 @@ test("baseline recovery reruns only evaluations missing at the current commit", 
         { id: "done", name: "Done", prompt: "Measure", weight: 1, enabled: true, createdAt: timestamp },
         { id: "missing", name: "Missing", prompt: "Measure", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp },
       ];
-      state.evaluationRuns.push({ id: "done-run", evaluationId: "done", score: 95, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" });
+      state.evaluationRuns.push({ id: "done-run", evaluationId: "done", score: 95, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3 });
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
     orchestrator.git = { resolveRef: async () => "base" };
     const calls = [];
     orchestrator.runEvaluations = async (context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
       calls.push({ context, evaluationIds });
-      const run = { id: `run-${context}`, evaluationId: "missing", score: 92, commit: "base", createdAt: new Date().toISOString(), durationMs: 1, status: "completed", context };
+      const run = { id: `run-${calls.length}`, evaluationId: "missing", score: 92, commit: "base", createdAt: new Date().toISOString(), durationMs: 1, status: "completed", context };
       await store.update((state) => state.evaluationRuns.push(run));
       return [run];
     };
@@ -595,7 +637,10 @@ test("baseline recovery reruns only evaluations missing at the current commit", 
     assert.deepEqual(calls, [
       { context: "baseline", evaluationIds: ["missing"] },
       { context: "screening_baseline", evaluationIds: ["missing"] },
+      { context: "baseline", evaluationIds: ["missing"] },
+      { context: "baseline", evaluationIds: ["missing"] },
     ]);
+    assert.equal(store.latestRuns().get("missing").promptSampleCount, 3);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -2266,15 +2311,24 @@ test("an exactly merged composite becomes the next full baseline without rerunni
     await store.init();
     const timestamp = new Date().toISOString();
     await store.update((state) => {
-      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp }];
+      state.evaluations = [
+        { id: "quality", name: "Quality", prompt: "Score", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "docs", name: "Docs", prompt: "Score docs", weight: 1, enabled: true, createdAt: timestamp },
+      ];
       state.composites.push({ id: "combined", title: "Combined", description: "", status: "merged", branch: "burner/combined", worktree: "", sources: [], deltas: [], reviewRounds: [], createdAt: timestamp, updatedAt: timestamp, isLiving: false });
-      state.evaluationRuns.push({ id: "combined-score", evaluationId: "quality", score: 88, commit: "combined-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "combined" });
+      state.evaluationRuns.push(
+        { id: "baseline-docs", evaluationId: "docs", score: 75, commit: "old-main", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3 },
+        { id: "combined-score", evaluationId: "quality", score: 88, commit: "combined-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "combined" },
+        { id: "combined-docs", evaluationId: "docs", score: 75, commit: "combined-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "combined" },
+      );
     });
     const orchestrator = new Orchestrator(root, store, new EventHub());
     orchestrator.git = { tree: async () => "same-tree" };
     assert.equal(await orchestrator.promoteMergedCompositeBaseline("combined", "new-main"), true);
     assert.equal(store.latestRuns().get("quality").score, 88);
     assert.equal(store.latestRuns().get("quality").commit, "new-main");
+    assert.equal(store.latestRuns().get("docs").score, 75);
+    assert.equal(store.latestRuns().get("docs").promptSampleCount, 3, "an unchanged prompt score must carry the confirmed baseline median forward");
     assert.equal(store.latestScreeningRuns().size, 0);
   } finally {
     await rm(root, { recursive: true, force: true });

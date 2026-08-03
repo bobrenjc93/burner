@@ -75,6 +75,10 @@ function yoloEvaluationSets(state: BurnerState): { enabled: Set<string>; command
   };
 }
 
+function isAuthoritativeFullBaseline(evaluation: Evaluation, run: EvaluationRun | undefined, commit: string): boolean {
+  return run?.commit === commit && (Boolean(evaluation.command) || (run.promptSampleCount ?? 0) >= 3);
+}
+
 export function inferIdeaResources(idea: Pick<Idea, "title" | "description" | "rationale">): string[] {
   const focus = `${idea.title} ${idea.rationale}`;
   const text = `${idea.title} ${idea.description} ${idea.rationale}`;
@@ -559,7 +563,7 @@ export class Orchestrator {
     const screeningBaseline = this.store.latestScreeningRuns();
     await this.store.update((draft) => {
       const enabled = draft.evaluations.filter((evaluation) => evaluation.enabled);
-      const complete = enabled.every((evaluation) => fullBaseline.get(evaluation.id)?.commit === baseCommit) &&
+      const complete = enabled.every((evaluation) => isAuthoritativeFullBaseline(evaluation, fullBaseline.get(evaluation.id), baseCommit)) &&
         (!this.portfolioMode() || enabled.every((evaluation) => !evaluation.screeningCommand || screeningBaseline.get(evaluation.id)?.commit === baseCommit));
       if (complete) {
         draft.orchestrator.mergeWindowStartedAt ??= now();
@@ -717,6 +721,60 @@ export class Orchestrator {
     }
   }
 
+  private async collectPromptMedians(
+    context: EvaluationRun["context"],
+    cwd: string,
+    evaluationIds: string[],
+    seeds: Map<string, EvaluationRun>,
+    retryLabel: string,
+    agentRunId?: string,
+    compositeId?: string,
+  ): Promise<Map<string, EvaluationRun> | undefined> {
+    if (!evaluationIds.length) return new Map();
+    const initialConfirmationBatches = await Promise.all([0, 1].map(() =>
+      this.runEvaluations(context, cwd, agentRunId, compositeId, evaluationIds),
+    ));
+    const incompleteBatchIds = initialConfirmationBatches.map((confirmationRuns) =>
+      evaluationIds.filter((evaluationId) => {
+        const run = confirmationRuns.find((item) => item.evaluationId === evaluationId);
+        return !run || run.status !== "completed" || run.score === undefined;
+      }),
+    );
+    const retryCount = incompleteBatchIds.reduce((total, ids) => total + ids.length, 0);
+    if (retryCount) {
+      await this.store.addActivity({
+        type: "evaluation",
+        message: `Retrying ${retryCount} incomplete prompt confirmation sample${retryCount === 1 ? "" : "s"} for ${retryLabel}`,
+        detail: "Only missing samples are retried once; scoring remains fail-closed if any retry is incomplete.",
+      });
+    }
+    const confirmationBatches = await Promise.all(initialConfirmationBatches.map(async (confirmationRuns, index) => {
+      const incompleteIds = incompleteBatchIds[index]!;
+      if (!incompleteIds.length) return confirmationRuns;
+      const retries = await this.runEvaluations(context, cwd, agentRunId, compositeId, incompleteIds);
+      const completed = new Map(confirmationRuns
+        .filter((item) => item.status === "completed" && item.score !== undefined)
+        .map((item) => [item.evaluationId, item]));
+      for (const retry of retries) {
+        if (retry.status === "completed" && retry.score !== undefined) completed.set(retry.evaluationId, retry);
+      }
+      return evaluationIds.map((evaluationId) => completed.get(evaluationId)).filter((item): item is EvaluationRun => Boolean(item));
+    }));
+    const samples = new Map(evaluationIds.map((evaluationId) => [evaluationId, [seeds.get(evaluationId)!]]));
+    for (const confirmationRuns of confirmationBatches) {
+      if (confirmationRuns.length !== evaluationIds.length || confirmationRuns.some((item) => item.status !== "completed" || item.score === undefined)) return undefined;
+      for (const confirmationRun of confirmationRuns) samples.get(confirmationRun.evaluationId)!.push(confirmationRun);
+    }
+    for (const [evaluationId, runs] of samples) {
+      const seed = seeds.get(evaluationId);
+      if (!seed || seed.status !== "completed" || seed.score === undefined || runs.some((run) => run.commit !== seed.commit)) return undefined;
+    }
+    return new Map([...samples].map(([evaluationId, runs]) => {
+      const median = [...runs].sort((left, right) => left.score! - right.score!)[Math.floor(runs.length / 2)]!;
+      return [evaluationId, { ...median, promptSampleCount: 3 }];
+    }));
+  }
+
   private async confirmPromptChanges(
     cwd: string,
     baseline: Map<string, EvaluationRun>,
@@ -742,67 +800,14 @@ export class Orchestrator {
         ? "Burner will compare median-of-three prompt scores on both the baseline and candidate so a single noisy baseline cannot manufacture a gain or regression; deterministic command results are never softened."
         : "Burner will compare the candidate median-of-three with the cached baseline median-of-three; deterministic command results are never softened.",
     });
-    const collectMedians = async (
-      context: EvaluationRun["context"],
-      runCwd: string,
-      evaluationIds: string[],
-      seeds: Map<string, EvaluationRun>,
-      retryLabel: string,
-      runAgentId?: string,
-      runCompositeId?: string,
-    ): Promise<Map<string, EvaluationRun> | undefined> => {
-      if (!evaluationIds.length) return new Map();
-      const initialConfirmationBatches = await Promise.all([0, 1].map(() =>
-        this.runEvaluations(context, runCwd, runAgentId, runCompositeId, evaluationIds),
-      ));
-      const incompleteBatchIds = initialConfirmationBatches.map((confirmationRuns) =>
-        evaluationIds.filter((evaluationId) => {
-          const run = confirmationRuns.find((item) => item.evaluationId === evaluationId);
-          return !run || run.status !== "completed" || run.score === undefined;
-        }),
-      );
-      const retryCount = incompleteBatchIds.reduce((total, evaluationIds) => total + evaluationIds.length, 0);
-      if (retryCount) {
-        await this.store.addActivity({
-          type: "evaluation",
-          message: `Retrying ${retryCount} incomplete prompt confirmation sample${retryCount === 1 ? "" : "s"} for ${retryLabel}`,
-          detail: "Only missing samples are retried once; the candidate remains fail-closed if any retry is incomplete.",
-        });
-      }
-      const confirmationBatches = await Promise.all(initialConfirmationBatches.map(async (confirmationRuns, index) => {
-        const incompleteIds = incompleteBatchIds[index]!;
-        if (!incompleteIds.length) return confirmationRuns;
-        const retries = await this.runEvaluations(context, runCwd, runAgentId, runCompositeId, incompleteIds);
-        const completed = new Map(confirmationRuns
-          .filter((item) => item.status === "completed" && item.score !== undefined)
-          .map((item) => [item.evaluationId, item]));
-        for (const retry of retries) {
-          if (retry.status === "completed" && retry.score !== undefined) completed.set(retry.evaluationId, retry);
-        }
-        return evaluationIds.map((evaluationId) => completed.get(evaluationId)).filter((item): item is EvaluationRun => Boolean(item));
-      }));
-      const samples = new Map(evaluationIds.map((evaluationId) => [evaluationId, [seeds.get(evaluationId)!]]));
-      for (const confirmationRuns of confirmationBatches) {
-        if (confirmationRuns.length !== evaluationIds.length || confirmationRuns.some((item) => item.status !== "completed" || item.score === undefined)) return undefined;
-        for (const confirmationRun of confirmationRuns) samples.get(confirmationRun.evaluationId)!.push(confirmationRun);
-      }
-      for (const [evaluationId, runs] of samples) {
-        const seed = seeds.get(evaluationId);
-        if (!seed || seed.status !== "completed" || seed.score === undefined || runs.some((run) => run.commit !== seed.commit)) return undefined;
-      }
-      return new Map([...samples].map(([evaluationId, runs]) => {
-        const median = [...runs].sort((left, right) => left.score! - right.score!)[Math.floor(runs.length / 2)]!;
-        return [evaluationId, { ...median, promptSampleCount: 3 }];
-      }));
-    };
     const candidateSeeds = new Map(promptChangeIds.map((evaluationId) => [
       evaluationId,
       afterRuns.find((item) => item.evaluationId === evaluationId)!,
     ]));
     const baselineSeeds = new Map(baselineConfirmationIds.map((evaluationId) => [evaluationId, baseline.get(evaluationId)!]));
     const [candidateMedians, baselineMedians] = await Promise.all([
-      collectMedians("composite", cwd, promptChangeIds, candidateSeeds, candidateLabel, agentRunId, compositeId),
-      collectMedians("baseline", this.root, baselineConfirmationIds, baselineSeeds, `${candidateLabel} baseline`),
+      this.collectPromptMedians("composite", cwd, promptChangeIds, candidateSeeds, candidateLabel, agentRunId, compositeId),
+      this.collectPromptMedians("baseline", this.root, baselineConfirmationIds, baselineSeeds, `${candidateLabel} baseline`),
     ]);
     if (!candidateMedians || !baselineMedians) return undefined;
     for (const [evaluationId, median] of baselineMedians) baseline.set(evaluationId, median);
@@ -1001,6 +1006,53 @@ export class Orchestrator {
     return this.runEvaluationSuite(context, cwd, agentRunId, compositeId, evaluationIds, callerOwnsCpuLock);
   }
 
+  private async confirmBaselinePromptScores(commit: string): Promise<EvaluationRun[] | undefined> {
+    const state = this.store.get();
+    const latest = this.store.latestRuns();
+    const evaluationIds = state.evaluations
+      .filter((evaluation) => evaluation.enabled && !evaluation.command)
+      .filter((evaluation) => {
+        const run = latest.get(evaluation.id);
+        return run?.commit === commit && (run.promptSampleCount ?? 0) < 3;
+      })
+      .map((evaluation) => evaluation.id);
+    if (!evaluationIds.length) return [];
+    await this.store.addActivity({
+      type: "evaluation",
+      message: `Confirming ${evaluationIds.length} baseline prompt score${evaluationIds.length === 1 ? "" : "s"}`,
+      detail: "Burner will persist median-of-three baseline scores before starting the merge-cadence clock or dispatching candidate work.",
+    });
+    const seeds = new Map(evaluationIds.map((evaluationId) => [evaluationId, latest.get(evaluationId)!]));
+    const medians = await this.collectPromptMedians("baseline", this.root, evaluationIds, seeds, "the baseline");
+    if (!medians) {
+      await this.store.addActivity({
+        type: "error",
+        message: "Baseline prompt confirmation incomplete",
+        detail: "The cadence clock and candidate dispatch remain paused until every enabled prompt baseline has three valid samples.",
+      });
+      return undefined;
+    }
+    const createdAt = now();
+    const promoted = [...medians].map(([evaluationId, median]) => ({
+      ...median,
+      id: id("evalrun"),
+      evaluationId,
+      commit,
+      createdAt,
+      context: "baseline" as const,
+      agentRunId: undefined,
+      compositeId: undefined,
+      promptSampleCount: 3,
+    }));
+    await this.store.update((draft) => draft.evaluationRuns.push(...promoted));
+    await this.store.addActivity({
+      type: "evaluation",
+      message: `${promoted.length} baseline prompt median${promoted.length === 1 ? "" : "s"} confirmed`,
+      detail: `Authoritative baseline established at ${commit.slice(0, 8)}.`,
+    });
+    return promoted;
+  }
+
   async runBaselineEvaluations(context: "baseline" | "manual" = "manual"): Promise<EvaluationRun[]> {
     const commit = await this.git.resolveRef(this.store.get().settings.baseBranch);
     const enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
@@ -1014,10 +1066,12 @@ export class Orchestrator {
     const screeningRuns = missingScreening.length > 0
       ? await this.runEvaluations("screening_baseline", this.root, undefined, undefined, missingScreening.map((evaluation) => evaluation.id))
       : [];
-    const runs = [...fullRuns, ...screeningRuns];
+    const promptMedians = await this.confirmBaselinePromptScores(commit);
+    const runs = [...fullRuns, ...screeningRuns, ...(promptMedians ?? [])];
     const refreshedFull = this.store.latestRuns();
     const refreshedScreening = this.store.latestScreeningRuns();
-    const complete = enabled.every((evaluation) => refreshedFull.get(evaluation.id)?.commit === commit) &&
+    const complete = promptMedians !== undefined &&
+      enabled.every((evaluation) => isAuthoritativeFullBaseline(evaluation, refreshedFull.get(evaluation.id), commit)) &&
       enabled.every((evaluation) => !evaluation.screeningCommand || refreshedScreening.get(evaluation.id)?.commit === commit);
     if (runs.every((run) => run.status === "completed" && run.score !== undefined) && complete) {
       await this.store.update((draft) => {
@@ -1032,7 +1086,7 @@ export class Orchestrator {
     const fullBaseline = this.store.latestRuns();
     const screeningBaseline = this.store.latestScreeningRuns();
     return state.evaluations.filter((evaluation) => evaluation.enabled && (
-      fullBaseline.get(evaluation.id)?.commit !== baseCommit ||
+      !isAuthoritativeFullBaseline(evaluation, fullBaseline.get(evaluation.id), baseCommit) ||
       Boolean(evaluation.screeningCommand && screeningBaseline.get(evaluation.id)?.commit !== baseCommit)
     ));
   }
@@ -1042,6 +1096,7 @@ export class Orchestrator {
     const composite = state.composites.find((item) => item.id === compositeId);
     if (!composite) return false;
     const runs = this.store.latestCompositeRuns(compositeId);
+    const previousBaseline = this.store.latestRuns();
     const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
     if (!enabled.length || enabled.some((evaluation) => runs.get(evaluation.id)?.score === undefined)) return false;
     if (await this.git.tree(baseCommit) !== await this.git.tree(composite.branch)) return false;
@@ -1049,6 +1104,14 @@ export class Orchestrator {
     await this.store.update((draft) => {
       for (const evaluation of enabled) {
         const source = runs.get(evaluation.id)!;
+        const previous = previousBaseline.get(evaluation.id);
+        const promptSampleCount = evaluation.command
+          ? undefined
+          : (source.promptSampleCount ?? 0) >= 3
+            ? 3
+            : (previous?.promptSampleCount ?? 0) >= 3 && previous?.score === source.score
+              ? 3
+              : undefined;
         draft.evaluationRuns.push({
           ...source,
           id: id("evalrun"),
@@ -1057,6 +1120,7 @@ export class Orchestrator {
           context: "baseline",
           agentRunId: undefined,
           compositeId: undefined,
+          promptSampleCount,
         });
       }
     });
