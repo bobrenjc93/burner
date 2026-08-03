@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
@@ -320,6 +320,20 @@ test("composite evaluation revisions fail closed instead of resampling an unchan
     () => assertCompositeEvaluationRevisionChanged("same", "same", 2),
     /will not resample an identical tree until prompt noise happens to pass/,
   );
+});
+
+test("leaf validation reserves the complete confirmation and merge tail", () => {
+  const currentTime = Date.now();
+  assert.deepEqual(leafValidationHeadroom(new Date(currentTime - 41 * 60_000).toISOString(), 60, currentTime), {
+    allowed: true,
+    remainingMs: 19 * 60_000,
+    reserveMs: 18 * 60_000,
+  });
+  assert.deepEqual(leafValidationHeadroom(new Date(currentTime - 43 * 60_000).toISOString(), 60, currentTime), {
+    allowed: false,
+    remainingMs: 17 * 60_000,
+    reserveMs: 18 * 60_000,
+  });
 });
 
 test("YOLO yields a long review loop while an approved fallback can still use the merge reserve", async () => {
@@ -1493,6 +1507,49 @@ test("cadence fallback skips an unchanged rejected leaf and validates the next c
     assert.equal(await orchestrator.autoMergeNext(), true);
     assert.equal(validated, "second");
     assert.equal(merged, "second");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("late cadence recovery waits for cached leaf validation but still merges a cached-qualified leaf", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-late-leaf-validation-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    const fingerprint = JSON.stringify({ threshold: 0, evaluations: [{ id: "quality", name: "Quality", prompt: "Score", weight: 1 }] });
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.mergeWindowStartedAt = new Date(Date.now() - 43 * 60_000).toISOString();
+      state.orchestrator.lastMergeCadenceAlertAt = state.orchestrator.mergeWindowStartedAt;
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.ideas.push({ id: "idea", title: "Healthy leaf", description: "Improve", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "leaf" });
+      state.agentRuns.push({
+        id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp,
+        prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base",
+        deltas: [{ evaluationId: "quality", name: "Quality", before: 50, after: 55, delta: 5 }], impact: 5,
+        resources: [], reviewRounds: [approvedRound], reviewApproved: true,
+      });
+      state.composites.push({ id: "failed", title: "Failed", description: "", status: "failed", branch: "burner/failed", worktree: "", baseCommit: "base", sources: [], deltas: [], reviewRounds: [], createdAt: timestamp, updatedAt: timestamp, isLiving: false });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { resolveRef: async (ref) => ref === "main" ? "base" : "candidate" };
+    let validated = 0;
+    let merged;
+    orchestrator.fullyValidateLeafForMerge = async () => { validated += 1; return true; };
+    orchestrator.mergeAgent = async (id) => { merged = id; return {}; };
+
+    assert.equal(await orchestrator.autoMergeNext(), false);
+    assert.equal(validated, 0, "an uncached full suite must not begin inside the reserved tail");
+
+    await store.update((state) => {
+      state.agentRuns[0].fullMergeValidation = { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: fingerprint, qualified: true, completedAt: timestamp };
+    });
+    assert.equal(await orchestrator.autoMergeNext(), true);
+    assert.equal(validated, 1);
+    assert.equal(merged, "leaf");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

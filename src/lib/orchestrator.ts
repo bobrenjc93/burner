@@ -221,6 +221,20 @@ export function compositeRevisionHeadroom(
   return { allowed: remainingMs >= reserveMs, remainingMs, reserveMs };
 }
 
+export function leafValidationHeadroom(
+  mergeWindowStartedAt: string | undefined,
+  mergeCadenceMinutes: number,
+  currentTimeMs = Date.now(),
+): { allowed: boolean; remainingMs: number; reserveMs: number } {
+  if (!mergeWindowStartedAt) return { allowed: true, remainingMs: Infinity, reserveMs: 0 };
+  const cadenceMs = mergeCadenceMinutes * 60_000;
+  const remainingMs = new Date(mergeWindowStartedAt).getTime() + cadenceMs - currentTimeMs;
+  // A previously unvalidated leaf still needs the complete suite, two prompt
+  // confirmation samples, one bounded retry, and the final merge/stamp path.
+  const reserveMs = Math.min(20 * 60_000, Math.max(12 * 60_000, cadenceMs * 3 / 10));
+  return { allowed: remainingMs >= reserveMs, remainingMs, reserveMs };
+}
+
 export function cachedFullMergeValidationResult(
   run: Pick<AgentRun, "fullMergeValidation">,
   baseCommit: string,
@@ -393,6 +407,11 @@ export class Orchestrator {
   private cadenceRecoveryTailExhausted(state = this.store.get()): boolean {
     return Boolean(state.orchestrator.lastMergeCadenceAlertAt) &&
       !compositeRevisionHeadroom(state.orchestrator.mergeWindowStartedAt, state.settings.mergeCadenceMinutes).allowed;
+  }
+
+  private cadenceLeafValidationTailExhausted(state = this.store.get()): boolean {
+    return Boolean(state.orchestrator.lastMergeCadenceAlertAt) &&
+      !leafValidationHeadroom(state.orchestrator.mergeWindowStartedAt, state.settings.mergeCadenceMinutes).allowed;
   }
 
   private portfolioCookDue(state = this.store.get(), baseCommit?: string): boolean {
@@ -574,10 +593,30 @@ export class Orchestrator {
     }
     if (!candidate) return false;
     if (candidate.kind === "agent" && this.portfolioMode()) {
-      if (!(await this.fullyValidateLeafForMerge(candidate.id, baseCommit))) return false;
+      if (this.cadenceLeafValidationTailExhausted(state)) {
+        const evaluationFingerprint = fullMergeValidationFingerprint(state);
+        const cachedCandidate = (await Promise.all(eligibleYoloLeaves(state, baseCommit).map(async (leaf) => {
+          const candidateCommit = await this.git.resolveRef(leaf.branch);
+          return cachedFullMergeValidationResult(leaf, baseCommit, candidateCommit, evaluationFingerprint) === true
+            ? leaf
+            : undefined;
+        }))).find((leaf) => leaf !== undefined);
+        if (!cachedCandidate?.prNumber || cachedCandidate.impact === undefined) return false;
+        candidate = { kind: "agent", id: cachedCandidate.id, prNumber: cachedCandidate.prNumber, impact: cachedCandidate.impact };
+      }
+      const candidateId = candidate.id;
+      if (!(await this.fullyValidateLeafForMerge(candidateId, baseCommit))) return false;
       state = this.store.get();
-      candidate = selectYoloMergeCandidate(state, baseCommit, true);
-      if (!candidate || candidate.kind !== "agent") return false;
+      const validatedRun = state.agentRuns.find((run) => run.id === candidateId);
+      const { enabled, commands } = yoloEvaluationSets(state);
+      if (!validatedRun?.prNumber || !isYoloCandidate(
+        validatedRun.deltas,
+        validatedRun.impact,
+        enabled,
+        commands,
+        state.settings.compositeAbsorbThreshold,
+      )) return false;
+      candidate = { kind: "agent", id: validatedRun.id, prNumber: validatedRun.prNumber, impact: validatedRun.impact };
     }
     await this.store.addActivity({
       type: "pr",
