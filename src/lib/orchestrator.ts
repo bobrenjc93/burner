@@ -273,10 +273,16 @@ export function agentReviewCadenceHeadroom(
   if (!Number.isFinite(headroom.remainingMs)) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
   const fallback = selectYoloMergeCandidate(state, baseCommit, true);
   const fallbackReady = Boolean(fallback && (fallback.kind !== "agent" || fallback.id !== currentRunId));
-  if (!fallbackReady) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
+  const queuedReplacement = state.ideas.some((idea) => idea.status === "queued");
+  if (!fallbackReady && !queuedReplacement) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
   const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
   const reviewCycleReserveMs = Math.min(10 * 60_000, Math.max(5 * 60_000, cadenceMs / 6));
-  const requiredMs = reviewCycleReserveMs * 2;
+  // An approved leaf only needs full validation and merge. With no approved
+  // fallback, release a monopolized slot earlier so one queued replacement can
+  // still author, review, evaluate, and receive direct-leaf validation.
+  const requiredMs = fallbackReady
+    ? reviewCycleReserveMs * 2
+    : Math.min(30 * 60_000, Math.max(10 * 60_000, cadenceMs / 2));
   return { allowed: headroom.remainingMs > requiredMs, remainingMs: headroom.remainingMs, requiredMs };
 }
 
@@ -919,7 +925,7 @@ export class Orchestrator {
         error: message,
         completedAt,
         ...(reviewLimited ? { quarantinedAt: completedAt, quarantineReason: `No approval within ${this.portfolioReviewLimit(this.store.get().settings)} portfolio review rounds.` } : {}),
-        ...(cadenceYield ? { quarantinedAt: completedAt, quarantineReason: `Review yielded with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes left so an approved fallback can use the merge reserve.` } : {}),
+        ...(cadenceYield ? { quarantinedAt: completedAt, quarantineReason: `Review yielded with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes left so fallback work can use the merge reserve.` } : {}),
       });
       if (quarantined) await this.publishAgentCheckpoint(idea, run.id, run.worktree, run.branch, state.settings).catch(async (checkpointError) => {
         await this.store.addActivity({ type: "error", message: `Could not publish review checkpoint: ${idea.title}`, detail: errorMessage(checkpointError) });
@@ -929,7 +935,7 @@ export class Orchestrator {
         type: "error",
         message: cadenceYield ? `Agent yielded to merge cadence: ${idea.title}` : quarantined ? `Agent quarantined: ${idea.title}` : `Agent retry failed: ${idea.title}`,
         detail: cadenceYield
-          ? `Burner preserved this unapproved draft and released the slot with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes remaining; an already approved leaf can now receive full validation and merge.`
+          ? `Burner preserved this unapproved draft and released the slot with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes remaining; approved or queued fallback work can now advance toward validation and merge.`
           : quarantined ? "The review budget was exhausted. Burner released the portfolio slot so healthier work can advance." : message,
       });
     } finally {
@@ -1878,7 +1884,7 @@ export class Orchestrator {
         error: message,
         completedAt,
         ...(reviewLimited ? { quarantinedAt: completedAt, quarantineReason: `No approval within ${this.portfolioReviewLimit(this.store.get().settings)} portfolio review rounds.` } : {}),
-        ...(cadenceYield ? { quarantinedAt: completedAt, quarantineReason: `Review yielded with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes left so an approved fallback can use the merge reserve.` } : {}),
+        ...(cadenceYield ? { quarantinedAt: completedAt, quarantineReason: `Review yielded with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes left so fallback work can use the merge reserve.` } : {}),
         ...(retryEvaluation ? { evaluationRetryCount: 1 } : {}),
       });
       if (quarantined && worktree) await this.publishAgentCheckpoint(idea, runId, worktree, branch, this.store.get().settings).catch(async (checkpointError) => {
@@ -1889,7 +1895,7 @@ export class Orchestrator {
         type: "error",
         message: cadenceYield ? `Agent yielded to merge cadence: ${idea.title}` : quarantined ? `Agent quarantined: ${idea.title}` : `Agent failed: ${idea.title}`,
         detail: cadenceYield
-          ? `Burner preserved this unapproved draft and released the slot with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes remaining; an already approved leaf can now receive full validation and merge.`
+          ? `Burner preserved this unapproved draft and released the slot with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes remaining; approved or queued fallback work can now advance toward validation and merge.`
           : quarantined ? "The review budget was exhausted. Burner released the portfolio slot so healthier work can advance." : message,
       });
       this.events.emit("agent", { runId, status: "failed", error: message });

@@ -414,6 +414,24 @@ test("YOLO yields a long review loop while an approved fallback can still use th
       remainingMs: 19 * 60_000,
       requiredMs: 0,
     }, "a reviewed but regressing fallback must not cause Burner to abandon the only other candidate");
+
+    await store.update((state) => {
+      state.ideas.push({ id: "replacement-idea", title: "Smaller fallback", description: "Narrow work", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "planner" });
+    });
+    assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
+      allowed: false,
+      remainingMs: 19 * 60_000,
+      requiredMs: 30 * 60_000,
+    }, "a queued replacement needs the slot earlier when no approved fallback exists");
+
+    await store.update((state) => {
+      state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 29 * 60_000).toISOString();
+    });
+    assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
+      allowed: true,
+      remainingMs: 31 * 60_000,
+      requiredMs: 30 * 60_000,
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
