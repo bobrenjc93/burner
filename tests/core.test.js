@@ -260,8 +260,8 @@ test("portfolio planning preserves the current generation until its queue and ac
 test("composite evaluation revisions reserve enough merge-cadence headroom", () => {
   const anchor = "2026-01-01T00:00:00.000Z";
   const started = Date.parse(anchor);
-  assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 49 * 60_000), { allowed: true, remainingMs: 11 * 60_000, reserveMs: 10 * 60_000 });
-  assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 51 * 60_000), { allowed: false, remainingMs: 9 * 60_000, reserveMs: 10 * 60_000 });
+  assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 35 * 60_000), { allowed: true, remainingMs: 25 * 60_000, reserveMs: 24 * 60_000 });
+  assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 37 * 60_000), { allowed: false, remainingMs: 23 * 60_000, reserveMs: 24 * 60_000 });
   assert.equal(compositeRevisionHeadroom(undefined, 60).allowed, true);
 });
 

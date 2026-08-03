@@ -214,7 +214,10 @@ export function compositeRevisionHeadroom(
   if (!mergeWindowStartedAt) return { allowed: true, remainingMs: Infinity, reserveMs: 0 };
   const cadenceMs = mergeCadenceMinutes * 60_000;
   const remainingMs = new Date(mergeWindowStartedAt).getTime() + cadenceMs - currentTimeMs;
-  const reserveMs = Math.min(10 * 60_000, Math.max(5 * 60_000, cadenceMs / 6));
+  // A guided revision still needs an author pass, independent re-review, the
+  // full evaluation suite, two confirmation samples, and one bounded retry.
+  // Reserve that complete tail instead of only the initial evaluation time.
+  const reserveMs = Math.min(25 * 60_000, Math.max(10 * 60_000, cadenceMs * 2 / 5));
   return { allowed: remainingMs >= reserveMs, remainingMs, reserveMs };
 }
 
@@ -257,8 +260,9 @@ export function agentReviewCadenceHeadroom(
   const fallback = selectYoloMergeCandidate(state, baseCommit, true);
   const fallbackReady = Boolean(fallback && (fallback.kind !== "agent" || fallback.id !== currentRunId));
   if (!fallbackReady) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
-  const reviewCycleReserveMs = headroom.reserveMs;
-  const requiredMs = headroom.reserveMs + reviewCycleReserveMs;
+  const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
+  const reviewCycleReserveMs = Math.min(10 * 60_000, Math.max(5 * 60_000, cadenceMs / 6));
+  const requiredMs = reviewCycleReserveMs * 2;
   return { allowed: headroom.remainingMs > requiredMs, remainingMs: headroom.remainingMs, requiredMs };
 }
 
