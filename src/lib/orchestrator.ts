@@ -684,9 +684,9 @@ export class Orchestrator {
       if (await this.git.resolveRef(state.settings.baseBranch) !== baseCommit) return false;
       const baseline = this.store.latestRuns();
       let deltas = this.calculateDeltas(this.store.get(), baseline, afterRuns);
-      const confirmed = await this.confirmPromptRegressions(worktree, baseline, afterRuns, `PR #${run.prNumber}`, run.id);
+      const confirmed = await this.confirmPromptChanges(worktree, baseline, afterRuns, `PR #${run.prNumber}`, run.id);
       if (!confirmed) {
-        await this.store.addActivity({ type: "error", message: `Prompt confirmation failed for PR #${run.prNumber}`, detail: "The leaf remains open because a regression confirmation score was incomplete." });
+        await this.store.addActivity({ type: "error", message: `Prompt confirmation failed for PR #${run.prNumber}`, detail: "The leaf remains open because a changed prompt score could not be confirmed." });
         return false;
       }
       if (confirmed !== afterRuns) {
@@ -711,7 +711,7 @@ export class Orchestrator {
     }
   }
 
-  private async confirmPromptRegressions(
+  private async confirmPromptChanges(
     cwd: string,
     baseline: Map<string, EvaluationRun>,
     afterRuns: EvaluationRun[],
@@ -722,24 +722,24 @@ export class Orchestrator {
     const state = this.store.get();
     const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
     const deltas = this.calculateDeltas(state, baseline, afterRuns);
-    const promptRegressionIds = deltas
-      .filter((delta) => (delta.delta ?? 0) < 0 && !enabled.find((evaluation) => evaluation.id === delta.evaluationId)?.command)
+    const promptChangeIds = deltas
+      .filter((delta) => (delta.delta ?? 0) !== 0 && !enabled.find((evaluation) => evaluation.id === delta.evaluationId)?.command)
       .map((delta) => delta.evaluationId);
-    if (!promptRegressionIds.length) return afterRuns;
-    const samples = new Map(promptRegressionIds.map((evaluationId) => [
+    if (!promptChangeIds.length) return afterRuns;
+    const samples = new Map(promptChangeIds.map((evaluationId) => [
       evaluationId,
       [afterRuns.find((item) => item.evaluationId === evaluationId)!],
     ]));
     await this.store.addActivity({
       type: "evaluation",
-      message: `Confirming ${promptRegressionIds.length} prompt regression${promptRegressionIds.length === 1 ? "" : "s"} for ${candidateLabel}`,
-      detail: "Burner will use the median of three independent prompt scores; deterministic command results are never softened.",
+      message: `Confirming ${promptChangeIds.length} prompt change${promptChangeIds.length === 1 ? "" : "s"} for ${candidateLabel}`,
+      detail: "Burner will use the median of three independent prompt scores for gains and regressions; deterministic command results are never softened.",
     });
     const initialConfirmationBatches = await Promise.all([0, 1].map(() =>
-      this.runEvaluations("composite", cwd, agentRunId, compositeId, promptRegressionIds),
+      this.runEvaluations("composite", cwd, agentRunId, compositeId, promptChangeIds),
     ));
     const incompleteBatchIds = initialConfirmationBatches.map((confirmationRuns) =>
-      promptRegressionIds.filter((evaluationId) => {
+      promptChangeIds.filter((evaluationId) => {
         const run = confirmationRuns.find((item) => item.evaluationId === evaluationId);
         return !run || run.status !== "completed" || run.score === undefined;
       }),
@@ -762,10 +762,10 @@ export class Orchestrator {
       for (const retry of retries) {
         if (retry.status === "completed" && retry.score !== undefined) completed.set(retry.evaluationId, retry);
       }
-      return promptRegressionIds.map((evaluationId) => completed.get(evaluationId)).filter((item): item is EvaluationRun => Boolean(item));
+      return promptChangeIds.map((evaluationId) => completed.get(evaluationId)).filter((item): item is EvaluationRun => Boolean(item));
     }));
     for (const confirmationRuns of confirmationBatches) {
-      if (confirmationRuns.length !== promptRegressionIds.length || confirmationRuns.some((item) => item.status !== "completed" || item.score === undefined)) return undefined;
+      if (confirmationRuns.length !== promptChangeIds.length || confirmationRuns.some((item) => item.status !== "completed" || item.score === undefined)) return undefined;
       for (const confirmationRun of confirmationRuns) samples.get(confirmationRun.evaluationId)!.push(confirmationRun);
     }
     const medians = new Map([...samples].map(([evaluationId, runs]) => [
@@ -2065,8 +2065,8 @@ export class Orchestrator {
           return !run || run.status !== "completed" || run.score === undefined;
         });
         if (!incomplete.length) {
-          const confirmed = await this.confirmPromptRegressions(worktree, baseline, afterRuns, `composite PR #${composite.prNumber ?? composite.id}`, undefined, compositeId);
-          if (!confirmed) throw new Error("Composite prompt-regression confirmation remained incomplete; the generation was preserved without publishing unverified scores.");
+          const confirmed = await this.confirmPromptChanges(worktree, baseline, afterRuns, `composite PR #${composite.prNumber ?? composite.id}`, undefined, compositeId);
+          if (!confirmed) throw new Error("Composite prompt-change confirmation remained incomplete; the generation was preserved without publishing unverified scores.");
           afterRuns = confirmed;
           state = this.store.get();
         }

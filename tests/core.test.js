@@ -1373,13 +1373,13 @@ test("cadence-driven leaf validation confirms prompt regressions with a median w
       { evaluationId: "bench", delta: 5 },
       { evaluationId: "quality", delta: 0 },
     ]);
-    assert.ok(store.get().activity.some((item) => item.message === "Confirming 1 prompt regression for PR #10"));
+    assert.ok(store.get().activity.some((item) => item.message === "Confirming 1 prompt change for PR #10"));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("composite prompt regressions use a persisted median without rerunning commands", async () => {
+test("composite prompt gains use a persisted median without rerunning commands", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-composite-prompt-confirmation-test-"));
   try {
     const store = new StateStore(root);
@@ -1405,22 +1405,22 @@ test("composite prompt regressions use a persisted median without rerunning comm
     };
     const initial = [
       { id: "bench-after", evaluationId: "bench", score: 95, summary: "faster", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "combined" },
-      { id: "quality-after", evaluationId: "quality", score: 45, summary: "noisy low", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "combined" },
+      { id: "quality-after", evaluationId: "quality", score: 60, summary: "noisy high", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "combined" },
     ];
-    const confirmed = await orchestrator.confirmPromptRegressions(root, store.latestRuns(), initial, "composite PR #99", undefined, "combined");
-    assert.equal(confirmed.find((run) => run.evaluationId === "quality").score, 50);
+    const confirmed = await orchestrator.confirmPromptChanges(root, store.latestRuns(), initial, "composite PR #99", undefined, "combined");
+    assert.equal(confirmed.find((run) => run.evaluationId === "quality").score, 55);
     assert.equal(confirmed.find((run) => run.evaluationId === "bench").score, 95);
     assert.equal(calls.length, 2);
     assert.ok(calls.every((call) => call.context === "composite" && call.agentRunId === undefined && call.compositeId === "combined"));
     assert.ok(calls.every((call) => JSON.stringify(call.evaluationIds) === JSON.stringify(["quality"])), "command-backed evaluations must not be confirmed or softened");
-    assert.equal(store.latestCompositeRuns("combined").get("quality").score, 50, "the promoted baseline must use the confirmed median");
-    assert.ok(store.get().activity.some((item) => item.message === "Confirming 1 prompt regression for composite PR #99"));
+    assert.equal(store.latestCompositeRuns("combined").get("quality").score, 55, "the promoted baseline must use the confirmed median");
+    assert.ok(store.get().activity.some((item) => item.message === "Confirming 1 prompt change for composite PR #99"));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("prompt regression confirmation retries only incomplete samples once", async () => {
+test("prompt change confirmation retries only incomplete samples once", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-prompt-confirmation-retry-test-"));
   try {
     const store = new StateStore(root);
@@ -1454,7 +1454,7 @@ test("prompt regression confirmation retries only incomplete samples once", asyn
       { id: "quality-low", evaluationId: "quality", score: 75, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" },
       { id: "integrity-low", evaluationId: "integrity", score: 85, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" },
     ];
-    const confirmed = await orchestrator.confirmPromptRegressions(root, store.latestRuns(), initial, "PR #10", "leaf");
+    const confirmed = await orchestrator.confirmPromptChanges(root, store.latestRuns(), initial, "PR #10", "leaf");
     assert.deepEqual(calls, [["quality", "integrity"], ["quality", "integrity"], ["integrity"]]);
     assert.equal(confirmed.find((run) => run.evaluationId === "quality").score, 80);
     assert.equal(confirmed.find((run) => run.evaluationId === "integrity").score, 90);
