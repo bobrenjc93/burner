@@ -154,6 +154,15 @@ export function partitionReviewFallbacks(agentRunIds: string[], originalSize: nu
   return batches;
 }
 
+export function recoveryCompositeTitle(title: string, sourceCount: number, index: number, total: number): string {
+  const base = title
+    .replace(/ · recovery \d+\/\d+$/, "")
+    .replace(/(\bgeneration\s+\d+\s*:\s*)\d+(\s+reviewed improvements?\b)/i, (_match, prefix: string, suffix: string) =>
+      `${prefix}${sourceCount}${suffix.replace(/improvements?\b/i, sourceCount === 1 ? "improvement" : "improvements")}`,
+    );
+  return `${base} · recovery ${index}/${total}`;
+}
+
 export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string, includeAgents = true): YoloMergeCandidate | undefined {
   const { enabled: enabledEvaluationIds, commands: commandEvaluationIds } = yoloEvaluationSets(state);
   if (!enabledEvaluationIds.size) return undefined;
@@ -2134,7 +2143,14 @@ export class Orchestrator {
       if (roundsUsed >= this.portfolioReviewLimit(liveSettings)) break;
       const roundNumber = roundsUsed + 1;
       await this.updateComposite(compositeId, { status: "reviewing", updatedAt: now() });
-      const review = await this.codex.review(cwd, baseBranch, title, liveSettings);
+      const liveComposite = this.store.get().composites.find((item) => item.id === compositeId);
+      const reviewScope = liveComposite ? [
+        title,
+        "Authoritative composite scope: review only the included changes below. Do not require omitted, removed, or quarantined changes, even if an earlier generation title or commit history mentions them.",
+        ...liveComposite.sources.map((source) => `- ${source.prNumber ? `PR #${source.prNumber}: ` : ""}${source.title}`),
+        liveComposite.description ? `Recovery context: ${liveComposite.description.slice(0, 2_000)}` : "",
+      ].filter(Boolean).join("\n") : title;
+      const review = await this.codex.review(cwd, baseBranch, reviewScope, liveSettings);
       lastFindings = review.findings;
       const round: ReviewRound = { id: id("review"), round: roundNumber, commit: await this.git.head(cwd), approved: review.approved, summary: review.summary, findings: review.findings, createdAt: now() };
       await this.store.update((state) => state.composites.find((item) => item.id === compositeId)?.reviewRounds.push(round));
@@ -2235,7 +2251,7 @@ export class Orchestrator {
     for (const [index, batch] of fallbackBatches.entries()) {
       fallbacks.push(await this.createComposite(
         batch,
-        `${composite.title.replace(/ · recovery \d+\/\d+$/, "")} · recovery ${index + 1}/${fallbackBatches.length}`,
+        recoveryCompositeTitle(composite.title, batch.length, index + 1, fallbackBatches.length),
         `${composite.description}\n\nBurner removed ${suspect.prNumber ? `#${suspect.prNumber}` : suspect.title} after the portfolio review budget was exhausted and split the remaining leaves into a smaller recovery batch (${index + 1}/${fallbackBatches.length}).`,
         { makeLiving: index === 0 && (composite.isLiving || state.orchestrator.livingCompositeId === composite.id) },
       ));

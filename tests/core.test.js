@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, Orchestrator, partitionReviewFallbacks, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
@@ -1426,6 +1426,50 @@ test("YOLO portfolio caps reviews, quarantines the implicated leaf, and queues s
     assert.deepEqual(fallbacks.map((fallback) => fallback.ids), [["a", "c", "d", "e"], ["f", "g", "h"]]);
     assert.deepEqual(quarantined, [2]);
     assert.deepEqual(closed, [100]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("recovery composites advertise and review only their authoritative surviving sources", async () => {
+  assert.equal(
+    recoveryCompositeTitle("YOLO generation 7: 3 reviewed improvements", 2, 1, 1),
+    "YOLO generation 7: 2 reviewed improvements · recovery 1/1",
+  );
+
+  const root = await mkdtemp(join(tmpdir(), "burner-recovery-review-scope-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.settings.portfolioReviewRounds = 1;
+      state.composites.push({
+        id: "recovery", title: "YOLO generation 7: 2 reviewed improvements · recovery 1/1",
+        description: "Burner removed quarantined PR #310; only the surviving sources belong in this recovery.",
+        status: "reviewing", branch: "recovery", worktree: root,
+        sources: [
+          { agentRunId: "a", prNumber: 309, title: "Stream SELECT results", branch: "a", kind: "pull_request" },
+          { agentRunId: "b", prNumber: 311, title: "Persist one table", branch: "b", kind: "pull_request" },
+        ],
+        deltas: [], reviewRounds: [], createdAt: timestamp, updatedAt: timestamp, isLiving: false,
+      });
+    });
+    let reviewedScope = "";
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { head: async () => "head" };
+    orchestrator.publishCompositeDraft = async () => undefined;
+    orchestrator.codex = {
+      review: async (_cwd, _base, scope) => {
+        reviewedScope = scope;
+        return { approved: true, summary: "Approved", findings: [] };
+      },
+    };
+    await orchestrator.reviewComposite(root, "recovery", "YOLO generation 7: 2 reviewed improvements · recovery 1/1", "main", "thread", store.get().settings);
+    assert.match(reviewedScope, /Authoritative composite scope/);
+    assert.match(reviewedScope, /PR #309: Stream SELECT results/);
+    assert.match(reviewedScope, /PR #311: Persist one table/);
+    assert.match(reviewedScope, /removed quarantined PR #310/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
