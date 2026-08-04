@@ -86,7 +86,7 @@ function commandFailure(result: CommandResult, fallback: string): string {
 function isInconclusiveCommandOutput(output: EvaluationOutput): boolean {
   if (output.score !== 0 || !/\b(?:benchmark rejected|no timing score was accepted|invalid measurement)\b/i.test(output.summary)) return false;
   if (!output.evidence.length) return true;
-  return output.evidence.some((item) => /\b(?:unstable timing|timing .{0,80}(?:spread|variance|noise)|timed? out|failed to launch|could not execute|no such file|permission denied|checksum mismatch|provenance failure|identity mismatch)\b/i.test(item));
+  return output.evidence.some((item) => /\b(?:unstable timing|primary timing saturated|every case reached (?:the )?parity cap|timing .{0,80}(?:spread|variance|noise)|timed? out|failed to launch|could not execute|no such file|permission denied|checksum mismatch|provenance failure|identity mismatch)\b/i.test(item));
 }
 
 export class CodexClient {

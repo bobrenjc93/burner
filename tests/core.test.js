@@ -612,6 +612,11 @@ test("command evaluations reject fail-closed measurements instead of treating th
       () => new CodexClient().evaluate(root, { id: "bench", name: "Benchmark", prompt: "Measure it", command: evaluator, weight: 1, enabled: true, createdAt: new Date().toISOString() }, settings, "manual"),
       /inconclusive measurement.*Benchmark rejected/s,
     );
+    await writeFile(evaluator, `#!/bin/sh\nprintf '%s\\n' '{"score":0,"summary":"Benchmark rejected: no timing score was accepted.","evidence":["primary timing saturated: every case reached the parity cap"],"suggestions":[]}'\n`);
+    await assert.rejects(
+      () => new CodexClient().evaluate(root, { id: "bench", name: "Benchmark", prompt: "Measure it", command: evaluator, weight: 1, enabled: true, createdAt: new Date().toISOString() }, settings, "manual"),
+      /inconclusive measurement.*Benchmark rejected/s,
+    );
     await writeFile(evaluator, `#!/bin/sh\nprintf '%s\\n' '{"score":0,"summary":"Benchmark rejected: no timing score was accepted.","evidence":["typed correctness mismatch for unsupported SELECT"],"suggestions":[]}'\n`);
     assert.equal((await new CodexClient().evaluate(root, { id: "bench", name: "Benchmark", prompt: "Measure it", command: evaluator, weight: 1, enabled: true, createdAt: new Date().toISOString() }, settings, "manual")).score, 0);
   } finally {
@@ -2803,6 +2808,7 @@ test("state persists evaluation configuration and excludes candidate scores from
         { id: "baseline", evaluationId: evaluation.id, score: 61, commit: "a", createdAt: "2026-01-01T00:00:00.000Z", durationMs: 1, status: "completed", context: "manual" },
         { id: "candidate", evaluationId: evaluation.id, score: 99, commit: "b", createdAt: "2026-01-02T00:00:00.000Z", durationMs: 1, status: "completed", context: "agent", error: "x".repeat(20_000) },
         { id: "rejected-screen", evaluationId: evaluation.id, score: 0, summary: "Benchmark rejected: no timing score was accepted.", evidence: ["unstable timing: max/min spread 11.7"], commit: "a", createdAt: "2026-01-03T00:00:00.000Z", durationMs: 1, status: "completed", context: "screening_baseline" },
+        { id: "rejected-saturated", evaluationId: evaluation.id, score: 0, summary: "Benchmark rejected: no timing score was accepted.", evidence: ["primary timing saturated: every case reached the parity cap"], commit: "a", createdAt: "2026-01-04T00:00:00.000Z", durationMs: 1, status: "completed", context: "baseline" },
       );
     });
     assert.equal(store.latestRuns().get(evaluation.id)?.score, 61);
@@ -2818,6 +2824,7 @@ test("state persists evaluation configuration and excludes candidate scores from
     assert.equal(reloaded.get().settings.parallelism, 1);
     assert.equal(reloaded.latestRuns().get(evaluation.id)?.score, 61);
     assert.equal(reloaded.get().evaluationRuns.find((run) => run.id === "rejected-screen").status, "failed");
+    assert.equal(reloaded.get().evaluationRuns.find((run) => run.id === "rejected-saturated").status, "failed");
     assert.deepEqual(validateEvaluation({ name: " UX ", prompt: " Score it ", weight: 2 }), { name: "UX", prompt: "Score it", weight: 2, enabled: true });
     assert.deepEqual(validateEvaluation({ name: "Bench", prompt: "Score", command: " full ", screeningCommand: " quick " }), { name: "Bench", prompt: "Score", command: "full", screeningCommand: "quick", weight: 1, enabled: true });
     assert.throws(() => validateEvaluation({ name: "Bench", prompt: "Score", screeningCommand: "quick" }), /requires a full evaluation command/);

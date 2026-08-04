@@ -8,7 +8,7 @@ type Listener = (state: BurnerState) => void;
 const isInconclusiveMeasurement = (run: EvaluationRun): boolean =>
   run.score === 0 &&
   /\b(?:benchmark rejected|no timing score was accepted|invalid measurement)\b/i.test(run.summary ?? "") &&
-  (!(run.evidence?.length) || run.evidence.some((item) => /\b(?:unstable timing|timing .{0,80}(?:spread|variance|noise)|timed? out|failed to launch|could not execute|no such file|permission denied|checksum mismatch|provenance failure|identity mismatch)\b/i.test(item)));
+  (!(run.evidence?.length) || run.evidence.some((item) => /\b(?:unstable timing|primary timing saturated|every case reached (?:the )?parity cap|timing .{0,80}(?:spread|variance|noise)|timed? out|failed to launch|could not execute|no such file|permission denied|checksum mismatch|provenance failure|identity mismatch)\b/i.test(item)));
 
 const isUsableRun = (run: EvaluationRun): boolean =>
   run.status === "completed" && run.score !== undefined && !isInconclusiveMeasurement(run);
