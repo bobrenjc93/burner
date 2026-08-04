@@ -1754,6 +1754,57 @@ test("late cadence tail waits for cached leaf validation but still merges a cach
   }
 });
 
+test("composite tail falls back to one reviewed leaf even when two leaves could form a late batch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-composite-tail-leaf-fallback-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    const leaf = (id, number, impact) => ({
+      id,
+      ideaId: `idea-${id}`,
+      status: "completed",
+      branch: `burner/${id}`,
+      worktree: "",
+      startedAt: timestamp,
+      completedAt: timestamp,
+      prNumber: number,
+      prState: "open",
+      baseCommit: "base",
+      deltas: [{ evaluationId: "quality", name: "Quality", before: 50, after: 55, delta: 5 }],
+      impact,
+      resources: [],
+      reviewRounds: [approvedRound],
+      reviewApproved: true,
+    });
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.mergeWindowStartedAt = new Date(Date.now() - 40 * 60_000).toISOString();
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.ideas.push(
+        { id: "idea-first", title: "First", description: "", rationale: "", predictedImpact: 5, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "first" },
+        { id: "idea-second", title: "Second", description: "", rationale: "", predictedImpact: 4, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "second" },
+      );
+      state.agentRuns.push(leaf("first", 10, 5), leaf("second", 11, 4));
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { resolveRef: async (ref) => ref === "main" ? "base" : `${ref}-head` };
+    let validated;
+    let merged;
+    orchestrator.fullyValidateLeafForMerge = async (id) => { validated = id; return true; };
+    orchestrator.mergeAgent = async (id) => { merged = id; return {}; };
+
+    assert.deepEqual(selectYoloLeafBatch(store.get(), "base", 3, 2), ["first", "second"]);
+    assert.equal(orchestrator.cadenceCompositeTailExhausted(), true);
+    assert.equal(await orchestrator.autoMergeNext(), true);
+    assert.equal(validated, "first");
+    assert.equal(merged, "first");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("late cadence tail holds new composites and agent dispatch before or after a breach", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-late-recovery-hold-test-"));
   try {

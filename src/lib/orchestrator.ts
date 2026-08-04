@@ -608,7 +608,9 @@ export class Orchestrator {
     const cadenceDue = this.mergeCadenceUrgent(state);
     const cookDue = this.portfolioCookDue(state, baseCommit);
     const failedCurrentGeneration = state.composites.some((composite) => composite.status === "failed" && composite.baseCommit === baseCommit);
-    const cadenceNeedsSingleLeaf = failedCurrentGeneration || ((cadenceDue || cookDue) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0);
+    const cadenceNeedsSingleLeaf = failedCurrentGeneration ||
+      this.cadenceCompositeTailExhausted(state) ||
+      ((cadenceDue || cookDue) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0);
     let candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf);
     if (!candidate && (this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf)) {
       const evaluationFingerprint = fullMergeValidationFingerprint(state);
