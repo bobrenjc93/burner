@@ -269,6 +269,27 @@ export function cachedFullMergeValidationResult(
   return currentQualification ?? cached.qualified;
 }
 
+export function reusableFullAgentCommandRuns(
+  state: Pick<BurnerState, "evaluations" | "evaluationRuns">,
+  agentRunId: string,
+  candidateCommit: string,
+): EvaluationRun[] {
+  return state.evaluations
+    .filter((evaluation) => evaluation.enabled && evaluation.command && !evaluation.screeningCommand)
+    .flatMap((evaluation) => {
+      const run = state.evaluationRuns.filter((item) =>
+        item.agentRunId === agentRunId &&
+        item.context === "agent" &&
+        item.evaluationId === evaluation.id &&
+        item.commit === candidateCommit &&
+        item.evaluationDefinitionVersion === evaluation.definitionVersion &&
+        item.status === "completed" &&
+        item.score !== undefined,
+      ).at(-1);
+      return run ? [run] : [];
+    });
+}
+
 function fullMergeValidationFingerprint(state: BurnerState): string {
   return JSON.stringify({
     candidateEvaluationProtocol: CANDIDATE_EVALUATION_PROTOCOL,
@@ -707,7 +728,15 @@ export class Orchestrator {
     try { worktree = await this.git.createExistingWorktree(owner, run.branch); }
     finally { await createLock.release(); }
     try {
-      let afterRuns = await this.runCandidateEvaluations("composite", worktree, run.id);
+      const reusableCommandRuns = reusableFullAgentCommandRuns(state, run.id, candidateCommit);
+      if (reusableCommandRuns.length) {
+        await this.store.addActivity({
+          type: "evaluation",
+          message: `Reusing ${reusableCommandRuns.length} exact-head command evaluation${reusableCommandRuns.length === 1 ? "" : "s"} for PR #${run.prNumber}`,
+          detail: "The deterministic full command already completed on this exact candidate commit and evaluation definition; prompt and screened evaluations still run through the full merge gate.",
+        });
+      }
+      let afterRuns = await this.runCandidateEvaluations("composite", worktree, run.id, undefined, reusableCommandRuns);
       const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
       if (afterRuns.length !== enabled.length || afterRuns.some((item) => item.status !== "completed" || item.score === undefined)) {
         await this.store.addActivity({ type: "error", message: `Full merge validation failed for PR #${run.prNumber}`, detail: "The leaf remains open and will not be merged from screening scores." });
@@ -1258,11 +1287,16 @@ export class Orchestrator {
     cwd: string,
     agentRunId?: string,
     compositeId?: string,
+    initialRuns: readonly EvaluationRun[] = [],
   ): Promise<EvaluationRun[]> {
     const enabledIds = this.store.get().evaluations.filter((evaluation) => evaluation.enabled).map((evaluation) => evaluation.id);
-    const latest = new Map<string, EvaluationRun>();
-    let pending: readonly string[] | undefined;
+    const latest = new Map(initialRuns.map((run) => [run.evaluationId, run]));
+    let pending: readonly string[] = enabledIds.filter((evaluationId) => {
+      const run = latest.get(evaluationId);
+      return !run || run.status !== "completed" || run.score === undefined;
+    });
     for (let pass = 1; pass <= 2; pass += 1) {
+      if (!pending.length) break;
       const runs = await this.runEvaluations(context, cwd, agentRunId, compositeId, pending);
       for (const run of runs) latest.set(run.evaluationId, run);
       pending = enabledIds.filter((evaluationId) => {

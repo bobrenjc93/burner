@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
@@ -324,6 +324,74 @@ test("unchanged leaves reuse both accepted and rejected full merge validation", 
   assert.equal(cachedFullMergeValidationResult({
     fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: false, completedAt },
   }, baseCommit, candidateCommit, "changed-evaluations"), undefined, "changed evaluation policy requires fresh validation");
+});
+
+test("full leaf validation reuses only exact-head unscreened command results", () => {
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  const completed = (evaluationId, overrides = {}) => ({
+    id: `run-${evaluationId}`,
+    evaluationId,
+    commit: "candidate",
+    createdAt,
+    durationMs: 1,
+    status: "completed",
+    score: 80,
+    context: "agent",
+    agentRunId: "leaf",
+    evaluationDefinitionVersion: "v1",
+    ...overrides,
+  });
+  const state = {
+    evaluations: [
+      { id: "full", enabled: true, command: "full", definitionVersion: "v1" },
+      { id: "screened", enabled: true, command: "full", screeningCommand: "quick", definitionVersion: "v1" },
+      { id: "prompt", enabled: true, definitionVersion: "v1" },
+      { id: "disabled", enabled: false, command: "full", definitionVersion: "v1" },
+    ],
+    evaluationRuns: [
+      completed("full"),
+      completed("screened"),
+      completed("prompt"),
+      completed("disabled"),
+      completed("full", { id: "wrong-commit", commit: "old" }),
+      completed("full", { id: "wrong-definition", evaluationDefinitionVersion: "v0" }),
+    ],
+  };
+  assert.deepEqual(reusableFullAgentCommandRuns(state, "leaf", "candidate").map((run) => run.id), ["run-full"]);
+  assert.deepEqual(reusableFullAgentCommandRuns(state, "other-leaf", "candidate"), []);
+});
+
+test("full leaf validation runs only evaluations missing from exact-head seeds", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-leaf-partial-validation-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    await store.update((state) => {
+      state.evaluations = [
+        { id: "command", name: "Command", prompt: "Measure", command: "full", weight: 1, enabled: true, createdAt: new Date().toISOString() },
+        { id: "prompt", name: "Prompt", prompt: "Inspect", weight: 1, enabled: true, createdAt: new Date().toISOString() },
+      ];
+    });
+    const commandRun = {
+      id: "command-run", evaluationId: "command", commit: "candidate", createdAt: new Date().toISOString(), durationMs: 1,
+      status: "completed", score: 99, context: "agent", agentRunId: "leaf",
+    };
+    const promptRun = {
+      id: "prompt-run", evaluationId: "prompt", commit: "candidate", createdAt: new Date().toISOString(), durationMs: 1,
+      status: "completed", score: 80, context: "composite", agentRunId: "leaf",
+    };
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    const requested = [];
+    orchestrator.runEvaluations = async (_context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+      requested.push([...evaluationIds]);
+      return [promptRun];
+    };
+    const runs = await orchestrator.runCandidateEvaluations("composite", root, "leaf", undefined, [commandRun]);
+    assert.deepEqual(requested, [["prompt"]]);
+    assert.deepEqual(runs.map((run) => run.id), ["command-run", "prompt-run"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("cached leaf merge validation bypasses the full evaluation suite", async () => {
