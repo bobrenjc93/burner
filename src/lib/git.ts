@@ -233,7 +233,7 @@ export class GitService {
 
   async mergePr(cwd: string, number: number, expectedHead: string): Promise<void> {
     if (!expectedHead.trim()) throw new Error(`Cannot merge PR #${number} without its exact pushed head commit.`);
-    const mergeAttempts = this.mergePolling.mergeAttempts ?? 3;
+    const mergeAttempts = this.mergePolling.mergeAttempts ?? 24;
     let lastError = "";
     for (let attempt = 1; attempt <= mergeAttempts; attempt += 1) {
       const status = await this.waitForPrMergeability(cwd, number, expectedHead);
@@ -317,6 +317,13 @@ export class GitService {
       if (lastStatus.headRefOid === expectedHead && lastStatus.mergeable === "CONFLICTING") {
         throw new Error(`PR #${number} conflicts with its base branch at ${expectedHead.slice(0, 8)}.`);
       }
+      // GitHub can leave the GraphQL mergeability field UNKNOWN even after the
+      // exact head's required checks have succeeded. The merge mutation is the
+      // authoritative answer in that state, and mergePr retries its transient
+      // "not mergeable" responses without ever relaxing the exact-head/check
+      // gates. Do not permanently retire a validated head just because this
+      // advisory field is stale.
+      if (lastStatus.headRefOid === expectedHead && lastStatus.mergeable === "UNKNOWN") return lastStatus;
       if (attempt < attempts) await wait(intervalMs);
     }
     const observed = lastStatus?.headRefOid ? lastStatus.headRefOid.slice(0, 8) : "unknown";
