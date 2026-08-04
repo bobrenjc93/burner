@@ -3,7 +3,7 @@ import { readFile, realpath } from "node:fs/promises";
 import type { AgentRun, BurnerState, CompositePr, CompositeSource, Evaluation, EvaluationRun, Idea, ReviewRound, RuntimeStatus, ScoreDelta } from "../types.js";
 import { CodexClient, type ReviewResult, type SessionResult } from "./codex.js";
 import { EventHub } from "./events.js";
-import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "./git.js";
+import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, isTransientGitHubFailure } from "./git.js";
 import type { HeldLock } from "./locks.js";
 import { LockManager } from "./locks.js";
 import { commandExists, runCommand } from "./process.js";
@@ -362,6 +362,7 @@ export class Orchestrator {
   private readonly promptEvaluationWaiters: Array<() => void> = [];
   private protectedParentRepository?: { root: string; excludedTarget: string; snapshot: string };
   private boundaryTripped = false;
+  private readonly mergeRetryAfter = new Map<string, number>();
 
   private async repositorySnapshot(root: string, excludedTarget: string): Promise<string> {
     const excludePathspec = `:(exclude)${excludedTarget}`;
@@ -650,6 +651,10 @@ export class Orchestrator {
       }
     }
     if (!candidate) return false;
+    const retryKey = `${candidate.kind}:${candidate.id}`;
+    const retryAfter = this.mergeRetryAfter.get(retryKey) ?? 0;
+    if (retryAfter > Date.now()) return false;
+    this.mergeRetryAfter.delete(retryKey);
     if (candidate.kind === "agent" && this.portfolioMode()) {
       if (this.cadenceLeafValidationTailExhausted(state)) {
         const evaluationFingerprint = fullMergeValidationFingerprint(state);
@@ -692,6 +697,15 @@ export class Orchestrator {
 
   private async recordMergeGateFailure(candidate: YoloMergeCandidate, error: unknown): Promise<void> {
     const message = errorMessage(error);
+    if (isTransientGitHubFailure(error)) {
+      this.mergeRetryAfter.set(`${candidate.kind}:${candidate.id}`, Date.now() + 30_000);
+      await this.store.addActivity({
+        type: "error",
+        message: `Merge gate deferred PR #${candidate.prNumber}`,
+        detail: `${message} The reviewed, fully validated exact head remains eligible and Burner will retry after a short cooldown.`,
+      });
+      return;
+    }
     const timestamp = now();
     await this.store.update((state) => {
       if (candidate.kind === "composite") {
@@ -1720,6 +1734,14 @@ export class Orchestrator {
         if (run.prState !== next) {
           if (next === "merged") {
             const mergedAt = now();
+            if (run.quarantineReason?.startsWith("Merge gate rejected")) {
+              Object.assign(run, {
+                status: "completed",
+                error: undefined,
+                quarantinedAt: undefined,
+                quarantineReason: undefined,
+              });
+            }
             baseChanged = true;
             draft.orchestrator.baseSyncPending = true;
             draft.orchestrator.lastMergeAt = mergedAt;

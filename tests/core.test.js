@@ -12,7 +12,7 @@ import { EventHub } from "../dist/lib/events.js";
 import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
-import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
+import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, TransientMergeGateError } from "../dist/lib/git.js";
 import { createBurnerServer } from "../dist/server.js";
 import { StateStore, validateEvaluation } from "../dist/lib/store.js";
 import { clampScore, parseJsonObject, slugify, weightedScore } from "../dist/lib/utils.js";
@@ -1161,7 +1161,7 @@ test("GitHub merge waits for the pushed head and retries transient not-mergeable
   await writeFile(executable, `#!/usr/bin/env node
 const fs=require("fs");const args=process.argv.slice(2);const path=process.env.BURNER_TEST_GH_STATE;const state=fs.existsSync(path)?JSON.parse(fs.readFileSync(path,"utf8")):{views:0,checkViews:0,merges:0};
 if(args[0]==="pr"&&args[1]==="view"&&args.includes("state,headRefOid,statusCheckRollup")){state.checkViews++;fs.writeFileSync(path,JSON.stringify(state));const pending=state.checkViews===1;const failed=process.env.BURNER_TEST_CHECK_FAIL==="1";const checks=process.env.BURNER_TEST_NO_CHECKS==="1"?[]:[{__typename:"CheckRun",name:"CI",status:pending?"IN_PROGRESS":"COMPLETED",conclusion:pending?null:failed?"FAILURE":"SUCCESS"}];console.log(JSON.stringify({state:"OPEN",headRefOid:process.env.BURNER_TEST_HEAD,statusCheckRollup:checks}));process.exit(0);}
-if(args[0]==="pr"&&args[1]==="view"){state.views++;fs.writeFileSync(path,JSON.stringify(state));const mergeable=process.env.BURNER_TEST_CONFLICT==="1"?"CONFLICTING":process.env.BURNER_TEST_ALWAYS_UNKNOWN==="1"?"UNKNOWN":state.views===1?"UNKNOWN":"MERGEABLE";console.log(JSON.stringify({state:"OPEN",mergeable,headRefOid:process.env.BURNER_TEST_HEAD}));process.exit(0);}
+if(args[0]==="pr"&&args[1]==="view"){state.views++;if(process.env.BURNER_TEST_RESET_ONCE==="1"&&!state.reset){state.reset=1;fs.writeFileSync(path,JSON.stringify(state));console.error("read: connection reset by peer");process.exit(1);}fs.writeFileSync(path,JSON.stringify(state));const mergeable=process.env.BURNER_TEST_CONFLICT==="1"?"CONFLICTING":process.env.BURNER_TEST_ALWAYS_UNKNOWN==="1"?"UNKNOWN":state.views===1?"UNKNOWN":"MERGEABLE";console.log(JSON.stringify({state:"OPEN",mergeable,headRefOid:process.env.BURNER_TEST_HEAD}));process.exit(0);}
 if(args[0]==="pr"&&args[1]==="merge"){state.merges++;fs.writeFileSync(path,JSON.stringify(state));if(state.merges===1){console.error("GraphQL: Pull Request is not mergeable (mergePullRequest)");process.exit(1);}process.exit(0);}
 process.exit(0);
 `);
@@ -1189,6 +1189,12 @@ process.exit(0);
     process.env.BURNER_TEST_ALWAYS_UNKNOWN = "1";
     await git.mergePr(root, 46, head);
     assert.equal(JSON.parse(await readFile(statePath, "utf8")).merges, 4, "an exact checked head must reach the authoritative merge mutation even while GitHub reports UNKNOWN");
+    process.env.BURNER_TEST_ALWAYS_UNKNOWN = "0";
+    process.env.BURNER_TEST_RESET_ONCE = "1";
+    await git.mergePr(root, 47, head);
+    const recovered = JSON.parse(await readFile(statePath, "utf8"));
+    assert.equal(recovered.reset, 1);
+    assert.equal(recovered.merges, 5, "a transient GitHub inspection reset must retry without losing the validated head");
   } finally {
     process.env.PATH = previousPath;
     delete process.env.BURNER_TEST_GH_STATE;
@@ -1197,6 +1203,7 @@ process.exit(0);
     delete process.env.BURNER_TEST_CHECK_FAIL;
     delete process.env.BURNER_TEST_NO_CHECKS;
     delete process.env.BURNER_TEST_ALWAYS_UNKNOWN;
+    delete process.env.BURNER_TEST_RESET_ONCE;
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -1582,6 +1589,40 @@ test("hard composite merge-gate failures retire the unchanged head instead of re
     assert.equal(store.get().activity.filter((item) => item.message === "Merge gate blocked PR #234").length, 1);
     assert.equal(await orchestrator.autoMergeNext(), false);
     assert.equal(attempts, 1, "the same failed head must not be retried automatically");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("transient merge-gate failures defer the same validated head without retiring it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-transient-merge-gate-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp };
+    await store.update((state) => {
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.composites.push({
+        id: "composite", title: "Composite", description: "", status: "open", branch: "burner/composite", worktree: "", baseCommit: "base",
+        sources: [], deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 81, delta: 1 }], compositeScore: 81, impact: 1,
+        reviewRounds: [approvedRound], reviewApproved: true, prNumber: 235, prUrl: "https://example.test/pull/235", createdAt: timestamp, updatedAt: timestamp, isLiving: true,
+      });
+      state.orchestrator.livingCompositeId = "composite";
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    let attempts = 0;
+    orchestrator.mergeComposite = async () => { attempts += 1; throw new TransientMergeGateError("connection reset by peer"); };
+
+    assert.equal(await orchestrator.autoMergeNext(), true);
+    assert.equal(store.get().composites[0].status, "open");
+    assert.equal(store.get().composites[0].isLiving, true);
+    assert.equal(store.get().orchestrator.livingCompositeId, "composite");
+    assert.equal(store.get().composites[0].error, undefined);
+    assert.equal(store.get().activity.filter((item) => item.message === "Merge gate deferred PR #235").length, 1);
+    assert.equal(await orchestrator.autoMergeNext(), false);
+    assert.equal(attempts, 1, "the transient head must observe a retry cooldown instead of hot-looping");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -2634,7 +2675,9 @@ test("direct merges requeue reviewed stale sibling experiments on the new base",
       reviewApproved: true,
     });
     await store.update((state) => {
-      state.agentRuns.push(run("merged", 10), run("sibling", 11));
+      const merged = run("merged", 10);
+      Object.assign(merged, { status: "failed", error: "connection reset by peer", quarantinedAt: timestamp, quarantineReason: "Merge gate rejected PR #10: connection reset by peer" });
+      state.agentRuns.push(merged, run("sibling", 11));
       state.ideas.push(
         { id: "idea-merged", title: "Merged", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "merged" },
         { id: "idea-sibling", title: "Reviewed sibling", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "sibling" },
@@ -2657,6 +2700,9 @@ test("direct merges requeue reviewed stale sibling experiments on the new base",
 
     const state = store.get();
     assert.equal(state.agentRuns.find((item) => item.id === "merged").prState, "merged");
+    assert.equal(state.agentRuns.find((item) => item.id === "merged").status, "completed");
+    assert.equal(state.agentRuns.find((item) => item.id === "merged").error, undefined);
+    assert.equal(state.agentRuns.find((item) => item.id === "merged").quarantinedAt, undefined);
     assert.equal(state.agentRuns.find((item) => item.id === "sibling").prState, "closed");
     assert.equal(state.ideas.find((item) => item.id === "idea-merged").status, "completed");
     const sibling = state.ideas.find((item) => item.id === "idea-sibling");

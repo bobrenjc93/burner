@@ -5,6 +5,21 @@ import { runCommand } from "./process.js";
 
 export type PullRequestDisposition = "merged" | "unmerged";
 
+export class TransientMergeGateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TransientMergeGateError";
+  }
+}
+
+const transientGitHubPattern = /connection (?:reset|refused|closed)|network (?:error|failure)|timed? out|timeout|unexpected eof|tls|temporary failure|service unavailable|no route to host|failed to connect|could not resolve host|http (?:429|5\d\d)|stream (?:error|disconnected)|socket (?:not open|hang up)/i;
+
+export function isTransientGitHubFailure(error: unknown): boolean {
+  if (error instanceof TransientMergeGateError) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return transientGitHubPattern.test(message);
+}
+
 type PullRequestMergeStatus = {
   state: "OPEN" | "CLOSED" | "MERGED";
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
@@ -34,8 +49,28 @@ export class GitService {
   constructor(
     readonly root: string,
     private readonly dataDir: string,
-    private readonly mergePolling: { attempts?: number; intervalMs?: number; mergeAttempts?: number; checkAttempts?: number; noCheckGraceAttempts?: number } = {},
+    private readonly mergePolling: { attempts?: number; intervalMs?: number; mergeAttempts?: number; checkAttempts?: number; noCheckGraceAttempts?: number; transportAttempts?: number } = {},
   ) {}
+
+  private async githubJson<T>(cwd: string, args: string[], description: string): Promise<T> {
+    const attempts = this.mergePolling.transportAttempts ?? 5;
+    const intervalMs = this.mergePolling.intervalMs ?? 2_500;
+    let lastError = "";
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const result = await runCommand("gh", args, { cwd, timeoutMs: 2 * 60 * 1000 });
+      if (result.exitCode === 0) {
+        try { return JSON.parse(result.stdout) as T; }
+        catch (error) {
+          lastError = `Could not parse GitHub response while ${description}: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      } else {
+        lastError = result.stderr.trim() || result.stdout.trim() || `Could not ${description}`;
+      }
+      if (!isTransientGitHubFailure(lastError)) throw new Error(lastError);
+      if (attempt < attempts) await wait(intervalMs);
+    }
+    throw new TransientMergeGateError(lastError || `GitHub remained unavailable while ${description}.`);
+  }
 
   private async prepareWorktreePath(path: string, worktreesDir: string): Promise<void> {
     await mkdir(worktreesDir, { recursive: true });
@@ -248,8 +283,10 @@ export class GitService {
         return;
       }
       lastError = result.stderr.trim() || result.stdout.trim() || `Could not merge PR #${number}`;
-      const transient = /not mergeable|mergeability|head (?:branch|sha).*(?:changed|updated)|base branch.*(?:changed|updated)/i.test(lastError);
-      if (!transient || attempt === mergeAttempts) throw new Error(lastError);
+      const transientState = /not mergeable|mergeability|head (?:branch|sha).*(?:changed|updated)|base branch.*(?:changed|updated)/i.test(lastError);
+      const transientTransport = isTransientGitHubFailure(lastError);
+      if (!transientState && !transientTransport) throw new Error(lastError);
+      if (attempt === mergeAttempts) throw new TransientMergeGateError(lastError);
       await wait(this.mergePolling.intervalMs ?? 2_500);
     }
     throw new Error(lastError || `Could not merge PR #${number}`);
@@ -261,13 +298,11 @@ export class GitService {
     const intervalMs = this.mergePolling.intervalMs ?? 2_500;
     let lastPending: string[] = [];
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      const result = await runCommand(
-        "gh",
+      const status = await this.githubJson<PullRequestCheckStatus>(
+        cwd,
         ["pr", "view", String(number), "--json", "state,headRefOid,statusCheckRollup"],
-        { cwd, timeoutMs: 2 * 60 * 1000 },
+        `inspect PR #${number} checks`,
       );
-      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not inspect PR #${number} checks`);
-      const status = JSON.parse(result.stdout) as PullRequestCheckStatus;
       if (status.state === "MERGED") return;
       if (status.state !== "OPEN") throw new Error(`PR #${number} is ${status.state.toLowerCase()} instead of open.`);
       if (status.headRefOid !== expectedHead) {
@@ -296,7 +331,7 @@ export class GitService {
       lastPending = pending;
       if (attempt < attempts) await wait(intervalMs);
     }
-    throw new Error(`PR #${number} checks did not finish at ${expectedHead.slice(0, 8)}: ${lastPending.join(", ") || "status unavailable"}.`);
+    throw new TransientMergeGateError(`PR #${number} checks did not finish at ${expectedHead.slice(0, 8)}: ${lastPending.join(", ") || "status unavailable"}.`);
   }
 
   private async waitForPrMergeability(cwd: string, number: number, expectedHead: string): Promise<PullRequestMergeStatus> {
@@ -304,13 +339,11 @@ export class GitService {
     const intervalMs = this.mergePolling.intervalMs ?? 2_500;
     let lastStatus: PullRequestMergeStatus | undefined;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      const result = await runCommand(
-        "gh",
+      lastStatus = await this.githubJson<PullRequestMergeStatus>(
+        cwd,
         ["pr", "view", String(number), "--json", "state,mergeable,headRefOid"],
-        { cwd, timeoutMs: 2 * 60 * 1000 },
+        `inspect PR #${number} mergeability`,
       );
-      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not inspect PR #${number} mergeability`);
-      lastStatus = JSON.parse(result.stdout) as PullRequestMergeStatus;
       if (lastStatus.state === "MERGED") return lastStatus;
       if (lastStatus.state !== "OPEN") throw new Error(`PR #${number} is ${lastStatus.state.toLowerCase()} instead of open.`);
       if (lastStatus.headRefOid === expectedHead && lastStatus.mergeable === "MERGEABLE") return lastStatus;
