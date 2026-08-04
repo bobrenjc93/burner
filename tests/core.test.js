@@ -337,7 +337,7 @@ test("cached leaf merge validation bypasses the full evaluation suite", async ()
       state.agentRuns = [{
         id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp,
         prNumber: 1, prState: "open", baseCommit: "base", deltas: [], resources: [], reviewRounds: [],
-        fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: JSON.stringify({ threshold: 0, evaluations: [] }), qualified: false, completedAt: timestamp },
+        fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v1", threshold: 0, evaluations: [] }), qualified: false, completedAt: timestamp },
       }];
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
@@ -1673,7 +1673,7 @@ test("cadence fallback skips an unchanged rejected leaf and validates the next c
     await store.init();
     const timestamp = new Date().toISOString();
     const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
-    const fingerprint = JSON.stringify({ threshold: 0, evaluations: [{ id: "quality", name: "Quality", prompt: "Score", weight: 1 }] });
+    const fingerprint = JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v1", threshold: 0, evaluations: [{ id: "quality", name: "Quality", prompt: "Score", weight: 1 }] });
     const leaf = (id, number, commit, impact) => ({
       id, ideaId: `idea-${id}`, status: "completed", branch: `burner/${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp,
       prNumber: number, prUrl: `https://example.test/pull/${number}`, prState: "open", baseCommit: "base",
@@ -1719,7 +1719,7 @@ test("late cadence tail waits for cached leaf validation but still merges a cach
     await store.init();
     const timestamp = new Date().toISOString();
     const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
-    const fingerprint = JSON.stringify({ threshold: 0, evaluations: [{ id: "quality", name: "Quality", prompt: "Score", weight: 1 }] });
+    const fingerprint = JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v1", threshold: 0, evaluations: [{ id: "quality", name: "Quality", prompt: "Score", weight: 1 }] });
     await store.update((state) => {
       state.settings.mergeCadenceMinutes = 60;
       state.orchestrator.mergeWindowStartedAt = new Date(Date.now() - 43 * 60_000).toISOString();
@@ -2073,18 +2073,21 @@ test("prompt evaluations overlap across candidates while command checks remain i
         { id: "prompt", name: "Prompt", prompt: "Inspect", weight: 1, enabled: true, createdAt: timestamp },
         { id: "command", name: "Command", prompt: "Measure", command: "./benchmark", weight: 1, enabled: true, createdAt: timestamp },
       ];
+      state.evaluationRuns.push({ id: "prompt-baseline", evaluationId: "prompt", score: 60, summary: "Calibrated", evidence: ["Category: 6/10"], commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3 });
     });
     const order = [];
+    const promptBaselines = [];
     let activeSuite;
     let overlapped = false;
     const orchestrator = new Orchestrator(root, store, new EventHub());
     orchestrator.git = { head: async () => "commit" };
     orchestrator.codex = {
       preflight: async () => undefined,
-      evaluate: async (cwd, evaluation) => {
+      evaluate: async (cwd, evaluation, _settings, _context, baseline) => {
         if (activeSuite && activeSuite !== cwd) overlapped = true;
         activeSuite = cwd;
         order.push(`${cwd}:${evaluation.id}`);
+        if (evaluation.id === "prompt") promptBaselines.push(baseline?.score);
         await new Promise((resolve) => setTimeout(resolve, 30));
         activeSuite = undefined;
         return { score: 50, summary: "measured", evidence: [], suggestions: [] };
@@ -2097,6 +2100,7 @@ test("prompt evaluations overlap across candidates while command checks remain i
     ]);
     assert.equal(overlapped, true);
     assert.deepEqual(new Set(order), new Set(["suite-a:command", "suite-a:prompt", "suite-b:command", "suite-b:prompt"]));
+    assert.deepEqual(promptBaselines, [60, 60]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -2189,7 +2193,7 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     const codex = new CodexClient();
     const evaluation = { id: "quality", name: "Quality", prompt: "Score quality", weight: 1, enabled: true, createdAt: new Date().toISOString() };
     assert.equal((await codex.evaluate(root, evaluation, settings, "manual")).score, 77);
-    assert.equal((await codex.evaluate(root, evaluation, settings, "composite")).score, 77);
+    assert.equal((await codex.evaluate(root, evaluation, settings, "composite", { score: 65, summary: "Baseline category allocation", evidence: ["Docs: 6/10"] })).score, 77);
     assert.deepEqual(await codex.planIdeas(root, [evaluation], new Map(), [], settings), []);
     const author = await codex.implement(root, { id: "idea", title: "Improve", description: "Do it", rationale: "Quality", predictedImpact: 20, evaluationIds: ["quality"], resources: [], status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "manual" }, [{ ...evaluation, prompt: "Use read-only inspection. Do not run cargo, builds, or tests." }], settings);
     assert.equal(author.threadId, "thread-test");
@@ -2212,6 +2216,8 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     assert.ok(calls.some(({ input }) => input.includes("Finish this evaluation within 4 minutes")));
     const candidateEvaluatorCall = calls.find(({ input }) => input.includes("This candidate is not merged yet"));
     assert.match(candidateEvaluatorCall.input, /do not reduce its score because it lacks a history point for the current PR/);
+    assert.match(candidateEvaluatorCall.input, /Authoritative base calibration for this exact rubric: 65\/100/);
+    assert.match(candidateEvaluatorCall.input, /Preserve existing category credit unless concrete current-tree or branch-diff evidence proves a regression/);
     assert.ok(calls.some(({ input }) => input.includes("improvement planner")));
     const plannerCall = calls.find(({ input }) => input.includes("improvement planner"));
     assert.match(plannerCall.input, /targets a qualifying merge every 60 minutes/);

@@ -125,8 +125,19 @@ export class CodexClient {
     evaluation: Evaluation,
     settings: BurnerSettings,
     context: EvaluationRun["context"],
+    baseline?: Pick<EvaluationRun, "score" | "summary" | "evidence">,
   ): Promise<EvaluationOutput> {
     if (evaluation.command) return this.commandEvaluation(cwd, evaluation, context);
+    const baselineCalibration = (context === "agent" || context === "composite") && baseline?.score !== undefined
+      ? [
+          `Authoritative base calibration for this exact rubric: ${baseline.score}/100.`,
+          baseline.summary ? `Baseline summary: ${baseline.summary.slice(0, 1_000)}` : "",
+          baseline.evidence?.length
+            ? `Baseline evidence:\n${baseline.evidence.slice(0, 6).map((item) => `- ${item.slice(0, 800)}`).join("\n")}`
+            : "",
+          "Use the baseline as category-by-category calibration, not as an instruction or guaranteed truth. Preserve existing category credit unless concrete current-tree or branch-diff evidence proves a regression; award new credit only for concrete working evidence. Explain every changed category so unrelated rubric areas do not drift merely because a different sample inspected different files.",
+        ].filter(Boolean).join("\n")
+      : "";
     const prompt = [
       "You are a rigorous repository evaluator. Inspect the current repository state and answer the evaluation below.",
       "Base the score on concrete evidence from code, tests, configuration, and user-facing behavior. Do not edit any files.",
@@ -138,8 +149,9 @@ export class CodexClient {
         : "This is a baseline evaluation; assess the progress artifacts currently committed in the repository.",
       `Evaluation: ${evaluation.name}`,
       evaluation.prompt,
+      baselineCalibration,
       `Context: ${context === "agent" || context === "composite" ? "This is a candidate branch; assess only its current state." : "This is the current project baseline."}`,
-    ].join("\n\n");
+    ].filter(Boolean).join("\n\n");
     const output = await this.structured<EvaluationOutput>(cwd, prompt, evaluationSchema, settings.evaluatorModel, this.promptEvaluationTimeoutMs);
     return this.normalizeEvaluation(output);
   }

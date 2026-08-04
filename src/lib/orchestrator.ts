@@ -45,6 +45,8 @@ class CandidateEvaluationError extends Error {
   }
 }
 
+const CANDIDATE_EVALUATION_PROTOCOL = "baseline-anchored-v1";
+
 const finalReviewApproved = (reviewApproved: boolean | undefined, rounds: ReviewRound[]) => reviewApproved === true && rounds.at(-1)?.approved === true;
 
 function isYoloCandidate(
@@ -269,6 +271,7 @@ export function cachedFullMergeValidationResult(
 
 function fullMergeValidationFingerprint(state: BurnerState): string {
   return JSON.stringify({
+    candidateEvaluationProtocol: CANDIDATE_EVALUATION_PROTOCOL,
     threshold: state.settings.compositeAbsorbThreshold,
     evaluations: state.evaluations.filter((evaluation) => evaluation.enabled).map((evaluation) => ({
       id: evaluation.id,
@@ -1161,6 +1164,7 @@ export class Orchestrator {
     callerOwnsCpuLock = false,
   ): Promise<EvaluationRun[]> {
     const state = this.store.get();
+    const candidateBaselines = context === "agent" || context === "composite" ? this.store.latestRuns() : undefined;
     const selectedIds = evaluationIds ? new Set(evaluationIds) : undefined;
     const evaluations = state.evaluations.filter((evaluation) =>
       evaluation.enabled &&
@@ -1208,7 +1212,7 @@ export class Orchestrator {
             ? { ...evaluation, screeningCommand: undefined }
             : evaluation;
           run.attempts = 1;
-          const output = await this.codex.evaluate(cwd, evaluated, state.settings, context);
+          const output = await this.codex.evaluate(cwd, evaluated, state.settings, context, candidateBaselines?.get(evaluation.id));
           Object.assign(run, output, { status: "completed" as const, durationMs: Date.now() - started });
           await this.store.update((draft) => {
             const current = draft.evaluationRuns.find((item) => item.id === run.id);
