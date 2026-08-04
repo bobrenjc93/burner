@@ -65,9 +65,9 @@ function scoreMapsEqual(left: Record<string, number>, right: Record<string, numb
     leftIds.every((evaluationId, index) => evaluationId === rightIds[index] && left[evaluationId] === right[evaluationId]);
 }
 
-function collapseRedundantBaselinePoints(points: ProgressPoint[]): ProgressPoint[] {
+function collapseRedundantBaselinePoints(points: ProgressPoint[], candidateBaseCommits: Record<number, string> = {}): ProgressPoint[] {
   const collapsed: ProgressPoint[] = [];
-  for (const point of collapseDuplicateBaselines(points)) {
+  for (const point of orderBaselinesBeforeCandidates(collapseDuplicateBaselines(points), candidateBaseCommits)) {
     const previous = collapsed.at(-1);
     // After a Burner merge, the next candidate's base scores are exactly the
     // preceding PR point. Do not turn that unchanged state into a second dot.
@@ -76,6 +76,25 @@ function collapseRedundantBaselinePoints(points: ProgressPoint[]): ProgressPoint
     collapsed.push(point);
   }
   return collapsed;
+}
+
+function orderBaselinesBeforeCandidates(points: ProgressPoint[], candidateBaseCommits: Record<number, string>): ProgressPoint[] {
+  const ordered = [...points];
+  for (const baseCommit of new Set(Object.values(candidateBaseCommits))) {
+    const baselineIndex = ordered.findIndex((point) => baselineIdentity(point) === baseCommit);
+    const candidateIndexes = ordered.flatMap((point, index) =>
+      point.prNumber !== undefined && candidateBaseCommits[point.prNumber] === baseCommit ? [index] : [],
+    );
+    if (baselineIndex < 0 || !candidateIndexes.length) continue;
+    const firstCandidateIndex = Math.min(...candidateIndexes);
+    if (baselineIndex < firstCandidateIndex) continue;
+    const [baseline] = ordered.splice(baselineIndex, 1);
+    const refreshedCandidateIndex = ordered.findIndex((point) =>
+      point.prNumber !== undefined && candidateBaseCommits[point.prNumber] === baseCommit,
+    );
+    ordered.splice(refreshedCandidateIndex, 0, baseline!);
+  }
+  return ordered;
 }
 
 function emptyHistory(): ProgressHistory {
@@ -157,9 +176,14 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
   await rename(temporary, path);
 }
 
-export async function updateProgressArtifacts(cwd: string, evaluations: Evaluation[], newPoints: ProgressPoint[]): Promise<ProgressHistory> {
+export async function updateProgressArtifacts(
+  cwd: string,
+  evaluations: Evaluation[],
+  newPoints: ProgressPoint[],
+  candidateBaseCommits: Record<number, string> = {},
+): Promise<ProgressHistory> {
   const history = await readHistory(cwd);
-  history.points = collapseRedundantBaselinePoints(history.points);
+  history.points = collapseRedundantBaselinePoints(history.points, candidateBaseCommits);
   for (const evaluation of evaluations.filter((item) => item.enabled)) {
     const existing = history.evaluations[evaluation.id];
     history.evaluations[evaluation.id] = { name: evaluation.name, color: existing?.color ?? COLORS[Object.keys(history.evaluations).length % COLORS.length]! };
@@ -181,7 +205,7 @@ export async function updateProgressArtifacts(cwd: string, evaluations: Evaluati
     }
     else history.points.push(point);
   }
-  history.points = collapseRedundantBaselinePoints(history.points);
+  history.points = collapseRedundantBaselinePoints(history.points, candidateBaseCommits);
   await atomicWrite(join(cwd, HISTORY_PATH), `${JSON.stringify(history, null, 2)}\n`);
   await atomicWrite(join(cwd, GRAPH_PATH), renderSvg(history));
   const readmePath = join(cwd, "README.md");

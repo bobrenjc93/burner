@@ -1155,11 +1155,13 @@ export class Orchestrator {
       : [];
     const promptMedians = await this.confirmBaselinePromptScores(commit);
     const runs = [...fullRuns, ...screeningRuns, ...(promptMedians ?? [])];
+    const refreshedState = this.store.get();
+    const refreshedEnabled = refreshedState.evaluations.filter((evaluation) => evaluation.enabled);
     const refreshedFull = this.store.latestRuns();
     const refreshedScreening = this.store.latestScreeningRuns();
     const complete = promptMedians !== undefined &&
-      enabled.every((evaluation) => isAuthoritativeFullBaseline(evaluation, refreshedFull.get(evaluation.id), commit)) &&
-      enabled.every((evaluation) => !evaluation.screeningCommand || isAuthoritativeScreeningBaseline(evaluation, refreshedScreening.get(evaluation.id), commit));
+      refreshedEnabled.every((evaluation) => isAuthoritativeFullBaseline(evaluation, refreshedFull.get(evaluation.id), commit)) &&
+      refreshedEnabled.every((evaluation) => !evaluation.screeningCommand || isAuthoritativeScreeningBaseline(evaluation, refreshedScreening.get(evaluation.id), commit));
     if (runs.every((run) => run.status === "completed" && run.score !== undefined) && complete) {
       await this.store.update((draft) => {
         draft.orchestrator.lastEvaluationAt = now();
@@ -1590,7 +1592,11 @@ export class Orchestrator {
     try { worktree = await this.git.createExistingWorktree(owner, candidate.branch); }
     finally { await createLock.release(); }
     try {
-      await updateProgressArtifacts(worktree, state.evaluations, points);
+      const candidateBaseCommits = Object.fromEntries([
+        ...state.agentRuns.flatMap((run) => run.prNumber && run.baseCommit ? [[run.prNumber, run.baseCommit] as const] : []),
+        ...state.composites.flatMap((composite) => composite.prNumber && composite.baseCommit ? [[composite.prNumber, composite.baseCommit] as const] : []),
+      ]);
+      await updateProgressArtifacts(worktree, state.evaluations, points, candidateBaseCommits);
       if (await this.git.hasChanges(worktree)) {
         changed = true;
         await this.git.commit(worktree, `burner: record evaluation progress for PR #${prNumber}`);

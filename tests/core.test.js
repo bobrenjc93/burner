@@ -179,6 +179,24 @@ test("merge progress artifacts deduplicate semantic baselines and PR retries", a
   }
 });
 
+test("merge progress causally reorders a late retry baseline before its candidate", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-progress-retry-order-test-"));
+  try {
+    await writeFile(join(root, "README.md"), "# Demo\n");
+    const evaluation = { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: "2026-01-01T00:00:00.000Z" };
+    await updateProgressArtifacts(root, [evaluation], [
+      { key: "pr:1", recordedAt: "2026-01-01T00:00:00.000Z", label: "PR #1", kind: "composite", prNumber: 1, title: "First", scores: { quality: 60 } },
+      { key: "pr:2", recordedAt: "2026-01-02T00:00:00.000Z", label: "PR #2", kind: "leaf", prNumber: 2, title: "Retried", scores: { quality: 80 } },
+      { key: "base:base-1", commit: "base-1", recordedAt: "2026-01-03T00:00:00.000Z", label: "base base-1", kind: "baseline", title: "main", scores: { quality: 60 } },
+    ]);
+    const history = await updateProgressArtifacts(root, [evaluation], [], { 2: "base-1" });
+    assert.deepEqual(history.points.map((point) => point.key), ["pr:1", "pr:2"]);
+    assert.equal(history.points.at(-1).scores.quality, 80, "the graph must end at the retried candidate instead of its older base");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("progress keeps a base point when the evaluation registry changes", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-progress-registry-test-"));
   try {
@@ -643,6 +661,33 @@ test("portfolio merge clock starts after full and screening baselines", async ()
     assert.deepEqual(contexts, ["baseline", "screening_baseline"]);
     assert.ok(store.get().orchestrator.lastEvaluationAt);
     assert.ok(store.get().orchestrator.mergeWindowStartedAt);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("baseline completion rechecks evaluations added while the suite is running", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-live-evaluation-registry-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [{ id: "first", name: "First", prompt: "Measure", command: "full", weight: 1, enabled: true, createdAt: timestamp }];
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    orchestrator.runEvaluations = async (context) => {
+      const run = { id: "first-run", evaluationId: "first", score: 80, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context };
+      await store.update((state) => {
+        state.evaluationRuns.push(run);
+        state.evaluations.push({ id: "second", name: "Second", prompt: "Measure", command: "full-2", weight: 1, enabled: true, createdAt: timestamp });
+      });
+      return [run];
+    };
+    await orchestrator.runBaselineEvaluations("baseline");
+    assert.equal(store.get().orchestrator.lastEvaluationAt, undefined);
+    assert.equal(store.get().orchestrator.mergeWindowStartedAt, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
