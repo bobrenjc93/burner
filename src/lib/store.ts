@@ -192,6 +192,16 @@ export class StateStore {
     return latest;
   }
 
+  latestAgentFullRuns(agentRunId: string): Map<string, EvaluationRun> {
+    const latest = new Map<string, EvaluationRun>();
+    for (const run of this.state.evaluationRuns) {
+      if (run.context !== "composite" || run.agentRunId !== agentRunId || run.compositeId || !isUsableRun(run)) continue;
+      const current = latest.get(run.evaluationId);
+      if (!current || run.createdAt > current.createdAt) latest.set(run.evaluationId, run);
+    }
+    return latest;
+  }
+
   compositeScores(): { current?: number; previous?: number } {
     const byEvaluation = new Map<string, EvaluationRun[]>();
     for (const run of this.state.evaluationRuns) {

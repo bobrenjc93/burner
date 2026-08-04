@@ -47,6 +47,11 @@ class CandidateEvaluationError extends Error {
 
 const CANDIDATE_EVALUATION_PROTOCOL = "baseline-anchored-v1";
 
+function nextEvaluationTimestamp(runs: readonly Pick<EvaluationRun, "createdAt">[]): string {
+  const latest = runs.reduce((maximum, run) => Math.max(maximum, Date.parse(run.createdAt) || 0), 0);
+  return new Date(Math.max(Date.now(), latest + 1)).toISOString();
+}
+
 const finalReviewApproved = (reviewApproved: boolean | undefined, rounds: ReviewRound[]) => reviewApproved === true && rounds.at(-1)?.approved === true;
 
 function isYoloCandidate(
@@ -862,7 +867,7 @@ export class Orchestrator {
     ]);
     if (!candidateMedians || !baselineMedians) return undefined;
     for (const [evaluationId, median] of baselineMedians) baseline.set(evaluationId, median);
-    const recordedAt = now();
+    const recordedAt = nextEvaluationTimestamp(this.store.get().evaluationRuns);
     await this.store.update((draft) => {
       for (const [evaluationId, median] of baselineMedians) {
         draft.evaluationRuns.push({
@@ -1119,7 +1124,7 @@ export class Orchestrator {
       });
       return undefined;
     }
-    const createdAt = now();
+    const createdAt = nextEvaluationTimestamp(this.store.get().evaluationRuns);
     const promoted = [...medians].map(([evaluationId, median]) => ({
       ...median,
       id: id("evalrun"),
@@ -1142,9 +1147,18 @@ export class Orchestrator {
 
   async runBaselineEvaluations(context: "baseline" | "manual" = "manual"): Promise<EvaluationRun[]> {
     const commit = await this.git.resolveRef(this.store.get().settings.baseBranch);
-    const enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
-    const fullBaseline = this.store.latestRuns();
-    const missingFull = enabled.filter((evaluation) => !isCurrentEvaluationRun(evaluation, fullBaseline.get(evaluation.id), commit));
+    let enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
+    let fullBaseline = this.store.latestRuns();
+    let missingFull = enabled.filter((evaluation) => !isCurrentEvaluationRun(evaluation, fullBaseline.get(evaluation.id), commit));
+    if (missingFull.length) {
+      const mergedLeaves = this.store.get().agentRuns.filter((run) => run.prState === "merged").reverse();
+      for (const mergedLeaf of mergedLeaves) {
+        if (await this.promoteMergedAgentBaseline(mergedLeaf.id, commit)) break;
+      }
+      enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
+      fullBaseline = this.store.latestRuns();
+      missingFull = enabled.filter((evaluation) => !isCurrentEvaluationRun(evaluation, fullBaseline.get(evaluation.id), commit));
+    }
     const fullRuns = missingFull.length === 0
       ? []
       : await this.runEvaluations(context, this.root, undefined, undefined, missingFull.map((evaluation) => evaluation.id));
@@ -1192,7 +1206,7 @@ export class Orchestrator {
       return run?.score === undefined || run.evaluationDefinitionVersion !== evaluation.definitionVersion;
     })) return false;
     if (await this.git.tree(baseCommit) !== await this.git.tree(composite.branch)) return false;
-    const createdAt = now();
+    const createdAt = nextEvaluationTimestamp(this.store.get().evaluationRuns);
     await this.store.update((draft) => {
       for (const evaluation of enabled) {
         const source = runs.get(evaluation.id)!;
@@ -1219,6 +1233,53 @@ export class Orchestrator {
       }
     });
     await this.store.addActivity({ type: "evaluation", message: "Merged composite promoted to baseline", detail: `The tested composite tree exactly matches ${baseCommit.slice(0, 8)}; only leaf screens need refreshing.` });
+    return true;
+  }
+
+  private async promoteMergedAgentBaseline(runId: string, baseCommit: string): Promise<boolean> {
+    const state = this.store.get();
+    const agent = state.agentRuns.find((run) => run.id === runId);
+    if (!agent || agent.prState !== "merged" || agent.fullMergeValidation?.qualified !== true) return false;
+    const runs = this.store.latestAgentFullRuns(runId);
+    const previousBaseline = this.store.latestRuns();
+    const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
+    const deltas = new Map(agent.deltas.map((delta) => [delta.evaluationId, delta]));
+    if (!enabled.length || enabled.some((evaluation) => {
+      const source = runs.get(evaluation.id);
+      const delta = deltas.get(evaluation.id);
+      return source?.score === undefined || source.evaluationDefinitionVersion !== evaluation.definitionVersion || delta?.after === undefined;
+    })) return false;
+    if (await this.git.tree(baseCommit) !== await this.git.tree(agent.branch)) return false;
+    const createdAt = nextEvaluationTimestamp(this.store.get().evaluationRuns);
+    await this.store.update((draft) => {
+      for (const evaluation of enabled) {
+        const source = runs.get(evaluation.id)!;
+        const delta = deltas.get(evaluation.id)!;
+        const previous = previousBaseline.get(evaluation.id);
+        const promptSampleCount = evaluation.command
+          ? undefined
+          : (delta.delta ?? 0) !== 0 || (source.promptSampleCount ?? 0) >= 3
+            ? 3
+            : previous?.evaluationDefinitionVersion === evaluation.definitionVersion &&
+                (previous?.promptSampleCount ?? 0) >= 3 && previous?.score === delta.after
+              ? 3
+              : undefined;
+        draft.evaluationRuns.push({
+          ...source,
+          id: id("evalrun"),
+          score: delta.after,
+          summary: delta.summary ?? source.summary,
+          commit: baseCommit,
+          createdAt,
+          context: "baseline",
+          agentRunId: undefined,
+          compositeId: undefined,
+          evaluationDefinitionVersion: evaluation.definitionVersion,
+          promptSampleCount,
+        });
+      }
+    });
+    await this.store.addActivity({ type: "evaluation", message: "Merged leaf promoted to baseline", detail: `The fully validated leaf tree exactly matches ${baseCommit.slice(0, 8)}; only leaf screens need refreshing.` });
     return true;
   }
 
@@ -1645,6 +1706,7 @@ export class Orchestrator {
     }
     const byNumber = new Map(pullRequests.map((pr) => [pr.number, pr]));
     const newlyMergedCompositeIds: string[] = [];
+    const newlyMergedAgentIds: string[] = [];
     const changedRunIds = new Set<string>();
     const dispositionUpdates: Array<{ number: number; disposition: "merged" | "unmerged" }> = [];
     let baseChanged = Boolean(state.orchestrator.baseSyncPending);
@@ -1663,6 +1725,7 @@ export class Orchestrator {
             draft.orchestrator.lastMergeAt = mergedAt;
             draft.orchestrator.mergeWindowStartedAt = mergedAt;
             draft.orchestrator.lastMergeCadenceAlertAt = undefined;
+            newlyMergedAgentIds.push(run.id);
           }
           run.prState = next;
           changedRunIds.add(run.id);
@@ -1734,6 +1797,11 @@ export class Orchestrator {
       let promoted = false;
       for (const compositeId of newlyMergedCompositeIds) {
         if (await this.promoteMergedCompositeBaseline(compositeId, commit)) { promoted = true; break; }
+      }
+      if (!promoted) {
+        for (const runId of newlyMergedAgentIds) {
+          if (await this.promoteMergedAgentBaseline(runId, commit)) { promoted = true; break; }
+        }
       }
       if (!promoted) {
         await this.store.update((draft) => { draft.orchestrator.mergeWindowStartedAt = undefined; });

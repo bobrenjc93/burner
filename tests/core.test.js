@@ -2686,6 +2686,46 @@ test("an exactly merged composite becomes the next full baseline without rerunni
   }
 });
 
+test("an exactly merged fully validated leaf becomes the next full baseline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-promote-leaf-baseline-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [
+        { id: "quality", name: "Quality", prompt: "Score", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "docs", name: "Docs", prompt: "Score docs", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+      state.ideas = [{ id: "idea", title: "Improve", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "leaf" }];
+      state.agentRuns = [{
+        id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp,
+        prNumber: 10, prState: "merged", baseCommit: "old-main", deltas: [
+          { evaluationId: "quality", name: "Quality", before: 80, after: 88, delta: 8, summary: "Quality improved" },
+          { evaluationId: "docs", name: "Docs", before: 75, after: 80, delta: 5, summary: "Docs improved" },
+        ], impact: 6.5, resources: [], reviewApproved: true, reviewRounds: [],
+        fullMergeValidation: { baseCommit: "old-main", candidateCommit: "candidate", evaluationFingerprint: "fingerprint", qualified: true, completedAt: timestamp },
+      }];
+      state.evaluationRuns.push(
+        { id: "old-docs", evaluationId: "docs", score: 75, commit: "old-main", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3 },
+        { id: "leaf-quality", evaluationId: "quality", score: 88, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" },
+        { id: "leaf-docs", evaluationId: "docs", score: 78, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" },
+      );
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { tree: async () => "same-tree" };
+    assert.equal(await orchestrator.promoteMergedAgentBaseline("leaf", "new-main"), true);
+    assert.equal(store.latestRuns().get("quality").score, 88);
+    assert.equal(store.latestRuns().get("quality").commit, "new-main");
+    assert.equal(store.latestRuns().get("docs").score, 80, "the confirmed delta score must override an arbitrary confirmation sample");
+    assert.equal(store.latestRuns().get("docs").summary, "Docs improved");
+    assert.equal(store.latestRuns().get("docs").promptSampleCount, 3, "a changed prompt score was already median-confirmed by the full merge gate");
+    assert.equal(store.latestScreeningRuns().size, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("evaluation weight changes restamp open leaf impacts and PR bodies", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-reweight-test-"));
   try {
