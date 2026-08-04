@@ -1692,15 +1692,43 @@ export class Orchestrator {
         run.prNumber !== undefined &&
         run.baseCommit !== syncedBaseCommit &&
         !reserved.has(run.id));
+      const reviewedStaleRunsByIdea = new Map(staleLeaves.flatMap((run) => {
+        const idea = current.ideas.find((item) => item.id === run.ideaId);
+        return run.status === "completed" &&
+          !run.quarantinedAt &&
+          finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
+          idea?.status === "completed" &&
+          idea.agentRunId === run.id
+          ? [[run.ideaId, run.id] as const]
+          : [];
+      }));
       for (const run of staleLeaves) {
-        await this.git.closePr(this.root, run.prNumber!, `Burner closed this unbatched leaf because the YOLO portfolio advanced ${state.settings.baseBranch}; a fresh experiment will be planned from ${syncedBaseCommit.slice(0, 8)}.`);
+        const requeued = reviewedStaleRunsByIdea.has(run.ideaId);
+        await this.git.closePr(this.root, run.prNumber!, requeued
+          ? `Burner closed this unbatched leaf because the YOLO portfolio advanced ${state.settings.baseBranch}. This reviewed experiment was requeued from ${syncedBaseCommit.slice(0, 8)}.`
+          : `Burner closed this unbatched leaf because the YOLO portfolio advanced ${state.settings.baseBranch}; a fresh experiment will be planned from ${syncedBaseCommit.slice(0, 8)}.`);
       }
       if (staleLeaves.length) {
         const staleIds = new Set(staleLeaves.map((run) => run.id));
         await this.store.update((draft) => {
           for (const run of draft.agentRuns) if (staleIds.has(run.id)) run.prState = "closed";
+          const requeuedAt = now();
+          for (const idea of draft.ideas) {
+            const staleRunId = reviewedStaleRunsByIdea.get(idea.id);
+            if (!staleRunId || idea.status !== "completed" || idea.agentRunId !== staleRunId) continue;
+            idea.status = "queued";
+            idea.agentRunId = undefined;
+            idea.updatedAt = requeuedAt;
+          }
         });
-        await this.store.addActivity({ type: "pr", message: `${staleLeaves.length} stale leaf PR${staleLeaves.length === 1 ? "" : "s"} closed`, detail: "The next portfolio generation will branch from the newly merged base." });
+        const requeuedCount = reviewedStaleRunsByIdea.size;
+        await this.store.addActivity({
+          type: "pr",
+          message: `${staleLeaves.length} stale leaf PR${staleLeaves.length === 1 ? "" : "s"} closed`,
+          detail: requeuedCount
+            ? `${requeuedCount} fully reviewed experiment${requeuedCount === 1 ? " was" : "s were"} requeued on the newly merged base.`
+            : "The next portfolio generation will branch from the newly merged base.",
+        });
       }
       if (staleFailedComposites.length) {
         await this.store.addActivity({ type: "pr", message: `${staleFailedComposites.length} failed portfolio generation${staleFailedComposites.length === 1 ? "" : "s"} retired`, detail: "Their obsolete leaf PRs were released for stale-branch cleanup." });

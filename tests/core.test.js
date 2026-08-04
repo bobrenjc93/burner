@@ -2344,6 +2344,67 @@ test("merged composites supersede source PRs and queue overlapping composites fo
   }
 });
 
+test("direct merges requeue reviewed stale sibling experiments on the new base", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-requeue-stale-leaf-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    const run = (id, number) => ({
+      id,
+      ideaId: `idea-${id}`,
+      status: "completed",
+      branch: `branch-${id}`,
+      worktree: "",
+      startedAt: timestamp,
+      completedAt: timestamp,
+      prNumber: number,
+      prState: "open",
+      baseCommit: "old-base",
+      deltas: [],
+      resources: [],
+      reviewRounds: [approvedRound],
+      reviewApproved: true,
+    });
+    await store.update((state) => {
+      state.agentRuns.push(run("merged", 10), run("sibling", 11));
+      state.ideas.push(
+        { id: "idea-merged", title: "Merged", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "merged" },
+        { id: "idea-sibling", title: "Reviewed sibling", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "sibling" },
+      );
+    });
+    const closed = [];
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.git = {
+      remoteExists: async () => true,
+      listPullRequests: async () => [
+        { number: 10, state: "MERGED", headRefName: "branch-merged", url: "" },
+        { number: 11, state: "OPEN", headRefName: "branch-sibling", url: "" },
+      ],
+      markPrDisposition: async () => undefined,
+      syncBase: async () => "new-base",
+      closePr: async (_cwd, number, comment) => { closed.push([number, comment]); },
+    };
+
+    await orchestrator.syncPullRequests(true);
+
+    const state = store.get();
+    assert.equal(state.agentRuns.find((item) => item.id === "merged").prState, "merged");
+    assert.equal(state.agentRuns.find((item) => item.id === "sibling").prState, "closed");
+    assert.equal(state.ideas.find((item) => item.id === "idea-merged").status, "completed");
+    const sibling = state.ideas.find((item) => item.id === "idea-sibling");
+    assert.equal(sibling.status, "queued");
+    assert.equal(sibling.agentRunId, undefined);
+    assert.equal(closed.length, 1);
+    assert.equal(closed[0][0], 11);
+    assert.match(closed[0][1], /reviewed experiment was requeued/);
+    assert.match(state.activity[0].detail, /1 fully reviewed experiment was requeued/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("an exactly merged composite becomes the next full baseline without rerunning it", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-promote-baseline-test-"));
   try {
