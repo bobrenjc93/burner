@@ -113,7 +113,7 @@ async function runHeadless(args: string[]): Promise<boolean> {
     const store = new StateStore(root);
     await store.init();
     const input = validateEvaluation({ name: required(args, "--name"), prompt: required(args, "--prompt"), command: option(args, "--command"), screeningCommand: option(args, "--screening-command"), weight: numberOption(args, "--weight", 1, Number.EPSILON, 10), enabled: true });
-    const evaluation = { ...input, id: id("eval"), createdAt: now() };
+    const evaluation = { ...input, id: id("eval"), createdAt: now(), definitionVersion: id("evaldef") };
     await store.update((state) => {
       state.evaluations.push(evaluation);
       state.orchestrator.lastEvaluationAt = undefined;

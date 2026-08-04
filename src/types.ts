@@ -7,6 +7,8 @@ export type Evaluation = {
   weight: number;
   enabled: boolean;
   createdAt: string;
+  /** Changes whenever score-producing evaluation inputs are edited. */
+  definitionVersion?: string;
 };
 
 export type EvaluationRun = {
@@ -25,6 +27,8 @@ export type EvaluationRun = {
   context: "baseline" | "screening_baseline" | "agent" | "composite" | "manual";
   agentRunId?: string;
   compositeId?: string;
+  /** Exact evaluation definition used to produce this run. */
+  evaluationDefinitionVersion?: string;
   /** Number of independent prompt samples represented by this persisted median. */
   promptSampleCount?: number;
 };

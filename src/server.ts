@@ -104,7 +104,7 @@ export async function createBurnerServer(options: BurnerServerOptions) {
     }),
     route("POST", "/api/evaluations", async (_request, response, _params, body) => {
       const input = validateEvaluation(body);
-      const evaluation = { ...input, id: id("eval"), createdAt: now() };
+      const evaluation = { ...input, id: id("eval"), createdAt: now(), definitionVersion: id("evaldef") };
       await store.update((state) => {
         state.evaluations.push(evaluation);
         state.orchestrator.lastEvaluationAt = undefined;
@@ -120,7 +120,7 @@ export async function createBurnerServer(options: BurnerServerOptions) {
       await store.update((state) => {
         const evaluation = state.evaluations.find((item) => item.id === params.evaluationId);
         if (evaluation) {
-          Object.assign(evaluation, input);
+          Object.assign(evaluation, input, { definitionVersion: id("evaldef") });
           state.orchestrator.lastEvaluationAt = undefined;
           state.orchestrator.mergeWindowStartedAt = undefined;
           found = true;

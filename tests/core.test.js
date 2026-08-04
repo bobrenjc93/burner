@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService } from "../dist/lib/git.js";
@@ -115,6 +115,14 @@ test("prompt evaluators fail early enough to leave targeted retry headroom", asy
     process.env.PATH = previousPath;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("baseline authority is bound to the exact evaluation definition", () => {
+  const evaluation = { id: "quality", name: "Quality", prompt: "Score quality", weight: 1, enabled: true, createdAt: "2026-01-01T00:00:00.000Z", definitionVersion: "definition-v2" };
+  const run = { id: "run", evaluationId: "quality", score: 80, commit: "base", createdAt: "2026-01-01T00:00:00.000Z", durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3, evaluationDefinitionVersion: "definition-v2" };
+  assert.equal(isAuthoritativeFullBaseline(evaluation, run, "base"), true);
+  assert.equal(isAuthoritativeFullBaseline(evaluation, { ...run, evaluationDefinitionVersion: "definition-v1" }, "base"), false);
+  assert.equal(isAuthoritativeFullBaseline({ ...evaluation, definitionVersion: undefined }, { ...run, evaluationDefinitionVersion: undefined }, "base"), true, "legacy definitions remain compatible until edited");
 });
 
 test("score helpers clamp and weight enabled evaluations", () => {
@@ -812,6 +820,22 @@ test("compiled server closes connected event streams and stalled HTTP clients", 
       body: JSON.stringify({ name: "Docs", prompt: "Score the docs", weight: 2, enabled: true }),
     });
     assert.equal(created.status, 201);
+    const createdEvaluation = await created.json();
+    assert.match(createdEvaluation.definitionVersion, /^evaldef_/);
+    const definitionBeforeEdit = createdEvaluation.definitionVersion;
+    await burner.store.update((state) => state.evaluationRuns.push({
+      id: "docs-baseline", evaluationId: createdEvaluation.id, score: 80, commit: "base", createdAt: new Date().toISOString(), durationMs: 1,
+      status: "completed", context: "baseline", promptSampleCount: 3, evaluationDefinitionVersion: definitionBeforeEdit,
+    }));
+    const updated = await fetch(`${base}/api/evaluations/${createdEvaluation.id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Docs", prompt: "Score documentation comprehensively", weight: 2, enabled: true }),
+    });
+    assert.equal(updated.status, 200);
+    const editedEvaluation = burner.store.get().evaluations.find((evaluation) => evaluation.id === createdEvaluation.id);
+    assert.notEqual(editedEvaluation.definitionVersion, definitionBeforeEdit);
+    assert.equal(isAuthoritativeFullBaseline(editedEvaluation, burner.store.latestRuns().get(createdEvaluation.id), "base"), false);
     const invalidComposite = await fetch(`${base}/api/composites`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ agentRunIds: [] }) });
     assert.equal(invalidComposite.status, 400);
     const missingRetry = await fetch(`${base}/api/agents/missing/retry`, { method: "POST" });

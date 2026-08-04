@@ -82,8 +82,17 @@ function currentlyQualifiesForYoloMerge(state: BurnerState, run: Pick<AgentRun, 
   return isYoloCandidate(run.deltas, run.impact, enabled, commands, state.settings.compositeAbsorbThreshold);
 }
 
-function isAuthoritativeFullBaseline(evaluation: Evaluation, run: EvaluationRun | undefined, commit: string): boolean {
-  return run?.commit === commit && (Boolean(evaluation.command) || (run.promptSampleCount ?? 0) >= 3);
+function isCurrentEvaluationRun(evaluation: Evaluation, run: EvaluationRun | undefined, commit: string): boolean {
+  return run?.commit === commit && run.evaluationDefinitionVersion === evaluation.definitionVersion;
+}
+
+export function isAuthoritativeFullBaseline(evaluation: Evaluation, run: EvaluationRun | undefined, commit: string): boolean {
+  return isCurrentEvaluationRun(evaluation, run, commit) &&
+    (Boolean(evaluation.command) || (run!.promptSampleCount ?? 0) >= 3);
+}
+
+function isAuthoritativeScreeningBaseline(evaluation: Evaluation, run: EvaluationRun | undefined, commit: string): boolean {
+  return isCurrentEvaluationRun(evaluation, run, commit);
 }
 
 export function inferIdeaResources(idea: Pick<Idea, "title" | "description" | "rationale">): string[] {
@@ -572,7 +581,7 @@ export class Orchestrator {
     await this.store.update((draft) => {
       const enabled = draft.evaluations.filter((evaluation) => evaluation.enabled);
       const complete = enabled.every((evaluation) => isAuthoritativeFullBaseline(evaluation, fullBaseline.get(evaluation.id), baseCommit)) &&
-        (!this.portfolioMode() || enabled.every((evaluation) => !evaluation.screeningCommand || screeningBaseline.get(evaluation.id)?.commit === baseCommit));
+        (!this.portfolioMode() || enabled.every((evaluation) => !evaluation.screeningCommand || isAuthoritativeScreeningBaseline(evaluation, screeningBaseline.get(evaluation.id), baseCommit)));
       if (complete) {
         draft.orchestrator.mergeWindowStartedAt ??= now();
       } else {
@@ -1021,7 +1030,9 @@ export class Orchestrator {
       .filter((evaluation) => evaluation.enabled && !evaluation.command)
       .filter((evaluation) => {
         const run = latest.get(evaluation.id);
-        return run?.commit === commit && (run.promptSampleCount ?? 0) < 3;
+        return run?.commit === commit &&
+          run.evaluationDefinitionVersion === evaluation.definitionVersion &&
+          (run.promptSampleCount ?? 0) < 3;
       })
       .map((evaluation) => evaluation.id);
     if (!evaluationIds.length) return [];
@@ -1065,12 +1076,12 @@ export class Orchestrator {
     const commit = await this.git.resolveRef(this.store.get().settings.baseBranch);
     const enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
     const fullBaseline = this.store.latestRuns();
-    const missingFull = enabled.filter((evaluation) => fullBaseline.get(evaluation.id)?.commit !== commit);
+    const missingFull = enabled.filter((evaluation) => !isCurrentEvaluationRun(evaluation, fullBaseline.get(evaluation.id), commit));
     const fullRuns = missingFull.length === 0
       ? []
       : await this.runEvaluations(context, this.root, undefined, undefined, missingFull.map((evaluation) => evaluation.id));
     const screeningBaseline = this.store.latestScreeningRuns();
-    const missingScreening = enabled.filter((evaluation) => evaluation.screeningCommand && screeningBaseline.get(evaluation.id)?.commit !== commit);
+    const missingScreening = enabled.filter((evaluation) => evaluation.screeningCommand && !isAuthoritativeScreeningBaseline(evaluation, screeningBaseline.get(evaluation.id), commit));
     const screeningRuns = missingScreening.length > 0
       ? await this.runEvaluations("screening_baseline", this.root, undefined, undefined, missingScreening.map((evaluation) => evaluation.id))
       : [];
@@ -1080,7 +1091,7 @@ export class Orchestrator {
     const refreshedScreening = this.store.latestScreeningRuns();
     const complete = promptMedians !== undefined &&
       enabled.every((evaluation) => isAuthoritativeFullBaseline(evaluation, refreshedFull.get(evaluation.id), commit)) &&
-      enabled.every((evaluation) => !evaluation.screeningCommand || refreshedScreening.get(evaluation.id)?.commit === commit);
+      enabled.every((evaluation) => !evaluation.screeningCommand || isAuthoritativeScreeningBaseline(evaluation, refreshedScreening.get(evaluation.id), commit));
     if (runs.every((run) => run.status === "completed" && run.score !== undefined) && complete) {
       await this.store.update((draft) => {
         draft.orchestrator.lastEvaluationAt = now();
@@ -1095,7 +1106,7 @@ export class Orchestrator {
     const screeningBaseline = this.store.latestScreeningRuns();
     return state.evaluations.filter((evaluation) => evaluation.enabled && (
       !isAuthoritativeFullBaseline(evaluation, fullBaseline.get(evaluation.id), baseCommit) ||
-      Boolean(evaluation.screeningCommand && screeningBaseline.get(evaluation.id)?.commit !== baseCommit)
+      Boolean(evaluation.screeningCommand && !isAuthoritativeScreeningBaseline(evaluation, screeningBaseline.get(evaluation.id), baseCommit))
     ));
   }
 
@@ -1106,7 +1117,10 @@ export class Orchestrator {
     const runs = this.store.latestCompositeRuns(compositeId);
     const previousBaseline = this.store.latestRuns();
     const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
-    if (!enabled.length || enabled.some((evaluation) => runs.get(evaluation.id)?.score === undefined)) return false;
+    if (!enabled.length || enabled.some((evaluation) => {
+      const run = runs.get(evaluation.id);
+      return run?.score === undefined || run.evaluationDefinitionVersion !== evaluation.definitionVersion;
+    })) return false;
     if (await this.git.tree(baseCommit) !== await this.git.tree(composite.branch)) return false;
     const createdAt = now();
     await this.store.update((draft) => {
@@ -1117,7 +1131,8 @@ export class Orchestrator {
           ? undefined
           : (source.promptSampleCount ?? 0) >= 3
             ? 3
-            : (previous?.promptSampleCount ?? 0) >= 3 && previous?.score === source.score
+            : previous?.evaluationDefinitionVersion === evaluation.definitionVersion &&
+                (previous?.promptSampleCount ?? 0) >= 3 && previous?.score === source.score
               ? 3
               : undefined;
         draft.evaluationRuns.push({
@@ -1128,6 +1143,7 @@ export class Orchestrator {
           context: "baseline",
           agentRunId: undefined,
           compositeId: undefined,
+          evaluationDefinitionVersion: evaluation.definitionVersion,
           promptSampleCount,
         });
       }
@@ -1172,6 +1188,7 @@ export class Orchestrator {
           context,
           agentRunId,
           compositeId,
+          evaluationDefinitionVersion: evaluation.definitionVersion,
         };
         const started = Date.now();
         await this.store.update((draft) => draft.evaluationRuns.push(run));

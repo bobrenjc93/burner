@@ -43,6 +43,7 @@ function initialState(root: string): BurnerState {
         weight: 1,
         enabled: true,
         createdAt,
+        definitionVersion: id("evaldef"),
       },
       {
         id: id("eval"),
