@@ -964,10 +964,19 @@ export class Orchestrator {
     const run = state.agentRuns.find((item) => item.id === runId);
     const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
     if (!run || run.status !== "failed" || !idea) throw new Error("Only a failed agent run can be retried.");
-    if (!run.worktree || !run.authorThreadId || !run.baseRef || !run.baseCommit) throw new Error("This run failed before it produced a resumable candidate.");
+    if (!run.authorThreadId || !run.baseRef || !run.baseCommit) throw new Error("This run failed before it produced a resumable candidate.");
     if (await this.git.resolveRef(run.baseRef) !== run.baseCommit) throw new Error("The candidate base has moved; queue a fresh idea against the latest base instead.");
-    await this.git.head(run.worktree);
-    if (await this.git.hasChanges(run.worktree)) await this.git.commit(run.worktree, "burner: preserve interrupted revision");
+    let worktree = run.worktree;
+    try {
+      if (!worktree) throw new Error("Candidate worktree was removed after delivery.");
+      await this.git.head(worktree);
+    } catch {
+      const gitLock = await this.locks.acquire("git-metadata", `${run.id}-retry-worktree`);
+      try { worktree = await this.git.createExistingWorktree(run.id, run.branch); }
+      finally { await gitLock.release(); }
+      await this.updateAgent(run.id, { worktree });
+    }
+    if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, "burner: preserve interrupted revision");
     const baseline = run.parentCompositeId
       ? this.store.latestCompositeRuns(run.parentCompositeId)
       : this.portfolioMode() ? this.store.latestAgentBaselines() : this.store.latestRuns();
@@ -978,38 +987,63 @@ export class Orchestrator {
     if (!lease) throw new Error("A required resource is currently locked.");
     const base: AgentBase = { ref: run.baseRef, commit: run.baseCommit, baseline, compositeId: run.parentCompositeId };
     const unresolvedReview = run.reviewRounds.at(-1);
+    const mergeGateFeedback = run.quarantineReason?.startsWith("Merge gate rejected")
+      ? {
+          approved: false,
+          summary: "The external merge gate rejected the delivered candidate.",
+          findings: [{
+            severity: "high" as const,
+            title: "Repair the failed merge gate",
+            detail: `${run.error ?? run.quarantineReason} Inspect the exact PR head and its failed required checks, fix the underlying code, test, or workflow issue, and keep unrelated candidate behavior unchanged.`,
+            file: "",
+          }],
+        }
+      : undefined;
     this.activeAgents.add(idea.id);
     await this.store.update((draft) => {
       const currentRun = draft.agentRuns.find((item) => item.id === run.id);
       const currentIdea = draft.ideas.find((item) => item.id === idea.id);
-      if (currentRun) Object.assign(currentRun, { status: unresolvedReview && !unresolvedReview.approved ? "revising" : "reviewing", error: undefined, completedAt: undefined, reviewApproved: false, deltas: [], impact: undefined });
+      if (currentRun) Object.assign(currentRun, {
+        status: unresolvedReview && !unresolvedReview.approved || mergeGateFeedback ? "revising" : "reviewing",
+        error: undefined,
+        completedAt: undefined,
+        reviewApproved: false,
+        deltas: [],
+        impact: undefined,
+        fullMergeValidation: undefined,
+        quarantinedAt: undefined,
+        quarantineReason: undefined,
+      });
       if (currentIdea) Object.assign(currentIdea, { status: "running", updatedAt: now() });
     });
     await this.store.addActivity({ type: "agent", message: `Agent retry resumed: ${idea.title}`, detail: "Reusing the existing candidate and author session." });
     try {
       let authorThreadId = run.authorThreadId;
       let lastMessage = run.lastMessage ?? "";
-      if (unresolvedReview && !unresolvedReview.approved && unresolvedReview.findings.length) {
-        const revisionStartCommit = await this.git.head(run.worktree);
-        const revision = await this.codex.revise(run.worktree, authorThreadId, this.normalizeReview({
-          approved: false,
-          summary: unresolvedReview.summary,
-          findings: unresolvedReview.findings,
-        }), state.settings);
+      const retryReview = unresolvedReview && !unresolvedReview.approved && unresolvedReview.findings.length
+        ? this.normalizeReview({ approved: false, summary: unresolvedReview.summary, findings: unresolvedReview.findings })
+        : mergeGateFeedback;
+      if (retryReview) {
+        const revisionStartCommit = await this.git.head(worktree);
+        const revision = await this.codex.revise(worktree, authorThreadId, retryReview, state.settings);
         authorThreadId = revision.threadId;
         lastMessage = revision.message;
-        await this.assertCandidateDoesNotOwnProgress(run.worktree, revisionStartCommit);
-        if (await this.git.hasChanges(run.worktree)) await this.git.commit(run.worktree, "burner: address final review feedback before retry");
-        unresolvedReview.authorResponse = revision.message;
-        unresolvedReview.completedAt = now();
+        await this.assertCandidateDoesNotOwnProgress(worktree, revisionStartCommit);
+        if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, "burner: address final review feedback before retry");
+        if (unresolvedReview && !unresolvedReview.approved) {
+          unresolvedReview.authorResponse = revision.message;
+          unresolvedReview.completedAt = now();
+        }
         await this.store.update((draft) => {
           const currentRun = draft.agentRuns.find((item) => item.id === run.id);
-          const storedReview = currentRun?.reviewRounds.find((item) => item.id === unresolvedReview.id);
-          if (storedReview) Object.assign(storedReview, unresolvedReview);
+          const storedReview = unresolvedReview && !unresolvedReview.approved
+            ? currentRun?.reviewRounds.find((item) => item.id === unresolvedReview.id)
+            : undefined;
+          if (storedReview && unresolvedReview) Object.assign(storedReview, unresolvedReview);
           if (currentRun) Object.assign(currentRun, { lastMessage, authorThreadId });
         });
       }
-      await this.reviewAndDeliverAgent(idea, base, run.id, run.worktree, run.branch, state.settings, authorThreadId, lastMessage);
+      await this.reviewAndDeliverAgent(idea, base, run.id, worktree, run.branch, state.settings, authorThreadId, lastMessage);
     } catch (error) {
       const message = errorMessage(error);
       const reviewLimited = error instanceof PortfolioReviewLimitError;
@@ -2155,13 +2189,21 @@ export class Orchestrator {
       await this.updateAgent(runId, { status: "opening_pr" });
       if (!(await this.git.remoteExists(settings.remote))) throw new Error(`Git remote '${settings.remote}' does not exist.`);
       await this.git.push(worktree, settings.remote, branch);
-      pr = await this.git.openPr({
-        cwd: worktree,
-        base: settings.baseBranch,
-        branch,
-        title: idea.title,
-        body: buildPrBody(idea.description, lastMessage, deltas, impact, this.store.get().agentRuns.find((run) => run.id === runId)?.reviewRounds ?? []),
-      });
+      const currentRun = this.store.get().agentRuns.find((run) => run.id === runId);
+      const body = buildPrBody(idea.description, lastMessage, deltas, impact, currentRun?.reviewRounds ?? []);
+      if (currentRun?.prNumber && currentRun.prState === "open") {
+        await this.git.editPr(worktree, currentRun.prNumber, idea.title, body);
+        await this.git.markPrReady(worktree, currentRun.prNumber);
+        pr = { url: currentRun.prUrl ?? "", number: currentRun.prNumber };
+      } else {
+        pr = await this.git.openPr({
+          cwd: worktree,
+          base: settings.baseBranch,
+          branch,
+          title: idea.title,
+          body,
+        });
+      }
     }
     await this.updateAgent(runId, { status: "completed", completedAt: now(), prUrl: pr?.url, prNumber: pr?.number, prState: pr ? "open" : undefined });
     await this.finishIdea(idea.id, "completed");

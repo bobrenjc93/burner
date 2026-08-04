@@ -870,6 +870,58 @@ test("agent retry preserves review history and applies unresolved feedback befor
   }
 });
 
+test("merge-gate retry recreates a delivered worktree and sends the failure to the author", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-merge-gate-retry-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [];
+      state.ideas.push({ id: "idea", title: "Stable CLI", description: "Fix CLI", rationale: "CI", predictedImpact: 80, evaluationIds: [], resources: [], status: "failed", source: "manual", createdAt: timestamp, updatedAt: timestamp });
+      state.agentRuns.push({
+        id: "agent", ideaId: "idea", status: "failed", branch: "burner/stable-cli", worktree: join(root, "removed"),
+        startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1",
+        baseRef: "main", baseCommit: "base", prNumber: 7, prUrl: "https://example.test/pr/7", prState: "open",
+        error: "PR #7 required check failed: Rust quality gate", quarantinedAt: timestamp,
+        quarantineReason: "Merge gate rejected PR #7: Rust quality gate failed.",
+        reviewApproved: true,
+        reviewRounds: [{ id: "review-1", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
+        fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: "old", qualified: true, completedAt: timestamp },
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
+    let recreated = 0;
+    let changeChecks = 0;
+    orchestrator.git = {
+      resolveRef: async () => "base",
+      head: async (cwd) => { if (cwd.endsWith("removed")) throw new Error("missing"); return "candidate"; },
+      createExistingWorktree: async () => { recreated += 1; return root; },
+      hasChanges: async () => ++changeChecks > 1,
+      commit: async () => "fixed",
+    };
+    let retryReview;
+    orchestrator.codex = {
+      revise: async (_cwd, _threadId, review) => { retryReview = review; return { threadId: "thread-2", message: "Tolerated the expected broken pipe" }; },
+    };
+    orchestrator.reviewAndDeliverAgent = async (_idea, _base, runId, worktree) => {
+      assert.equal(worktree, root);
+      await store.update((state) => { const run = state.agentRuns.find((item) => item.id === runId); if (run) run.status = "completed"; });
+    };
+    await orchestrator.retryAgent("agent");
+    const run = store.get().agentRuns.find((item) => item.id === "agent");
+    assert.equal(recreated, 1);
+    assert.equal(retryReview.findings[0].title, "Repair the failed merge gate");
+    assert.match(retryReview.findings[0].detail, /Rust quality gate/);
+    assert.equal(run.worktree, root);
+    assert.equal(run.quarantinedAt, undefined);
+    assert.equal(run.fullMergeValidation, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("compiled server closes connected event streams and stalled HTTP clients", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-server-test-"));
   const burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0 });
