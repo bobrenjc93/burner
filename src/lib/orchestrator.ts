@@ -1736,20 +1736,25 @@ export class Orchestrator {
         if (!composite.prNumber) continue;
         const remote = byNumber.get(composite.prNumber);
         if (!remote) continue;
-        if (remote.state === "MERGED" && composite.status !== "merged") {
-          const mergedAt = now();
-          composite.status = "merged";
-          composite.mergedAt = mergedAt;
-          composite.updatedAt = mergedAt;
-          draft.orchestrator.lastMergeAt = mergedAt;
-          draft.orchestrator.mergeWindowStartedAt = mergedAt;
-          draft.orchestrator.lastMergeCadenceAlertAt = undefined;
-          newlyMergedCompositeIds.push(composite.id);
-          baseChanged = true;
-          draft.orchestrator.baseSyncPending = true;
-          composite.isLiving = false;
-          if (draft.orchestrator.livingCompositeId === composite.id) draft.orchestrator.livingCompositeId = undefined;
-          dispositionUpdates.push({ number: composite.prNumber, disposition: "merged" });
+        if (remote.state === "MERGED") {
+          // A successful remote merge is authoritative and resolves any stale
+          // local merge-gate diagnostic left by an interrupted recovery.
+          composite.error = undefined;
+          if (composite.status !== "merged") {
+            const mergedAt = now();
+            composite.status = "merged";
+            composite.mergedAt = mergedAt;
+            composite.updatedAt = mergedAt;
+            draft.orchestrator.lastMergeAt = mergedAt;
+            draft.orchestrator.mergeWindowStartedAt = mergedAt;
+            draft.orchestrator.lastMergeCadenceAlertAt = undefined;
+            newlyMergedCompositeIds.push(composite.id);
+            baseChanged = true;
+            draft.orchestrator.baseSyncPending = true;
+            composite.isLiving = false;
+            if (draft.orchestrator.livingCompositeId === composite.id) draft.orchestrator.livingCompositeId = undefined;
+            dispositionUpdates.push({ number: composite.prNumber, disposition: "merged" });
+          }
         } else if (remote.state === "CLOSED" && composite.status !== "merged" && composite.status !== "closed") {
           composite.status = "closed";
           composite.updatedAt = now();

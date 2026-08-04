@@ -2571,7 +2571,7 @@ test("merged composites supersede source PRs and queue overlapping composites fo
     await store.update((state) => {
       state.agentRuns.push(run("a", 1), run("b", 2), run("c", 3), run("d", 4));
       state.composites.push(
-        { id: "merged", title: "Merged composite", description: "", status: "open", branch: "composite-merged", worktree: "", sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a", kind: "pull_request" }, { agentRunId: "b", prNumber: 2, title: "B", branch: "branch-b", kind: "pull_request" }], deltas: [], reviewRounds: [], prNumber: 100, prUrl: "https://example.test/pull/100", createdAt: timestamp, updatedAt: timestamp, isLiving: true },
+        { id: "merged", title: "Merged composite", description: "", status: "open", branch: "composite-merged", worktree: "", sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a", kind: "pull_request" }, { agentRunId: "b", prNumber: 2, title: "B", branch: "branch-b", kind: "pull_request" }], deltas: [], reviewRounds: [], prNumber: 100, prUrl: "https://example.test/pull/100", createdAt: timestamp, updatedAt: timestamp, isLiving: true, error: "stale mergeability diagnostic" },
         { id: "overlap", title: "Overlap", description: "", status: "open", branch: "composite-overlap", worktree: "", sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a", kind: "pull_request" }, { agentRunId: "c", prNumber: 3, title: "C", branch: "branch-c", kind: "pull_request" }, { agentRunId: "d", prNumber: 4, title: "D", branch: "branch-d", kind: "pull_request" }], deltas: [], reviewRounds: [], prNumber: 101, prUrl: "https://example.test/pull/101", createdAt: timestamp, updatedAt: timestamp, isLiving: false },
       );
       state.orchestrator.livingCompositeId = "merged";
@@ -2593,6 +2593,7 @@ test("merged composites supersede source PRs and queue overlapping composites fo
     await orchestrator.syncPullRequests(true);
     const state = store.get();
     assert.equal(state.composites.find((item) => item.id === "merged").status, "merged");
+    assert.equal(state.composites.find((item) => item.id === "merged").error, undefined);
     assert.equal(state.agentRuns.find((item) => item.id === "a").prState, "superseded");
     assert.equal(state.agentRuns.find((item) => item.id === "b").prState, "superseded");
     const overlap = state.composites.find((item) => item.id === "overlap");
