@@ -78,7 +78,9 @@ export type SessionResult = { message: string; threadId: string };
 export type ReviewResult = { approved: boolean; summary: string; findings: ReviewFinding[] };
 
 function commandFailure(result: CommandResult, fallback: string): string {
-  const raw = result.stderr.trim() || result.stdout.trim() || fallback;
+  const stderr = result.stderr.trim();
+  const stdout = result.stdout.trim();
+  const raw = stderr && stdout ? `${stderr}\n${stdout}` : stderr || stdout || fallback;
   if (result.exitCode === 124) return raw.split("\n").reverse().find((line) => /timed out/i.test(line)) ?? fallback;
   return raw.length > 8_000 ? `…[truncated]\n${raw.slice(-8_000)}` : raw;
 }
@@ -168,7 +170,7 @@ export class CodexClient {
       signal: this.abortController.signal,
       onStderr: (line) => this.onProgress?.(line),
     });
-    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Evaluation command exited with ${result.exitCode}`);
+    if (result.exitCode !== 0) throw new Error(commandFailure(result, `Evaluation command exited with ${result.exitCode}`));
     const output = this.normalizeEvaluation(parseJsonObject<EvaluationOutput>(result.stdout));
     if (isInconclusiveCommandOutput(output)) {
       const detail = output.evidence[0] ? ` ${output.evidence[0]}` : "";

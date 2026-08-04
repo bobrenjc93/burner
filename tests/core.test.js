@@ -617,6 +617,11 @@ test("command evaluations reject fail-closed measurements instead of treating th
       () => new CodexClient().evaluate(root, { id: "bench", name: "Benchmark", prompt: "Measure it", command: evaluator, weight: 1, enabled: true, createdAt: new Date().toISOString() }, settings, "manual"),
       /inconclusive measurement.*Benchmark rejected/s,
     );
+    await writeFile(evaluator, `#!/bin/sh\nprintf '%09000d\\n' 0 >&2\nprintf '%s\\n' '{"score":0,"summary":"Benchmark rejected: no timing score was accepted.","evidence":["primary timing saturated: every case reached the parity cap"],"suggestions":[]}'\nexit 1\n`);
+    await assert.rejects(
+      () => new CodexClient().evaluate(root, { id: "bench", name: "Benchmark", prompt: "Measure it", command: evaluator, weight: 1, enabled: true, createdAt: new Date().toISOString() }, settings, "manual"),
+      /primary timing saturated/,
+    );
     await writeFile(evaluator, `#!/bin/sh\nprintf '%s\\n' '{"score":0,"summary":"Benchmark rejected: no timing score was accepted.","evidence":["typed correctness mismatch for unsupported SELECT"],"suggestions":[]}'\n`);
     assert.equal((await new CodexClient().evaluate(root, { id: "bench", name: "Benchmark", prompt: "Measure it", command: evaluator, weight: 1, enabled: true, createdAt: new Date().toISOString() }, settings, "manual")).score, 0);
   } finally {
