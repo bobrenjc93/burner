@@ -120,7 +120,17 @@ export async function createBurnerServer(options: BurnerServerOptions) {
       await store.update((state) => {
         const evaluation = state.evaluations.find((item) => item.id === params.evaluationId);
         if (evaluation) {
-          Object.assign(evaluation, input, { definitionVersion: id("evaldef") });
+          const fullDefinitionUnchanged = evaluation.name === input.name &&
+            evaluation.prompt === input.prompt &&
+            evaluation.command === input.command &&
+            evaluation.weight === input.weight &&
+            evaluation.enabled === input.enabled;
+          const screeningDefinitionUnchanged = evaluation.screeningCommand === input.screeningCommand;
+          const hasScreeningResults = state.evaluationRuns.some((run) =>
+            run.evaluationId === evaluation.id && run.context === "screening_baseline",
+          );
+          const preserveDefinition = fullDefinitionUnchanged && (screeningDefinitionUnchanged || !hasScreeningResults);
+          Object.assign(evaluation, input, { definitionVersion: preserveDefinition ? evaluation.definitionVersion : id("evaldef") });
           state.orchestrator.lastEvaluationAt = undefined;
           state.orchestrator.mergeWindowStartedAt = undefined;
           found = true;

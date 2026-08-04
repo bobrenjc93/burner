@@ -956,6 +956,40 @@ test("compiled server closes connected event streams and stalled HTTP clients", 
     const editedEvaluation = burner.store.get().evaluations.find((evaluation) => evaluation.id === createdEvaluation.id);
     assert.notEqual(editedEvaluation.definitionVersion, definitionBeforeEdit);
     assert.equal(isAuthoritativeFullBaseline(editedEvaluation, burner.store.latestRuns().get(createdEvaluation.id), "base"), false);
+
+    const commandCreated = await fetch(`${base}/api/evaluations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Bench", prompt: "Measure performance", command: "./full", weight: 3, enabled: true }),
+    });
+    const commandEvaluation = await commandCreated.json();
+    const commandDefinition = commandEvaluation.definitionVersion;
+    await burner.store.update((state) => state.evaluationRuns.push({
+      id: "bench-baseline", evaluationId: commandEvaluation.id, score: 70, commit: "base", createdAt: new Date().toISOString(), durationMs: 1,
+      status: "completed", context: "baseline", evaluationDefinitionVersion: commandDefinition,
+    }));
+    const screeningAdded = await fetch(`${base}/api/evaluations/${commandEvaluation.id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Bench", prompt: "Measure performance", command: "./full", screeningCommand: "./quick", weight: 3, enabled: true }),
+    });
+    assert.equal(screeningAdded.status, 200);
+    let screenedEvaluation = burner.store.get().evaluations.find((evaluation) => evaluation.id === commandEvaluation.id);
+    assert.equal(screenedEvaluation.definitionVersion, commandDefinition, "adding an unmeasured screen must preserve the unchanged full baseline");
+    assert.equal(isAuthoritativeFullBaseline(screenedEvaluation, burner.store.latestRuns().get(commandEvaluation.id), "base"), true);
+    await burner.store.update((state) => state.evaluationRuns.push({
+      id: "bench-screen", evaluationId: commandEvaluation.id, score: 72, commit: "base", createdAt: new Date().toISOString(), durationMs: 1,
+      status: "completed", context: "screening_baseline", evaluationDefinitionVersion: commandDefinition,
+    }));
+    const screeningChanged = await fetch(`${base}/api/evaluations/${commandEvaluation.id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Bench", prompt: "Measure performance", command: "./full", screeningCommand: "./quick-v2", weight: 3, enabled: true }),
+    });
+    assert.equal(screeningChanged.status, 200);
+    screenedEvaluation = burner.store.get().evaluations.find((evaluation) => evaluation.id === commandEvaluation.id);
+    assert.notEqual(screenedEvaluation.definitionVersion, commandDefinition, "changing a measured screen must invalidate its prior authority");
+    assert.equal(isAuthoritativeFullBaseline(screenedEvaluation, burner.store.latestRuns().get(commandEvaluation.id), "base"), false);
     const invalidComposite = await fetch(`${base}/api/composites`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ agentRunIds: [] }) });
     assert.equal(invalidComposite.status, 400);
     const missingRetry = await fetch(`${base}/api/agents/missing/retry`, { method: "POST" });
