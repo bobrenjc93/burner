@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, TransientMergeGateError } from "../dist/lib/git.js";
@@ -547,6 +547,47 @@ test("YOLO yields a long review loop while an approved fallback can still use th
       remainingMs: 31 * 60_000,
       requiredMs: 30 * 60_000,
     });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("YOLO reserves authoring and review time before dispatching a portfolio agent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-dispatch-cadence-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const currentTime = Date.now();
+    const timestamp = new Date(currentTime).toISOString();
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 40;
+      state.settings.parallelism = 1;
+      state.orchestrator.enabled = true;
+      state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 20 * 60_000).toISOString();
+      state.ideas.push({ id: "queued", title: "Candidate", description: "Narrow work", rationale: "Improve", predictedImpact: 1, evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "planner" });
+    });
+
+    assert.deepEqual(agentDispatchCadenceHeadroom(store.get(), "base", currentTime), {
+      allowed: false,
+      remainingMs: 20 * 60_000,
+      requiredMs: 80 * 60_000 / 3,
+    });
+
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    orchestrator.locks = { tryAcquireAll: async () => ({ locks: [], release: async () => {} }) };
+    let dispatched = false;
+    orchestrator.runIdea = async () => { dispatched = true; };
+    await orchestrator.schedule();
+    assert.equal(dispatched, false);
+    assert.match(store.get().activity[0].message, /dispatch held for merge cadence/i);
+
+    await store.update((state) => {
+      state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 10 * 60_000).toISOString();
+    });
+    assert.equal(agentDispatchCadenceHeadroom(store.get(), "base", currentTime).allowed, true);
+    await orchestrator.schedule();
+    assert.equal(dispatched, true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

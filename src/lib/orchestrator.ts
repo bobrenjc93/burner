@@ -336,6 +336,30 @@ export function agentReviewCadenceHeadroom(
   return { allowed: headroom.remainingMs > requiredMs, remainingMs: headroom.remainingMs, requiredMs };
 }
 
+export function agentDispatchCadenceHeadroom(
+  state: BurnerState,
+  baseCommit: string,
+  currentTimeMs = Date.now(),
+): { allowed: boolean; remainingMs: number; requiredMs: number } {
+  const headroom = compositeRevisionHeadroom(
+    state.orchestrator.mergeWindowStartedAt,
+    state.settings.mergeCadenceMinutes,
+    currentTimeMs,
+  );
+  if (!Number.isFinite(headroom.remainingMs)) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
+  const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
+  const authorCycleReserveMs = Math.min(10 * 60_000, Math.max(5 * 60_000, cadenceMs / 6));
+  const fallbackReady = Boolean(selectYoloMergeCandidate(state, baseCommit, true));
+  const downstreamReserveMs = fallbackReady
+    ? authorCycleReserveMs * 2
+    : Math.min(30 * 60_000, Math.max(10 * 60_000, cadenceMs / 2));
+  // Starting an author consumes time before the candidate reaches the review
+  // guard. Reserve both phases up front so Burner never starts work that its
+  // own cadence policy is already destined to quarantine.
+  const requiredMs = downstreamReserveMs + authorCycleReserveMs;
+  return { allowed: headroom.remainingMs > requiredMs, remainingMs: headroom.remainingMs, requiredMs };
+}
+
 export function assertCompositeEvaluationRevisionChanged(startCommit: string, endCommit: string, evaluationRevision: number): void {
   if (startCommit !== endCommit) return;
   throw new Error(
@@ -363,6 +387,7 @@ export class Orchestrator {
   private protectedParentRepository?: { root: string; excludedTarget: string; snapshot: string };
   private boundaryTripped = false;
   private readonly mergeRetryAfter = new Map<string, number>();
+  private agentDispatchHoldWindow?: string;
 
   private async repositorySnapshot(root: string, excludedTarget: string): Promise<string> {
     const excludePathspec = `:(exclude)${excludedTarget}`;
@@ -2092,6 +2117,22 @@ export class Orchestrator {
       if (started >= capacity) break;
       let base: AgentBase;
       try { base = await this.resolveAgentBase(idea, state); } catch { continue; }
+      if (this.portfolioMode()) {
+        const cadence = agentDispatchCadenceHeadroom(state, base.commit);
+        if (!cadence.allowed) {
+          const window = state.orchestrator.mergeWindowStartedAt;
+          if (window && this.agentDispatchHoldWindow !== window) {
+            this.agentDispatchHoldWindow = window;
+            await this.store.addActivity({
+              type: "system",
+              message: "Agent dispatch held for merge cadence",
+              detail: `${Math.max(0, Math.ceil(cadence.remainingMs / 60_000))} minutes remain, but a new author plus review and validation needs ${Math.ceil(cadence.requiredMs / 60_000)} minutes. Burner will not start work that its cadence guard would later quarantine.`,
+            });
+          }
+          return;
+        }
+        this.agentDispatchHoldWindow = undefined;
+      }
       const resources = [...new Set([...state.settings.defaultResources, ...idea.resources, ...inferIdeaResources(idea), ...(base.compositeId ? [`living-${base.compositeId}`] : [])])];
       const lease = await this.locks.tryAcquireAll(resources, idea.id);
       if (!lease) continue;
