@@ -38,6 +38,24 @@ test("command timeouts terminate descendant processes and return exit code 124",
   assert.ok(Date.now() - started < 2_000, "timed-out descendants should not keep their inherited pipes open");
 });
 
+test("command timeouts exclude host-suspend-sized event-loop gaps", async () => {
+  const started = Date.now();
+  const running = runCommand("/bin/sh", ["-c", "sleep 30 & wait"], {
+    cwd: process.cwd(),
+    timeoutMs: 80,
+    timeoutSuspendGapMs: 30,
+  });
+  const blockedUntil = Date.now() + 100;
+  while (Date.now() < blockedUntil) {
+    // Simulate the event loop resuming after a host-suspend-sized gap.
+  }
+  const result = await running;
+  assert.equal(result.exitCode, 124);
+  assert.match(result.stderr, /Command timed out after 80ms/);
+  assert.ok(Date.now() - started >= 140, "suspended wall time should not consume the active execution timeout");
+  assert.ok(Date.now() - started < 2_000, "the active execution timeout must still fail closed");
+});
+
 test("command aborts terminate descendant processes during Burner shutdown", async () => {
   const controller = new AbortController();
   const started = Date.now();
