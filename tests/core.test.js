@@ -1483,6 +1483,36 @@ test("YOLO starts a partial cook early enough for the observed full suite to mee
   }
 });
 
+test("YOLO cadence forecasting ignores one suspended-host duration outlier", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-duration-outlier-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const now = Date.now();
+    const timestamp = new Date(now).toISOString();
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.evaluations = [
+        { id: "benchmark", name: "Benchmark", prompt: "Measure", command: "./full", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+      state.evaluationRuns = [
+        { id: "benchmark-a", evaluationId: "benchmark", score: 100, commit: "a", createdAt: new Date(now - 30_000).toISOString(), durationMs: 11 * 60_000, status: "completed", context: "baseline" },
+        { id: "benchmark-b", evaluationId: "benchmark", score: 100, commit: "b", createdAt: new Date(now - 20_000).toISOString(), durationMs: 12 * 60_000, status: "completed", context: "composite" },
+        { id: "benchmark-slept", evaluationId: "benchmark", score: 100, commit: "c", createdAt: new Date(now - 10_000).toISOString(), durationMs: 62 * 60_000, status: "completed", context: "baseline" },
+        { id: "quality-a", evaluationId: "quality", score: 90, commit: "a", createdAt: new Date(now - 30_000).toISOString(), durationMs: 2 * 60_000, status: "completed", context: "baseline" },
+        { id: "quality-b", evaluationId: "quality", score: 90, commit: "b", createdAt: new Date(now - 20_000).toISOString(), durationMs: 3 * 60_000, status: "completed", context: "composite" },
+        { id: "quality-c", evaluationId: "quality", score: 90, commit: "c", createdAt: new Date(now - 10_000).toISOString(), durationMs: 2 * 60_000, status: "completed", context: "baseline" },
+      ];
+      state.orchestrator.mergeWindowStartedAt = new Date(now - 10 * 60_000).toISOString();
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    assert.equal(orchestrator.portfolioCookDue(store.get(), "base"), false, "one sleep-inflated run must not force an immediate singleton cook");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a missed merge cadence opens a bounded recovery window without losing urgency", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-cadence-recovery-test-"));
   try {

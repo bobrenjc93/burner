@@ -501,11 +501,33 @@ export class Orchestrator {
     const anchor = state.orchestrator.mergeWindowStartedAt;
     if (!anchor) return false;
     const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
-    const latest = this.store.latestRuns();
+    const observedDuration = (evaluation: Evaluation): number => {
+      const samples = state.evaluationRuns
+        .filter((run) =>
+          run.evaluationId === evaluation.id &&
+          run.status === "completed" &&
+          Number.isFinite(run.durationMs) &&
+          run.durationMs > 0 &&
+          run.context !== "agent" &&
+          run.context !== "screening_baseline" &&
+          run.evaluationDefinitionVersion === evaluation.definitionVersion,
+        )
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, 5)
+        .map((run) => run.durationMs)
+        .sort((left, right) => left - right);
+      if (!samples.length) return 0;
+      const middle = Math.floor(samples.length / 2);
+      return samples.length % 2 === 1
+        ? samples[middle]
+        : (samples[middle - 1] + samples[middle]) / 2;
+    };
     let commandMs = 0;
     let promptMs = 0;
     for (const evaluation of state.evaluations.filter((item) => item.enabled)) {
-      const duration = latest.get(evaluation.id)?.durationMs ?? 0;
+      // Wall-clock duration includes host sleep. Use a recent median so one
+      // suspended run cannot make every following generation cook early.
+      const duration = observedDuration(evaluation);
       if (evaluation.command) commandMs += duration;
       else promptMs = Math.max(promptMs, duration);
     }
