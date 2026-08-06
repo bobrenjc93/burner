@@ -389,14 +389,36 @@ export class Orchestrator {
   private readonly mergeRetryAfter = new Map<string, number>();
   private agentDispatchHoldWindow?: string;
 
+  private async isIndependentUntrackedRepository(root: string, path: string): Promise<boolean> {
+    // Git collapses an untracked nested repository to a single `?? path/`
+    // entry, even with --untracked-files=all. Treat independently rooted
+    // sibling repositories as separate workspaces so activity in another
+    // Burner project cannot trip this target's parent-boundary guard.
+    if (!path.endsWith("/")) return false;
+    const candidate = resolve(root, path.slice(0, -1));
+    if (!candidate.startsWith(`${root}${sep}`)) return false;
+    const discovered = await runCommand("git", ["rev-parse", "--show-toplevel"], { cwd: candidate, timeoutMs: 10_000 });
+    if (discovered.exitCode !== 0) return false;
+    try {
+      return await realpath(candidate) === await realpath(resolve(discovered.stdout.trim()));
+    } catch {
+      return false;
+    }
+  }
+
   private async repositorySnapshot(root: string, excludedTarget: string): Promise<string> {
     const excludePathspec = `:(exclude)${excludedTarget}`;
     const [status, diff] = await Promise.all([
-      runCommand("git", ["status", "--porcelain=v1", "--untracked-files=all", "--", ".", excludePathspec], { cwd: root, timeoutMs: 10_000 }),
+      runCommand("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".", excludePathspec], { cwd: root, timeoutMs: 10_000 }),
       runCommand("git", ["diff", "--binary", "HEAD", "--", ".", excludePathspec], { cwd: root, timeoutMs: 10_000 }),
     ]);
     if (status.exitCode !== 0 || diff.exitCode !== 0) throw new Error(`Could not snapshot protected parent repository '${root}'.`);
-    return `${status.stdout}\0${diff.stdout}`;
+    const filteredStatus: string[] = [];
+    for (const entry of status.stdout.split("\0").filter(Boolean)) {
+      if (entry.startsWith("?? ") && await this.isIndependentUntrackedRepository(root, entry.slice(3))) continue;
+      filteredStatus.push(entry);
+    }
+    return `${filteredStatus.join("\0")}\0${diff.stdout}`;
   }
 
   private async initializeProtectedParentRepository(): Promise<void> {

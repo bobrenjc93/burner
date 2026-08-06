@@ -113,6 +113,35 @@ test("Codex external edits pause Burner without reverting the protected parent r
   }
 });
 
+test("independent untracked sibling repositories do not trip the protected parent boundary", async () => {
+  const outer = await mkdtemp(join(tmpdir(), "burner-sibling-boundary-test-"));
+  const target = join(outer, "target");
+  const sibling = join(outer, "another-project");
+  try {
+    await exec(outer, "git", ["init", "-q"]);
+    await exec(outer, "git", ["config", "user.email", "burner@example.test"]);
+    await exec(outer, "git", ["config", "user.name", "Burner Test"]);
+    await writeFile(join(outer, ".gitignore"), "target/\n");
+    await exec(outer, "git", ["add", ".gitignore"]);
+    await exec(outer, "git", ["commit", "-qm", "seed"]);
+    await import("node:fs/promises").then((fs) => fs.mkdir(target));
+    const store = new StateStore(target);
+    await store.init();
+    await store.update((state) => { state.orchestrator.enabled = true; });
+    const orchestrator = new Orchestrator(target, store, new EventHub());
+    await orchestrator.initializeProtectedParentRepository();
+
+    await import("node:fs/promises").then((fs) => fs.mkdir(sibling));
+    await exec(sibling, "git", ["init", "-q"]);
+    await writeFile(join(sibling, "README.md"), "separate workspace\n");
+
+    await orchestrator.assertProtectedParentUnchanged();
+    assert.equal(store.get().orchestrator.enabled, true);
+  } finally {
+    await rm(outer, { recursive: true, force: true });
+  }
+});
+
 test("prompt evaluators fail early enough to leave targeted retry headroom", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-evaluator-timeout-test-"));
   const bin = join(root, "bin");
