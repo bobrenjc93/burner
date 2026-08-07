@@ -14,7 +14,14 @@ export type ProgressPoint = {
 };
 
 type ProgressHistory = {
-  version: 1;
+  version: 2;
+  updatePolicy: {
+    trigger: "successful_merge";
+    pointIdentity: "baseline_commit_or_pr_number";
+    retryBehavior: "upsert_existing_key_preserving_original_timestamp";
+    scoreValidation: "all_enabled_evaluations_finite_0_to_100";
+    failureBehavior: "abort_before_artifact_write";
+  };
   evaluations: Record<string, { name: string; color: string }>;
   points: ProgressPoint[];
 };
@@ -24,6 +31,14 @@ const GRAPH_PATH = "docs/burner-evaluation-progress.svg";
 const START = "<!-- burner-progress:start -->";
 const END = "<!-- burner-progress:end -->";
 const COLORS = ["#ff6b35", "#7c5cff", "#00a7a5", "#e6a700", "#d94f8a", "#2589bd", "#5b8c36", "#9c6644", "#6c757d", "#ef476f"];
+
+const updatePolicy = (): ProgressHistory["updatePolicy"] => ({
+  trigger: "successful_merge",
+  pointIdentity: "baseline_commit_or_pr_number",
+  retryBehavior: "upsert_existing_key_preserving_original_timestamp",
+  scoreValidation: "all_enabled_evaluations_finite_0_to_100",
+  failureBehavior: "abort_before_artifact_write",
+});
 
 const escapeXml = (value: string) => value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[character]!);
 
@@ -98,14 +113,52 @@ function orderBaselinesBeforeCandidates(points: ProgressPoint[], candidateBaseCo
 }
 
 function emptyHistory(): ProgressHistory {
-  return { version: 1, evaluations: {}, points: [] };
+  return { version: 2, updatePolicy: updatePolicy(), evaluations: {}, points: [] };
+}
+
+function validatePoint(point: ProgressPoint, requiredEvaluationIds?: Set<string>): void {
+  if (!point || typeof point !== "object" || !point.key?.trim() || !point.label?.trim() || !point.title?.trim()) {
+    throw new Error("progress point requires non-empty key, label, and title");
+  }
+  if (!Number.isFinite(Date.parse(point.recordedAt))) throw new Error(`progress point '${point.key}' has an invalid timestamp`);
+  if (point.kind === "baseline") {
+    if (!baselineIdentity(point)) throw new Error(`baseline progress point '${point.key}' requires a commit identity`);
+  } else if (!Number.isInteger(point.prNumber) || point.prNumber! <= 0 || point.key !== `pr:${point.prNumber}`) {
+    throw new Error(`PR progress point '${point.key}' requires a matching positive PR number`);
+  }
+  if (!point.scores || typeof point.scores !== "object" || Array.isArray(point.scores)) {
+    throw new Error(`progress point '${point.key}' requires a score map`);
+  }
+  const scoreIds = Object.keys(point.scores);
+  for (const [evaluationId, score] of Object.entries(point.scores)) {
+    if (!evaluationId.trim() || !Number.isFinite(score) || score < 0 || score > 100) {
+      throw new Error(`progress point '${point.key}' has an invalid score for '${evaluationId || "<empty>"}'`);
+    }
+  }
+  if (requiredEvaluationIds && (scoreIds.length !== requiredEvaluationIds.size || scoreIds.some((id) => !requiredEvaluationIds.has(id)))) {
+    throw new Error(`progress point '${point.key}' must contain exactly every enabled evaluation score`);
+  }
+}
+
+function validateStoredHistory(history: Pick<ProgressHistory, "evaluations" | "points">): void {
+  const keys = new Set<string>();
+  for (const point of history.points) {
+    validatePoint(point);
+    if (keys.has(point.key)) throw new Error(`progress history contains duplicate key '${point.key}'`);
+    keys.add(point.key);
+    for (const evaluationId of Object.keys(point.scores)) {
+      if (!history.evaluations[evaluationId]) throw new Error(`progress point '${point.key}' references unknown evaluation '${evaluationId}'`);
+    }
+  }
 }
 
 async function readHistory(cwd: string): Promise<ProgressHistory> {
   try {
-    const parsed = JSON.parse(await readFile(join(cwd, HISTORY_PATH), "utf8")) as Partial<ProgressHistory>;
-    if (parsed.version !== 1 || !parsed.evaluations || !Array.isArray(parsed.points)) throw new Error("unsupported history format");
-    return parsed as ProgressHistory;
+    const parsed = JSON.parse(await readFile(join(cwd, HISTORY_PATH), "utf8")) as Partial<ProgressHistory> & { version?: number };
+    if (![1, 2].includes(parsed.version ?? 0) || !parsed.evaluations || !Array.isArray(parsed.points)) throw new Error("unsupported history format");
+    const history: ProgressHistory = { version: 2, updatePolicy: updatePolicy(), evaluations: parsed.evaluations, points: parsed.points };
+    validateStoredHistory(history);
+    return history;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyHistory();
     throw new Error(`Could not read ${HISTORY_PATH}: ${error instanceof Error ? error.message : String(error)}`);
@@ -166,7 +219,7 @@ function renderSvg(history: ProgressHistory): string {
 }
 
 function readmeBlock(): string {
-  return `${START}\n## Burner evaluation progress\n\n![Burner evaluation progress](${GRAPH_PATH})\n\n_Updated automatically on every Burner merge. [Raw history](${HISTORY_PATH})._\n${END}`;
+  return `${START}\n## Burner evaluation progress\n\n![Burner evaluation progress](${GRAPH_PATH})\n\nBurner updates this graph atomically after each successful merge. It validates a complete finite 0–100 score map for every enabled evaluation, then upserts the canonical baseline-commit or \`pr:<number>\` key; retrying a merge replaces the existing point instead of duplicating it. Missing or malformed scores abort artifact generation before any file is written. The [raw versioned history](${HISTORY_PATH}) records this merge-coupled policy.\n${END}`;
 }
 
 async function atomicWrite(path: string, contents: string): Promise<void> {
@@ -183,6 +236,12 @@ export async function updateProgressArtifacts(
   candidateBaseCommits: Record<number, string> = {},
 ): Promise<ProgressHistory> {
   const history = await readHistory(cwd);
+  const requiredEvaluationIds = new Set(evaluations.filter((item) => item.enabled).map((item) => item.id));
+  try {
+    for (const point of newPoints) validatePoint(point, requiredEvaluationIds);
+  } catch (error) {
+    throw new Error(`Invalid progress update: ${error instanceof Error ? error.message : String(error)}`);
+  }
   history.points = collapseRedundantBaselinePoints(history.points, candidateBaseCommits);
   for (const evaluation of evaluations.filter((item) => item.enabled)) {
     const existing = history.evaluations[evaluation.id];

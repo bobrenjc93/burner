@@ -210,6 +210,12 @@ test("merge progress artifacts deduplicate semantic baselines and PR retries", a
     const svg = await readFile(join(root, "docs", "burner-evaluation-progress.svg"), "utf8");
     assert.match(readme, /burner-progress:start/);
     assert.match(readme, /burner-evaluation-progress\.svg/);
+    assert.match(readme, /retrying a merge replaces the existing point instead of duplicating it/i);
+    assert.match(readme, /malformed scores abort artifact generation/i);
+    assert.equal(history.version, 2);
+    assert.equal(history.updatePolicy.trigger, "successful_merge");
+    assert.equal(history.updatePolicy.retryBehavior, "upsert_existing_key_preserving_original_timestamp");
+    assert.equal(history.updatePolicy.scoreValidation, "all_enabled_evaluations_finite_0_to_100");
     assert.equal(history.points.length, 3);
     assert.equal(history.points[0].key, "baseline:abc");
     assert.equal(history.points[0].recordedAt, timestamp);
@@ -221,6 +227,34 @@ test("merge progress artifacts deduplicate semantic baselines and PR retries", a
     assert.match(svg, /Quality/);
     assert.match(svg, /PR #12/);
     assert.match(svg, /PR #13/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("progress updates reject incomplete or malformed score maps before writing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-progress-validation-test-"));
+  try {
+    await writeFile(join(root, "README.md"), "# Demo\n");
+    const timestamp = "2026-01-01T00:00:00.000Z";
+    const evaluations = [
+      { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+      { id: "speed", name: "Speed", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+    ];
+    await assert.rejects(
+      updateProgressArtifacts(root, evaluations, [
+        { key: "pr:1", recordedAt: timestamp, label: "PR #1", kind: "leaf", prNumber: 1, title: "Incomplete", scores: { quality: 80 } },
+      ]),
+      /must contain exactly every enabled evaluation score/,
+    );
+    await assert.rejects(
+      updateProgressArtifacts(root, evaluations, [
+        { key: "pr:2", recordedAt: timestamp, label: "PR #2", kind: "leaf", prNumber: 2, title: "Malformed", scores: { quality: 80, speed: Number.NaN } },
+      ]),
+      /invalid score/,
+    );
+    await assert.rejects(readFile(join(root, "docs", "burner-evaluation-history.json"), "utf8"), /ENOENT/);
+    assert.equal(await readFile(join(root, "README.md"), "utf8"), "# Demo\n");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
