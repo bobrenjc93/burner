@@ -9,7 +9,7 @@ import { StateStore, validateEvaluation } from "./lib/store.js";
 import type { BurnerSettings, Idea } from "./types.js";
 import { errorMessage, id, now } from "./lib/utils.js";
 
-export type BurnerServerOptions = { root: string; host: string; port: number; dev?: boolean; yolo?: boolean; yoloBatchSize?: number };
+export type BurnerServerOptions = { root: string; host: string; port: number; portScanLimit?: number; dev?: boolean; yolo?: boolean; yoloBatchSize?: number };
 
 type Route = { method: string; pattern: RegExp; keys: string[]; handler: Handler };
 type Handler = (request: IncomingMessage, response: ServerResponse, params: Record<string, string>, body: Record<string, unknown>) => Promise<void> | void;
@@ -265,13 +265,48 @@ export async function createBurnerServer(options: BurnerServerOptions) {
 
   const heartbeat = setInterval(() => events.heartbeat(), 20_000);
   heartbeat.unref();
-  await new Promise<void>((resolveListen, reject) => {
-    server.once("error", reject);
-    server.listen(options.port, options.host, () => { server.off("error", reject); resolveListen(); });
-  });
+  // One Burner per repository means several can run at once on one machine.
+  // Walk forward to the next free port so a second project does not fail to
+  // start, or die later, merely because the default was already taken.
+  const scanLimit = Math.max(1, options.portScanLimit ?? 1);
+  const listen = async (): Promise<number> => {
+    for (let attempt = 0; ; attempt += 1) {
+      const candidate = options.port + attempt;
+      if (candidate > 65_535) throw new Error(`No free port between ${options.port} and 65535.`);
+      try {
+        await new Promise<void>((resolveListen, reject) => {
+          const onError = (error: Error) => reject(error);
+          server.once("error", onError);
+          server.listen(candidate, options.host, () => { server.off("error", onError); resolveListen(); });
+        });
+        return candidate;
+      } catch (error) {
+        const busy = (error as NodeJS.ErrnoException).code === "EADDRINUSE";
+        if (!busy) throw error;
+        if (attempt + 1 >= scanLimit) {
+          throw new Error(
+            `Port ${candidate} is already in use. Another Burner may be running here; `
+            + "pass a different --port, or omit --port to take the next free one.",
+          );
+        }
+      }
+    }
+  };
+
+  let port: number;
+  try {
+    port = await listen();
+  } catch (error) {
+    // Never leave the orchestrator and its timers running behind a server that
+    // failed to bind; the caller has no handle to close.
+    clearInterval(heartbeat);
+    await orchestrator.close();
+    events.close();
+    throw error;
+  }
 
   return {
-    store, orchestrator, server,
+    store, orchestrator, server, port,
     close: async () => {
       clearInterval(heartbeat);
       await orchestrator.close();

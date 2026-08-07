@@ -17,7 +17,7 @@ burner --yolo
 
 ## What it does
 
-- Runs as a CLI-launched local web server in the target repository.
+- Runs as a CLI-launched local web server in the target repository. One Burner improves one repository, so several can run at once; each takes the next free port from 4321 unless you pass an explicit `--port`, which never moves.
 - Stores configuration and run history locally in `.burner/state.json`.
 - Evaluates arbitrary prompts with structured `codex exec` output.
 - Plans cadence-sized improvements from the latest evaluation evidence, decomposing oversized or quarantined scopes before retrying them.

@@ -40,7 +40,8 @@ Commands:
   status         Print project state and runtime readiness as JSON
 
 Server options:
-  -p, --port <port>       port to listen on (default: 4321)
+  -p, --port <port>       port to listen on (default: 4321, or the next free
+                          port; an explicit --port never moves)
   --host <host>           host to bind (default: 127.0.0.1)
   --no-open               do not open a browser
   --yolo                  autonomously run and master-cook leaf PRs
@@ -243,6 +244,7 @@ function parseServerArgs(argv: string[]) {
   let directory = ".";
   let host = "127.0.0.1";
   let port = "4321";
+  let portExplicit = false;
   let shouldOpen = true;
   let yolo = false;
   let yoloBatchSize = 10;
@@ -258,11 +260,11 @@ function parseServerArgs(argv: string[]) {
     }
     if (arg === "--dev") continue;
     if (arg === "--host") { host = argv[++index] ?? host; continue; }
-    if (arg === "--port" || arg === "-p") { port = argv[++index] ?? port; continue; }
+    if (arg === "--port" || arg === "-p") { port = argv[++index] ?? port; portExplicit = true; continue; }
     if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
     directory = arg;
   }
-  return { directory, host, port, shouldOpen, yolo, yoloBatchSize };
+  return { directory, host, port, portExplicit, shouldOpen, yolo, yoloBatchSize };
 }
 
 function openBrowser(url: string): void {
@@ -285,11 +287,17 @@ async function main(): Promise<void> {
   if (!new Set(["127.0.0.1", "localhost", "::1"]).has(options.host)) throw new Error("Burner only binds to the local machine. Use 127.0.0.1, localhost, or ::1.");
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Port must be an integer between 1 and 65535.");
 
-  const burner = await createBurnerServer({ root, host: options.host, port, yolo: options.yolo, yoloBatchSize: options.yoloBatchSize });
-  const url = `http://${options.host}:${port}`;
+  const burner = await createBurnerServer({
+    root, host: options.host, port,
+    portScanLimit: options.portExplicit ? 1 : 64,
+    yolo: options.yolo, yoloBatchSize: options.yoloBatchSize,
+  });
+  const url = `http://${options.host}:${burner.port}`;
   console.log(`\n${colors.fire("  ◉ BURNER")}\n${colors.dim("  Evaluation-driven repo improvement, running locally.")}\n`);
   console.log(`  ${colors.dim("Project")}  ${root}`);
-  console.log(`  ${colors.dim("Control")}  ${colors.cyan(url)}\n`);
+  console.log(`  ${colors.dim("Control")}  ${colors.cyan(url)}`);
+  if (burner.port !== port) console.log(colors.dim(`  ${" ".repeat(7)}  port ${port} was busy, took the next free one`));
+  console.log("");
   console.log(colors.red("  ⚠ Codex agents have unrestricted filesystem and command access as your user.\n"));
   if (options.yolo) console.log(colors.red(options.yoloBatchSize === 1
     ? "  ⚠ YOLO autopilot is active: Burner may open and merge approved leaf PRs.\n"

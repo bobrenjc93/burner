@@ -1065,6 +1065,36 @@ test("merge-gate retry recreates a delivered worktree and sends the failure to t
   }
 });
 
+test("a second Burner takes the next free port instead of failing", async () => {
+  const first = await mkdtemp(join(tmpdir(), "burner-port-a-"));
+  const second = await mkdtemp(join(tmpdir(), "burner-port-b-"));
+  const occupied = await createBurnerServer({ root: first, host: "127.0.0.1", port: 0 });
+  const busyPort = occupied.server.address().port;
+  try {
+    const scanned = await createBurnerServer({
+      root: second, host: "127.0.0.1", port: busyPort, portScanLimit: 16,
+    });
+    try {
+      assert.equal(scanned.port, scanned.server.address().port);
+      assert.ok(scanned.port > busyPort, "should have moved past the busy port");
+      const health = await (await fetch(`http://127.0.0.1:${scanned.port}/api/health`)).json();
+      assert.equal(health.ok, true);
+    } finally {
+      await scanned.close();
+    }
+
+    // An explicit --port must fail loudly rather than silently moving.
+    await assert.rejects(
+      createBurnerServer({ root: second, host: "127.0.0.1", port: busyPort, portScanLimit: 1 }),
+      /already in use/,
+    );
+  } finally {
+    await occupied.close();
+    await rm(first, { recursive: true, force: true });
+    await rm(second, { recursive: true, force: true });
+  }
+});
+
 test("compiled server closes connected event streams and stalled HTTP clients", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-server-test-"));
   const burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0 });
