@@ -142,9 +142,9 @@ test("independent untracked sibling repositories do not trip the protected paren
   }
 });
 
-test("prompt evaluators use an eight-minute default with bounded override support", async () => {
+test("prompt evaluators keep a five-minute default with bounded override support", async () => {
   const { DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS } = await import("../dist/lib/codex.js");
-  assert.equal(DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS, 8 * 60 * 1000);
+  assert.equal(DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS, 5 * 60 * 1000);
   const root = await mkdtemp(join(tmpdir(), "burner-evaluator-timeout-test-"));
   const bin = join(root, "bin");
   await import("node:fs/promises").then((fs) => fs.mkdir(bin));
