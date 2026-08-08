@@ -7,6 +7,7 @@ import { clampScore, errorMessage, parseJsonObject } from "./utils.js";
 
 const UNRESTRICTED_FLAG = "--dangerously-bypass-approvals-and-sandbox";
 const META_DISABLE_SANDBOX_FLAG = "--dangerously-disable-osx-sandbox";
+export const DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS = 8 * 60 * 1000;
 const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation progress artifacts: the managed README section, docs/burner-evaluation-history.json, and docs/burner-evaluation-progress.svg. Burner injects them only after final candidate scores are known. Do not create or modify those artifacts, and do not add repository-side progress generators, validators, tests, or workflows.";
 type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
 
@@ -101,7 +102,7 @@ export class CodexClient {
     private readonly onProgress?: (message: string) => void,
     options: { promptEvaluationTimeoutMs?: number; afterInvocation?: () => Promise<void> } = {},
   ) {
-    this.promptEvaluationTimeoutMs = Math.max(1, Math.min(15 * 60 * 1000, options.promptEvaluationTimeoutMs ?? 5 * 60 * 1000));
+    this.promptEvaluationTimeoutMs = Math.max(1, Math.min(15 * 60 * 1000, options.promptEvaluationTimeoutMs ?? DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS));
     this.afterInvocation = options.afterInvocation;
   }
 
