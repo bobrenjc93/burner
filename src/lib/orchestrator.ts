@@ -2108,7 +2108,16 @@ export class Orchestrator {
         !refreshed.orchestrator.lastPlanningAt ||
         Date.now() - new Date(refreshed.orchestrator.lastPlanningAt).getTime() >= settings.orchestratorIntervalMinutes * 60_000;
       const queued = refreshed.ideas.filter((idea) => idea.status === "queued").length;
-      if (planningDue && shouldRefillIdeaQueue(this.portfolioMode(), queued, settings.parallelism, this.activeAgents.size, this.activeComposites.size)) await this.plan();
+      if (planningDue && shouldRefillIdeaQueue(this.portfolioMode(), queued, settings.parallelism, this.activeAgents.size, this.activeComposites.size)) {
+        await this.plan();
+        // Planning can consume a meaningful fraction of a short merge window.
+        // Re-evaluate the dynamic deadline before dispatching an idea using the
+        // stale pre-planning decision made at the start of this tick.
+        if (this.yolo && this.runningEvaluations === 0 && this.activeAgents.size === 0 && this.activeComposites.size === 0) {
+          if (await this.autoMergeNext()) return;
+          if (await this.autoCookNext()) return;
+        }
+      }
       if (!this.store.get().orchestrator.enabled && !force) return;
       await this.scheduleComposites();
       await this.schedule();

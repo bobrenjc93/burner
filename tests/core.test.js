@@ -1689,6 +1689,41 @@ test("YOLO validates one reviewed leaf before another leaf cycle would miss cade
   }
 });
 
+test("YOLO rechecks merge urgency after planning before dispatching an author", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-post-plan-cadence-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.orchestrator.enabled = true;
+      state.orchestrator.lastEvaluationAt = timestamp;
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.syncPullRequests = async () => {};
+    orchestrator.recordCadenceBreach = async () => {};
+    orchestrator.git = { resolveRef: async () => "base" };
+    orchestrator.missingBaselineEvaluations = () => [];
+    orchestrator.shouldDrainForPortfolio = async () => false;
+    orchestrator.scheduleComposites = async () => {};
+    let mergeChecks = 0;
+    orchestrator.autoMergeNext = async () => { mergeChecks += 1; return mergeChecks === 2; };
+    orchestrator.autoCookNext = async () => false;
+    let planned = false;
+    orchestrator.plan = async () => { planned = true; return []; };
+    let dispatched = false;
+    orchestrator.schedule = async () => { dispatched = true; };
+
+    await orchestrator.tick(false);
+    assert.equal(planned, true);
+    assert.equal(mergeChecks, 2, "merge urgency must be recomputed after planning returns");
+    assert.equal(dispatched, false, "a newly urgent merge must preempt author dispatch");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a missed merge cadence opens a bounded recovery window without losing urgency", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-cadence-recovery-test-"));
   try {
