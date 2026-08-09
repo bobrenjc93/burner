@@ -2697,6 +2697,57 @@ test("candidate evaluation recovery reruns only failed scores", async () => {
   }
 });
 
+test("candidate prompt retries do not wait for the long command lane", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-independent-evaluation-lanes-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [
+        { id: "command", name: "Command", prompt: "Measure", command: "benchmark", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "prompt", name: "Prompt", prompt: "Inspect", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    const order = [];
+    let releaseCommand;
+    const commandGate = new Promise((resolve) => { releaseCommand = resolve; });
+    let promptAttempt = 0;
+    const run = (evaluationId, status, score) => ({
+      id: `run-${evaluationId}-${promptAttempt}`,
+      evaluationId,
+      commit: "candidate",
+      createdAt: timestamp,
+      durationMs: 1,
+      status,
+      score,
+      context: "composite",
+    });
+    orchestrator.runEvaluations = async (_context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+      if (evaluationIds[0] === "command") {
+        order.push("command:start");
+        await commandGate;
+        order.push("command:end");
+        return [run("command", "completed", 100)];
+      }
+      promptAttempt += 1;
+      order.push(`prompt:${promptAttempt}`);
+      return [run("prompt", promptAttempt === 1 ? "failed" : "completed", promptAttempt === 1 ? undefined : 90)];
+    };
+    const evaluationPromise = orchestrator.runCandidateEvaluations("composite", root, undefined, "composite");
+    for (let attempt = 0; attempt < 20 && !order.includes("prompt:2"); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.deepEqual(order, ["command:start", "prompt:1", "prompt:2"]);
+    releaseCommand();
+    const runs = await evaluationPromise;
+    assert.deepEqual(runs.map((item) => [item.evaluationId, item.status]), [["command", "completed"], ["prompt", "completed"]]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("every Codex role and structured fallback uses unrestricted mode with correct flag placement", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-codex-test-"));
   const bin = join(root, "bin");

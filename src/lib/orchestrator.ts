@@ -1515,29 +1515,41 @@ export class Orchestrator {
     compositeId?: string,
     initialRuns: readonly EvaluationRun[] = [],
   ): Promise<EvaluationRun[]> {
-    const enabledIds = this.store.get().evaluations.filter((evaluation) => evaluation.enabled).map((evaluation) => evaluation.id);
-    const latest = new Map(initialRuns.map((run) => [run.evaluationId, run]));
-    let pending: readonly string[] = enabledIds.filter((evaluationId) => {
-      const run = latest.get(evaluationId);
-      return !run || run.status !== "completed" || run.score === undefined;
-    });
-    for (let pass = 1; pass <= 2; pass += 1) {
-      if (!pending.length) break;
-      const runs = await this.runEvaluations(context, cwd, agentRunId, compositeId, pending);
-      for (const run of runs) latest.set(run.evaluationId, run);
-      pending = enabledIds.filter((evaluationId) => {
+    const enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
+    const enabledIds = enabled.map((evaluation) => evaluation.id);
+    const initial = new Map(initialRuns.map((run) => [run.evaluationId, run]));
+    const runLane = async (laneIds: readonly string[]): Promise<Map<string, EvaluationRun>> => {
+      const latest = new Map(laneIds.flatMap((evaluationId) => {
+        const run = initial.get(evaluationId);
+        return run ? [[evaluationId, run] as const] : [];
+      }));
+      let pending: readonly string[] = laneIds.filter((evaluationId) => {
         const run = latest.get(evaluationId);
         return !run || run.status !== "completed" || run.score === undefined;
       });
-      if (!pending.length) break;
-      if (pass < 2) {
-        await this.store.addActivity({
-          type: "evaluation",
-          message: `Retrying ${pending.length} incomplete candidate evaluation${pending.length === 1 ? "" : "s"}`,
-          detail: "Successful scores are retained; only missing evaluations will run again.",
+      for (let pass = 1; pass <= 2; pass += 1) {
+        if (!pending.length) break;
+        const runs = await this.runEvaluations(context, cwd, agentRunId, compositeId, pending);
+        for (const run of runs) latest.set(run.evaluationId, run);
+        pending = laneIds.filter((evaluationId) => {
+          const run = latest.get(evaluationId);
+          return !run || run.status !== "completed" || run.score === undefined;
         });
+        if (!pending.length) break;
+        if (pass < 2) {
+          await this.store.addActivity({
+            type: "evaluation",
+            message: `Retrying ${pending.length} incomplete candidate evaluation${pending.length === 1 ? "" : "s"}`,
+            detail: "Successful scores are retained; only missing evaluations will run again.",
+          });
+        }
       }
-    }
+      return latest;
+    };
+    const commandIds = enabled.filter((evaluation) => evaluation.command || evaluation.screeningCommand).map((evaluation) => evaluation.id);
+    const promptIds = enabled.filter((evaluation) => !evaluation.command && !evaluation.screeningCommand).map((evaluation) => evaluation.id);
+    const [commandRuns, promptRuns] = await Promise.all([runLane(commandIds), runLane(promptIds)]);
+    const latest = new Map([...commandRuns, ...promptRuns]);
     return enabledIds.flatMap((evaluationId) => {
       const run = latest.get(evaluationId);
       return run ? [run] : [];
