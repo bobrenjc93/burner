@@ -1,5 +1,5 @@
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { readFile, realpath } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import type { AgentRun, BurnerState, CompositePr, CompositeSource, Evaluation, EvaluationRun, Idea, ReviewRound, RuntimeStatus, ScoreDelta } from "../types.js";
 import { CodexClient, type ReviewResult, type SessionResult } from "./codex.js";
 import { EventHub } from "./events.js";
@@ -477,6 +477,52 @@ export class Orchestrator {
     const managedReadmeChanged = managedProgressBlock(baseReadme.exitCode === 0 ? baseReadme.stdout : "") !== managedProgressBlock(currentReadme);
     if (!forbidden.length && !managedReadmeChanged) return;
     throw new Error(`Candidate attempted to own Burner's merge-coupled evaluation progress${forbidden.length ? ` via ${forbidden.join(", ")}` : " via the managed README section"}. Burner rejected these changes before commit; it stamps canonical progress artifacts after final evaluation.`);
+  }
+
+  private async restoreBurnerProgressFromCommit(cwd: string, canonicalCommit: string): Promise<boolean> {
+    const managedPaths = ["docs/burner-evaluation-history.json", "docs/burner-evaluation-progress.svg"];
+    let changed = false;
+    for (const path of managedPaths) {
+      const canonical = await runCommand("git", ["show", `${canonicalCommit}:${path}`], { cwd, timeoutMs: 10_000 });
+      const current = await readFile(join(cwd, path), "utf8").catch(() => undefined);
+      if (canonical.exitCode === 0) {
+        if (current === canonical.stdout) continue;
+        await mkdir(dirname(join(cwd, path)), { recursive: true });
+        await writeFile(join(cwd, path), canonical.stdout);
+        changed = true;
+      } else if (current !== undefined) {
+        await rm(join(cwd, path), { force: true });
+        changed = true;
+      }
+    }
+
+    const markerBounds = (readme: string): { start: number; end: number; text: string } | undefined | null => {
+      const startMarker = "<!-- burner-progress:start -->";
+      const endMarker = "<!-- burner-progress:end -->";
+      const start = readme.indexOf(startMarker);
+      const end = readme.indexOf(endMarker);
+      if (start < 0 && end < 0) return undefined;
+      if (start < 0 || end < start) return null;
+      const afterEnd = end + endMarker.length;
+      return { start, end: afterEnd, text: readme.slice(start, afterEnd) };
+    };
+    const canonicalReadme = await runCommand("git", ["show", `${canonicalCommit}:README.md`], { cwd, timeoutMs: 10_000 });
+    const currentReadme = await readFile(join(cwd, "README.md"), "utf8").catch(() => "");
+    const canonicalBlock = markerBounds(canonicalReadme.exitCode === 0 ? canonicalReadme.stdout : "");
+    const currentBlock = markerBounds(currentReadme);
+    if (currentBlock === null) return changed;
+    let restoredReadme = currentReadme;
+    if (currentBlock) {
+      restoredReadme = `${currentReadme.slice(0, currentBlock.start)}${canonicalBlock?.text ?? ""}${currentReadme.slice(currentBlock.end)}`;
+    } else if (canonicalBlock) {
+      const separator = currentReadme.length === 0 ? "" : currentReadme.endsWith("\n") ? "\n" : "\n\n";
+      restoredReadme = `${currentReadme}${separator}${canonicalBlock.text}\n`;
+    }
+    if (restoredReadme !== currentReadme) {
+      await writeFile(join(cwd, "README.md"), restoredReadme);
+      changed = true;
+    }
+    return changed;
   }
 
   private async acquirePromptEvaluationSlot(): Promise<() => void> {
@@ -2462,6 +2508,9 @@ export class Orchestrator {
           const resolver = await this.codex.integrateComposite(worktree, composite.title, [source.title], settings);
           if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: resolve composite conflict for ${source.prNumber ? `#${source.prNumber}` : source.title}`);
           await this.updateComposite(compositeId, { authorThreadId: resolver.threadId, updatedAt: now() });
+        }
+        if (await this.restoreBurnerProgressFromCommit(worktree, baseCommit)) {
+          await this.git.commit(worktree, `burner: restore canonical progress after ${source.prNumber ? `#${source.prNumber}` : source.title}`);
         }
       }
 

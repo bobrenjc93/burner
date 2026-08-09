@@ -378,6 +378,36 @@ test("candidate work cannot replace Burner's merge-coupled progress ownership", 
   }
 });
 
+test("composite source normalization removes inherited Burner stamps without discarding README work", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-progress-normalization-test-"));
+  try {
+    await exec(root, "git", ["init", "-b", "main"]);
+    await import("node:fs/promises").then((fs) => fs.mkdir(join(root, "docs")));
+    const managedReadme = "# Demo\n\n<!-- burner-progress:start -->\n## Burner evaluation progress\n\nbaseline\n<!-- burner-progress:end -->\n";
+    await writeFile(join(root, "README.md"), managedReadme);
+    await writeFile(join(root, "docs", "burner-evaluation-history.json"), "{\"baseline\":true}\n");
+    await writeFile(join(root, "docs", "burner-evaluation-progress.svg"), "<svg>baseline</svg>\n");
+    await exec(root, "git", ["add", "."]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "seed"]);
+    const base = (await exec(root, "git", ["rev-parse", "HEAD"])).trim();
+    await writeFile(join(root, "README.md"), managedReadme.replace("# Demo", "# Demo\n\nCandidate documentation").replace("baseline", "leaf stamp"));
+    await writeFile(join(root, "docs", "burner-evaluation-history.json"), "{\"leaf\":true}\n");
+    await writeFile(join(root, "docs", "burner-evaluation-progress.svg"), "<svg>leaf</svg>\n");
+    const store = new StateStore(root);
+    await store.init();
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    assert.equal(await orchestrator.restoreBurnerProgressFromCommit(root, base), true);
+    assert.match(await readFile(join(root, "README.md"), "utf8"), /Candidate documentation/);
+    assert.match(await readFile(join(root, "README.md"), "utf8"), /baseline/);
+    assert.doesNotMatch(await readFile(join(root, "README.md"), "utf8"), /leaf stamp/);
+    assert.equal(await readFile(join(root, "docs", "burner-evaluation-history.json"), "utf8"), "{\"baseline\":true}\n");
+    assert.equal(await readFile(join(root, "docs", "burner-evaluation-progress.svg"), "utf8"), "<svg>baseline</svg>\n");
+    await orchestrator.assertCandidateDoesNotOwnProgress(root, base);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("benchmark-oriented ideas conservatively infer the shared CPU resource", () => {
   assert.deepEqual(inferIdeaResources({ title: "Emit benchmark evidence", description: "Prove results", rationale: "Integrity" }), ["cpu-heavy"]);
   assert.deepEqual(inferIdeaResources({ title: "Profile grouped queries", description: "Find hot paths", rationale: "Speed" }), ["cpu-heavy"]);
