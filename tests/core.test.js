@@ -1638,6 +1638,57 @@ test("YOLO cadence forecasting ignores one suspended-host duration outlier", asy
   }
 });
 
+test("YOLO validates one reviewed leaf before another leaf cycle would miss cadence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-singleton-deadline-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const now = Date.now();
+    const timestamp = new Date(now).toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.evaluations = [
+        { id: "benchmark", name: "Benchmark", prompt: "Measure", command: "./full", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp },
+      ];
+      state.evaluationRuns = [
+        { id: "benchmark-run", evaluationId: "benchmark", score: 100, commit: "base", createdAt: timestamp, durationMs: 21 * 60_000, status: "completed", context: "baseline" },
+        { id: "quality-run", evaluationId: "quality", score: 95, commit: "base", createdAt: timestamp, durationMs: 60_000, status: "completed", context: "baseline" },
+      ];
+      state.agentRuns = [{
+        id: "leaf", ideaId: "idea-leaf", status: "completed", branch: "branch-leaf", worktree: "",
+        startedAt: new Date(now - 14 * 60_000).toISOString(), completedAt: timestamp,
+        prUrl: "https://example.test/pull/1", prNumber: 1, prState: "open", baseCommit: "base",
+        deltas: [
+          { evaluationId: "benchmark", name: "Benchmark", before: 100, after: 100, delta: 0 },
+          { evaluationId: "quality", name: "Quality", before: 95, after: 96, delta: 1 },
+        ],
+        impact: 0.5, resources: [], reviewRounds: [approvedRound], reviewApproved: true,
+      }];
+      state.ideas.push({
+        id: "idea-leaf", title: "Ready leaf", description: "", rationale: "", predictedImpact: 0.5,
+        evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp,
+        source: "manual", agentRunId: "leaf",
+      });
+      state.orchestrator.mergeWindowStartedAt = new Date(now - 10 * 60_000).toISOString();
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.git = { resolveRef: async () => "base" };
+    assert.equal(orchestrator.portfolioCookDue(store.get(), "base"), false, "the singleton should not merge prematurely while another leaf still fits");
+
+    await store.update((state) => { state.orchestrator.mergeWindowStartedAt = new Date(now - 19 * 60_000).toISOString(); });
+    assert.equal(orchestrator.portfolioCookDue(store.get(), "base"), true, "the forecast must work before a second leaf exists");
+    let merged;
+    orchestrator.fullyValidateLeafForMerge = async () => true;
+    orchestrator.mergeAgent = async (id) => { merged = id; return {}; };
+    assert.equal(await orchestrator.autoMergeNext(), true);
+    assert.equal(merged, "leaf");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a missed merge cadence opens a bounded recovery window without losing urgency", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-cadence-recovery-test-"));
   try {

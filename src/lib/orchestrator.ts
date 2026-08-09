@@ -599,12 +599,18 @@ export class Orchestrator {
       if (evaluation.command) commandMs += duration;
       else promptMs = Math.max(promptMs, duration);
     }
-    const observedLeadMs = commandMs + promptMs + 5 * 60_000;
+    // Full validation is followed by integration/review, README graph stamping,
+    // and the stamped-head CI gate. Reserve that measured tail as well as the
+    // evaluation wall time so cadence forecasting covers the complete merge.
+    const observedLeadMs = commandMs + promptMs + 10 * 60_000;
     const revisionReserveMs = compositeRevisionHeadroom(anchor, state.settings.mergeCadenceMinutes).reserveMs;
     const leadMs = Math.min(Math.max(revisionReserveMs, observedLeadMs), Math.max(0, cadenceMs - 5 * 60_000));
     const elapsedMs = Date.now() - new Date(anchor).getTime();
     if (elapsedMs >= cadenceMs - leadMs) return true;
-    if (!baseCommit || selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0) return false;
+    // Forecast before dispatching another author even when only one reviewed
+    // leaf is ready. autoMergeNext can fully validate that singleton directly
+    // when another observed leaf cycle would consume the merge deadline.
+    if (!baseCommit || eligibleYoloLeaves(state, baseCommit).length === 0) return false;
 
     const recentLeafDurations = state.agentRuns
       .filter((run) => run.status === "completed" && run.baseCommit === baseCommit && run.completedAt)
