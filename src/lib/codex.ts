@@ -7,7 +7,7 @@ import { clampScore, errorMessage, parseJsonObject } from "./utils.js";
 
 const UNRESTRICTED_FLAG = "--dangerously-bypass-approvals-and-sandbox";
 const META_DISABLE_SANDBOX_FLAG = "--dangerously-disable-osx-sandbox";
-export const DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS = 5 * 60 * 1000;
+export const DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS = 4 * 60 * 1000;
 const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation progress artifacts: the managed README section, docs/burner-evaluation-history.json, and docs/burner-evaluation-progress.svg. Burner injects them only after final candidate scores are known. Do not create or modify those artifacts, and do not add repository-side progress generators, validators, tests, or workflows.";
 type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
 
@@ -144,7 +144,7 @@ export class CodexClient {
     const prompt = [
       "You are a rigorous repository evaluator. Inspect the current repository state and answer the evaluation below.",
       "Base the score on concrete evidence from code, tests, configuration, and user-facing behavior. Do not edit any files.",
-      "Finish this evaluation within 4 minutes. Inspect targeted, representative evidence for every rubric category; do not exhaustively read every file or narrate intermediate progress.",
+      "Finish this evaluation within 3 minutes. Inspect targeted, representative evidence for every rubric category; do not exhaustively read every file or narrate intermediate progress.",
       "Use no more than 12 shell commands. Reserve enough time to return the required structured result; concise evidence is preferred over exhaustive evidence.",
       "A score of 100 means genuinely exceptional and production-ready. Be calibrated, concise, and actionable.",
       context === "agent" || context === "composite"

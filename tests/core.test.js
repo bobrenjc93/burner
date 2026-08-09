@@ -142,9 +142,9 @@ test("independent untracked sibling repositories do not trip the protected paren
   }
 });
 
-test("prompt evaluators keep a five-minute default with bounded override support", async () => {
+test("prompt evaluators keep a four-minute default with bounded override support", async () => {
   const { DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS } = await import("../dist/lib/codex.js");
-  assert.equal(DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS, 5 * 60 * 1000);
+  assert.equal(DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS, 4 * 60 * 1000);
   const root = await mkdtemp(join(tmpdir(), "burner-evaluator-timeout-test-"));
   const bin = join(root, "bin");
   await import("node:fs/promises").then((fs) => fs.mkdir(bin));
@@ -2784,7 +2784,7 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
       assert.ok(!args.some((arg) => /sandbox_mode|approval_policy|read-only|workspace-write/.test(arg)));
     }
     assert.ok(calls.some(({ input }) => input.includes("rigorous repository evaluator")));
-    assert.ok(calls.some(({ input }) => input.includes("Finish this evaluation within 4 minutes")));
+    assert.ok(calls.some(({ input }) => input.includes("Finish this evaluation within 3 minutes")));
     const candidateEvaluatorCall = calls.find(({ input }) => input.includes("This candidate is not merged yet"));
     assert.match(candidateEvaluatorCall.input, /do not reduce its score because it lacks a history point for the current PR/);
     assert.match(candidateEvaluatorCall.input, /Authoritative base calibration for this exact rubric: 65\/100/);
