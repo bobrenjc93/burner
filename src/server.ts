@@ -9,7 +9,7 @@ import { StateStore, validateEvaluation } from "./lib/store.js";
 import type { BurnerSettings, Idea } from "./types.js";
 import { errorMessage, id, now } from "./lib/utils.js";
 
-export type BurnerServerOptions = { root: string; host: string; port: number; portScanLimit?: number; dev?: boolean; yolo?: boolean; yoloBatchSize?: number };
+export type BurnerServerOptions = { root: string; host: string; port: number; portScanLimit?: number; dev?: boolean; yolo?: boolean; yoloBatchSize?: number; onTerminate?: (reason: string) => void };
 
 type Route = { method: string; pattern: RegExp; keys: string[]; handler: Handler };
 type Handler = (request: IncomingMessage, response: ServerResponse, params: Record<string, string>, body: Record<string, unknown>) => Promise<void> | void;
@@ -76,6 +76,7 @@ function validateSettings(input: Record<string, unknown>): BurnerSettings {
     maxReviewRounds: integer("maxReviewRounds", 1, 50),
     portfolioReviewRounds: integer("portfolioReviewRounds", 1, 50),
     mergeCadenceMinutes: integer("mergeCadenceMinutes", 5, 10_080),
+    stallTerminationHours: integer("stallTerminationHours", 0, 8_760),
     preferLivingComposite: Boolean(input.preferLivingComposite),
     compositeAbsorbThreshold: number("compositeAbsorbThreshold", 0, 100),
   };
@@ -86,7 +87,7 @@ export async function createBurnerServer(options: BurnerServerOptions) {
   const store = new StateStore(root);
   await store.init();
   const events = new EventHub();
-  const orchestrator = new Orchestrator(root, store, events, { yolo: options.yolo, yoloBatchSize: options.yoloBatchSize });
+  const orchestrator = new Orchestrator(root, store, events, { yolo: options.yolo, yoloBatchSize: options.yoloBatchSize, onTerminate: options.onTerminate });
   await orchestrator.init();
   const publicDir = fileURLToPath(new URL("./public", import.meta.url));
   if (!existsSync(publicDir)) throw new Error(`Burner web assets are missing at ${publicDir}. Run npm run build.`);

@@ -188,6 +188,7 @@ export type BurnerSettings = {
   maxReviewRounds: number;
   portfolioReviewRounds: number;
   mergeCadenceMinutes: number;
+  stallTerminationHours: number;
   preferLivingComposite: boolean;
   compositeAbsorbThreshold: number;
 };
@@ -211,6 +212,9 @@ export type BurnerState = {
     lastMergeAt?: string;
     mergeWindowStartedAt?: string;
     lastMergeCadenceAlertAt?: string;
+    bestScore?: number;
+    bestScoreAt?: string;
+    stalledAt?: string;
   };
 };
 

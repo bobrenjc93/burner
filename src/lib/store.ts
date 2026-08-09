@@ -32,6 +32,7 @@ function initialState(root: string): BurnerState {
       maxReviewRounds: 12,
       portfolioReviewRounds: 12,
       mergeCadenceMinutes: 60,
+      stallTerminationHours: 24,
       preferLivingComposite: true,
       compositeAbsorbThreshold: 0,
     },
@@ -258,6 +259,7 @@ export class StateStore {
     legacy.settings.maxReviewRounds ??= 12;
     legacy.settings.portfolioReviewRounds ??= 12;
     legacy.settings.mergeCadenceMinutes ??= 60;
+    legacy.settings.stallTerminationHours ??= 24;
     legacy.settings.preferLivingComposite ??= true;
     legacy.settings.compositeAbsorbThreshold ??= 0;
     for (const run of legacy.agentRuns ?? []) {

@@ -50,6 +50,7 @@ Server options:
 Command options:
   -C, --directory <path>  target repository (default: current directory)
   --merge-cadence-minutes <n>  YOLO merge-health window (default: 60)
+  --stall-termination-hours <n> stop after this long without a new best score (default: 24; 0 never stops)
   --portfolio-review-rounds <n> cumulative YOLO rounds before quarantine/recovery (default: 12)
   --json                  JSON output (commands already default to JSON)
   -V, --version           output the version number
@@ -214,11 +215,13 @@ async function runHeadless(args: string[]): Promise<boolean> {
       const reviewRounds = option(args, "--max-review-rounds");
       const portfolioReviewRounds = option(args, "--portfolio-review-rounds");
       const mergeCadence = option(args, "--merge-cadence-minutes");
+      const stallHours = option(args, "--stall-termination-hours");
       const threshold = option(args, "--absorb-threshold");
       if (parallelism !== undefined) settings.parallelism = numberOption(args, "--parallelism", settings.parallelism, 1, 12);
       if (reviewRounds !== undefined) settings.maxReviewRounds = numberOption(args, "--max-review-rounds", settings.maxReviewRounds, 1, 50);
       if (portfolioReviewRounds !== undefined) settings.portfolioReviewRounds = numberOption(args, "--portfolio-review-rounds", settings.portfolioReviewRounds, 1, 50);
       if (mergeCadence !== undefined) settings.mergeCadenceMinutes = numberOption(args, "--merge-cadence-minutes", settings.mergeCadenceMinutes, 5, 10_080);
+      if (stallHours !== undefined) settings.stallTerminationHours = numberOption(args, "--stall-termination-hours", settings.stallTerminationHours, 0, 8_760);
       if (threshold !== undefined) settings.compositeAbsorbThreshold = numberOption(args, "--absorb-threshold", settings.compositeAbsorbThreshold, 0, 100);
       settings.autoCreatePrs = boolOption(args, "--auto-create-prs", settings.autoCreatePrs);
       settings.preferLivingComposite = boolOption(args, "--prefer-living", settings.preferLivingComposite);
@@ -287,10 +290,13 @@ async function main(): Promise<void> {
   if (!new Set(["127.0.0.1", "localhost", "::1"]).has(options.host)) throw new Error("Burner only binds to the local machine. Use 127.0.0.1, localhost, or ::1.");
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Port must be an integer between 1 and 65535.");
 
+  let closing = false;
+  let shutdown = async (_reason?: string): Promise<void> => {};
   const burner = await createBurnerServer({
     root, host: options.host, port,
     portScanLimit: options.portExplicit ? 1 : 64,
     yolo: options.yolo, yoloBatchSize: options.yoloBatchSize,
+    onTerminate: (reason) => void shutdown(reason),
   });
   const url = `http://${options.host}:${burner.port}`;
   console.log(`\n${colors.fire("  ◉ BURNER")}\n${colors.dim("  Evaluation-driven repo improvement, running locally.")}\n`);
@@ -305,11 +311,12 @@ async function main(): Promise<void> {
   console.log(colors.dim("  Press Ctrl+C to cool down.\n"));
   if (options.shouldOpen) openBrowser(url);
 
-  let closing = false;
-  const shutdown = async () => {
+  shutdown = async (reason?: string) => {
     if (closing) return;
     closing = true;
-    console.log(colors.dim("\n  Cooling down…"));
+    console.log(colors.dim(reason === "stalled"
+      ? `\n  No evaluation progress in ${burner.store.get().settings.stallTerminationHours}h — cooling down…`
+      : "\n  Cooling down…"));
     await burner.close();
     process.exit(0);
   };

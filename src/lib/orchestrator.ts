@@ -381,6 +381,7 @@ export class Orchestrator {
   private runtimeCache?: { value: RuntimeStatus; expires: number };
   private readonly yolo: boolean;
   private readonly yoloBatchSize: number;
+  private readonly onTerminate?: (reason: string) => void;
   private portfolioDraining = false;
   private activePromptEvaluations = 0;
   private readonly promptEvaluationWaiters: Array<() => void> = [];
@@ -650,14 +651,60 @@ export class Orchestrator {
     });
   }
 
+  private async terminateIfStalled(): Promise<boolean> {
+    const state = this.store.get();
+    const hours = state.settings.stallTerminationHours;
+    if (!hours || hours <= 0 || state.orchestrator.stalledAt) return false;
+    const score = this.store.compositeScores().current;
+    if (score === undefined) return false;
+
+    // Arm the clock on the first score, and restart it whenever the base
+    // branch beats its own record. Anything else -- a merge that scores flat,
+    // a rejected candidate, a contended benchmark -- leaves the clock running.
+    const best = state.orchestrator.bestScore;
+    if (best === undefined || score > best) {
+      const improvedAt = now();
+      await this.store.update((draft) => {
+        draft.orchestrator.bestScore = score;
+        draft.orchestrator.bestScoreAt = improvedAt;
+      });
+      return false;
+    }
+
+    const since = state.orchestrator.bestScoreAt;
+    if (!since) {
+      const armedAt = now();
+      await this.store.update((draft) => { draft.orchestrator.bestScoreAt = armedAt; });
+      return false;
+    }
+    const stalledMs = Date.now() - new Date(since).getTime();
+    if (stalledMs < hours * 3_600_000) return false;
+
+    const stalledAt = now();
+    await this.store.update((draft) => {
+      draft.orchestrator.enabled = false;
+      draft.orchestrator.stalledAt = stalledAt;
+    });
+    await this.store.addActivity({
+      type: "system",
+      message: `Terminated after ${hours}h without evaluation progress`,
+      detail: `The best weighted score has been ${best.toFixed(2)} since ${since}, and no candidate has beaten it in ${(stalledMs / 3_600_000).toFixed(1)} hours. Burner stopped dispatching so the machine is not spent re-measuring a plateau. Raise or zero out stallTerminationHours and re-ignite to keep going.`,
+    });
+    this.events.emit("state", this.store.get());
+    this.events.emit("terminated", { reason: "stalled", hours, bestScore: best, since });
+    if (this.onTerminate) void this.onTerminate("stalled");
+    return true;
+  }
+
   constructor(
     private readonly root: string,
     private readonly store: StateStore,
     private readonly events: EventHub,
-    options: { yolo?: boolean; yoloBatchSize?: number } = {},
+    options: { yolo?: boolean; yoloBatchSize?: number; onTerminate?: (reason: string) => void } = {},
   ) {
     this.yolo = Boolean(options.yolo);
     this.yoloBatchSize = Math.max(1, Math.min(100, Math.floor(options.yoloBatchSize ?? 10)));
+    this.onTerminate = options.onTerminate;
     this.git = new GitService(root, store.dataDir);
     this.locks = new LockManager(join(store.dataDir, "locks"));
     this.codex = new CodexClient((message) => {
@@ -2071,6 +2118,7 @@ export class Orchestrator {
       await this.syncPullRequests();
       const initial = this.store.get();
       if (!initial.orchestrator.enabled && !force) return;
+      if (await this.terminateIfStalled()) return;
       if (this.portfolioMode()) await this.recordCadenceBreach();
       if (this.yolo && this.runningEvaluations === 0 && this.activeAgents.size === 0 && this.activeComposites.size === 0) {
         if (await this.autoMergeNext()) return;

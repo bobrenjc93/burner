@@ -3240,3 +3240,81 @@ test("state persists evaluation configuration and excludes candidate scores from
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function stallHarness(hours, runs) {
+  const root = await mkdtemp(join(tmpdir(), "burner-stall-test-"));
+  const store = new StateStore(root);
+  await store.init();
+  await store.update((state) => {
+    state.settings.stallTerminationHours = hours;
+    state.orchestrator.enabled = true;
+    state.evaluations = [{ id: "eval_a", name: "A", prompt: "p", weight: 1, enabled: true, createdAt: "2026-01-01T00:00:00.000Z" }];
+    state.evaluationRuns = runs.map((score, index) => ({
+      id: `run_${index}`,
+      evaluationId: "eval_a",
+      context: "baseline",
+      status: "completed",
+      score,
+      attempts: 1,
+      createdAt: new Date(Date.UTC(2026, 0, 1, index)).toISOString(),
+    }));
+  });
+  const terminations = [];
+  const orchestrator = new Orchestrator(root, store, new EventHub(), { onTerminate: (reason) => terminations.push(reason) });
+  return { root, store, orchestrator, terminations };
+}
+
+test("stall termination arms on the first score and resets on a new best", async () => {
+  const { root, store, orchestrator } = await stallHarness(24, [40]);
+  try {
+    assert.equal(await orchestrator.terminateIfStalled(), false);
+    const armedAt = store.get().orchestrator.bestScoreAt;
+    assert.equal(store.get().orchestrator.bestScore, 40);
+    assert.ok(armedAt, "the first score should arm the stall clock");
+
+    // Backdate the clock well past the window, then beat the record: the
+    // improvement must restart the window rather than terminate the run.
+    await store.update((state) => { state.orchestrator.bestScoreAt = "2020-01-01T00:00:00.000Z"; });
+    await store.update((state) => { state.evaluationRuns.push({ id: "run_best", evaluationId: "eval_a", context: "baseline", status: "completed", score: 55, attempts: 1, createdAt: "2026-06-01T00:00:00.000Z" }); });
+    assert.equal(await orchestrator.terminateIfStalled(), false);
+    assert.equal(store.get().orchestrator.bestScore, 55);
+    assert.ok(store.get().orchestrator.bestScoreAt > "2020-01-01T00:00:00.000Z");
+    assert.equal(store.get().orchestrator.enabled, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stall termination stops the orchestrator after the configured window", async () => {
+  const { root, store, orchestrator, terminations } = await stallHarness(24, [70]);
+  try {
+    await orchestrator.terminateIfStalled();
+    await store.update((state) => { state.orchestrator.bestScoreAt = new Date(Date.now() - 25 * 3_600_000).toISOString(); });
+    // A later run that merely ties the record is not progress.
+    await store.update((state) => { state.evaluationRuns.push({ id: "run_flat", evaluationId: "eval_a", context: "baseline", status: "completed", score: 70, attempts: 1, createdAt: "2026-06-01T00:00:00.000Z" }); });
+
+    assert.equal(await orchestrator.terminateIfStalled(), true);
+    assert.equal(store.get().orchestrator.enabled, false);
+    assert.ok(store.get().orchestrator.stalledAt, "termination should be recorded");
+    assert.deepEqual(terminations, ["stalled"]);
+    assert.match(store.get().activity[0].message, /Terminated after 24h without evaluation progress/);
+
+    // Terminating is idempotent: a second pass must not re-fire the callback.
+    assert.equal(await orchestrator.terminateIfStalled(), false);
+    assert.deepEqual(terminations, ["stalled"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stall termination is disabled when the window is zero", async () => {
+  const { root, store, orchestrator, terminations } = await stallHarness(0, [70]);
+  try {
+    await store.update((state) => { state.orchestrator.bestScoreAt = new Date(Date.now() - 400 * 3_600_000).toISOString(); });
+    assert.equal(await orchestrator.terminateIfStalled(), false);
+    assert.equal(store.get().orchestrator.enabled, true);
+    assert.deepEqual(terminations, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
