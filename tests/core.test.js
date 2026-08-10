@@ -631,16 +631,19 @@ test("YOLO yields a long review loop while an approved fallback can still use th
     assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
       allowed: false,
       remainingMs: 19 * 60_000,
-      requiredMs: 30 * 60_000,
-    }, "a queued replacement needs the slot earlier when no approved fallback exists");
+      requiredMs: 50 * 60_000,
+    }, "a queued replacement needs enough handoff time to remain dispatchable after the current review yields");
+
+    assert.equal(agentDispatchCadenceHeadroom(store.get(), "base", currentTime).allowed, false,
+      "the replacement is already too late to dispatch at the old review-yield boundary");
 
     await store.update((state) => {
-      state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 29 * 60_000).toISOString();
+      state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 9 * 60_000).toISOString();
     });
     assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
       allowed: true,
-      remainingMs: 31 * 60_000,
-      requiredMs: 30 * 60_000,
+      remainingMs: 51 * 60_000,
+      requiredMs: 50 * 60_000,
     });
   } finally {
     await rm(root, { recursive: true, force: true });

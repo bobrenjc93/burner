@@ -332,7 +332,7 @@ export function agentReviewCadenceHeadroom(
   // still author, review, evaluate, and receive direct-leaf validation.
   const requiredMs = fallbackReady
     ? reviewCycleReserveMs * 2
-    : Math.min(30 * 60_000, Math.max(10 * 60_000, cadenceMs / 2));
+    : agentDispatchCadenceHeadroom(state, baseCommit, currentTimeMs).requiredMs + reviewCycleReserveMs;
   return { allowed: headroom.remainingMs > requiredMs, remainingMs: headroom.remainingMs, requiredMs };
 }
 
