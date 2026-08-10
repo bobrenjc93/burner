@@ -1,9 +1,11 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { Activity, BurnerState, Evaluation, EvaluationRun } from "../types.js";
 import { id, now, weightedScore } from "./utils.js";
 
 type Listener = (state: BurnerState) => void;
+export type StateStoreInitOptions = { recoverInterrupted?: boolean };
 
 const isInconclusiveMeasurement = (run: EvaluationRun): boolean =>
   run.score === 0 &&
@@ -83,51 +85,54 @@ function initialState(root: string): BurnerState {
 export class StateStore {
   readonly dataDir: string;
   readonly statePath: string;
+  readonly lockPath: string;
   private state!: BurnerState;
   private listeners = new Set<Listener>();
-  private writeChain = Promise.resolve();
+  private operationChain: Promise<void> = Promise.resolve();
 
   constructor(readonly root: string) {
     this.dataDir = join(root, ".burner");
     this.statePath = join(this.dataDir, "state.json");
+    this.lockPath = join(this.dataDir, "state.lock");
   }
 
-  async init(): Promise<BurnerState> {
+  async init(options: StateStoreInitOptions = {}): Promise<BurnerState> {
     await mkdir(this.dataDir, { recursive: true });
-    try {
-      this.state = JSON.parse(await readFile(this.statePath, "utf8")) as BurnerState;
+    return this.enqueue(async () => this.withStateLock(async () => {
+      this.state = await this.readState();
       this.migrate();
-      this.state.orchestrator.enabled = false;
-      for (const run of this.state.agentRuns) {
-        if (["starting", "running", "reviewing", "revising", "evaluating", "opening_pr"].includes(run.status)) {
-          run.status = "failed";
-          run.error = "Burner stopped before this run completed.";
-          run.completedAt = now();
+      if (options.recoverInterrupted !== false) {
+        this.state.orchestrator.enabled = false;
+        for (const run of this.state.agentRuns) {
+          if (["starting", "running", "reviewing", "revising", "evaluating", "opening_pr"].includes(run.status)) {
+            run.status = "failed";
+            run.error = "Burner stopped before this run completed.";
+            run.completedAt = now();
+          }
+          run.reviewRounds ??= [];
         }
-        run.reviewRounds ??= [];
-      }
-      for (const composite of this.state.composites) {
-        if (["building", "reviewing", "revising", "evaluating", "rebuilding"].includes(composite.status)) {
-          composite.status = "failed";
-          composite.error = "Burner stopped before this composite run completed.";
-          composite.updatedAt = now();
+        for (const composite of this.state.composites) {
+          if (["building", "reviewing", "revising", "evaluating", "rebuilding"].includes(composite.status)) {
+            composite.status = "failed";
+            composite.error = "Burner stopped before this composite run completed.";
+            composite.updatedAt = now();
+          }
         }
-      }
-      for (const idea of this.state.ideas) {
-        if (idea.status === "running") idea.status = "failed";
-      }
-      for (const run of this.state.evaluationRuns) {
-        if (run.status === "running") {
-          run.status = "failed";
-          run.error = "Burner stopped before this evaluation completed.";
+        for (const idea of this.state.ideas) {
+          if (idea.status === "running") idea.status = "failed";
         }
+        for (const run of this.state.evaluationRuns) {
+          if (run.status === "running") {
+            run.status = "failed";
+            run.error = "Burner stopped before this evaluation completed.";
+          }
+        }
+      } else {
+        for (const run of this.state.agentRuns) run.reviewRounds ??= [];
       }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      this.state = initialState(this.root);
-    }
-    await this.persist();
-    return this.get();
+      await this.persistUnlocked();
+      return this.get();
+    }));
   }
 
   get(): BurnerState {
@@ -135,12 +140,32 @@ export class StateStore {
   }
 
   async update(mutator: (state: BurnerState) => void): Promise<BurnerState> {
-    mutator(this.state);
-    this.trim();
-    await this.persist();
-    const snapshot = this.get();
-    for (const listener of this.listeners) listener(snapshot);
-    return snapshot;
+    return this.enqueue(async () => {
+      const snapshot = await this.withStateLock(async () => {
+        this.state = await this.readState(this.state);
+        this.migrate();
+        mutator(this.state);
+        this.trim();
+        await this.persistUnlocked();
+        return this.get();
+      });
+      for (const listener of this.listeners) listener(snapshot);
+      return snapshot;
+    });
+  }
+
+  async refresh(): Promise<boolean> {
+    return this.enqueue(async () => {
+      const before = JSON.stringify(this.state);
+      const snapshot = await this.withStateLock(async () => {
+        this.state = await this.readState(this.state);
+        this.migrate();
+        return this.get();
+      });
+      const changed = before !== JSON.stringify(snapshot);
+      if (changed) for (const listener of this.listeners) listener(snapshot);
+      return changed;
+    });
   }
 
   subscribe(listener: Listener): () => void {
@@ -224,13 +249,66 @@ export class StateStore {
     };
   }
 
-  private async persist(): Promise<void> {
-    this.writeChain = this.writeChain.then(async () => {
-      const temp = `${this.statePath}.tmp`;
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.operationChain.then(operation);
+    this.operationChain = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async readState(fallback?: BurnerState): Promise<BurnerState> {
+    try {
+      return JSON.parse(await readFile(this.statePath, "utf8")) as BurnerState;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return fallback ? structuredClone(fallback) : initialState(this.root);
+    }
+  }
+
+  private async persistUnlocked(): Promise<void> {
+    const temp = `${this.statePath}.${process.pid}.${Date.now()}.tmp`;
+    try {
       await writeFile(temp, `${JSON.stringify(this.state, null, 2)}\n`, "utf8");
       await rename(temp, this.statePath);
-    });
-    return this.writeChain;
+    } finally {
+      await rm(temp, { force: true }).catch(() => undefined);
+    }
+  }
+
+  private async withStateLock<T>(operation: () => Promise<T>): Promise<T> {
+    const deadline = Date.now() + 30_000;
+    while (true) {
+      try {
+        await mkdir(this.lockPath);
+        try {
+          await writeFile(join(this.lockPath, "owner.json"), JSON.stringify({ pid: process.pid, createdAt: now() }), "utf8");
+        } catch (error) {
+          await rm(this.lockPath, { recursive: true, force: true });
+          throw error;
+        }
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        let stale = false;
+        try {
+          const owner = JSON.parse(await readFile(join(this.lockPath, "owner.json"), "utf8")) as { pid?: number };
+          if (Number.isInteger(owner.pid)) {
+            try { process.kill(owner.pid!, 0); }
+            catch (signalError) { stale = (signalError as NodeJS.ErrnoException).code === "ESRCH"; }
+          }
+        } catch {
+          try { stale = Date.now() - (await stat(this.lockPath)).mtimeMs > 5_000; }
+          catch { stale = false; }
+        }
+        if (stale) {
+          await rm(this.lockPath, { recursive: true, force: true });
+          continue;
+        }
+        if (Date.now() >= deadline) throw new Error(`Timed out waiting for Burner state lock at ${this.lockPath}.`);
+        await delay(25);
+      }
+    }
+    try { return await operation(); }
+    finally { await rm(this.lockPath, { recursive: true, force: true }); }
   }
 
   private trim(): void {

@@ -760,6 +760,44 @@ test("headless CLI configures evaluations, ideas, and conservative settings as J
   }
 });
 
+test("headless CLI mutations preserve live daemon state and are refreshed without lost updates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-cli-live-state-test-"));
+  const cli = join(process.cwd(), "dist", "cli.js");
+  try {
+    const daemonStore = new StateStore(root);
+    await daemonStore.init();
+    const timestamp = new Date().toISOString();
+    await daemonStore.update((state) => {
+      state.orchestrator.enabled = true;
+      state.ideas.push({ id: "live-idea", title: "Live work", description: "Keep running", rationale: "Test", predictedImpact: 1, evaluationIds: [], resources: [], status: "running", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "live-agent" });
+      state.agentRuns.push({ id: "live-agent", ideaId: "live-idea", status: "evaluating", branch: "burner/live", worktree: root, startedAt: timestamp, deltas: [], resources: [], reviewRounds: [] });
+    });
+
+    const queued = JSON.parse(await exec(root, "node", [cli, "idea", "add", "-C", root, "--title", "External idea", "--description", "Must survive the daemon's next write", "--impact", "99"]));
+    assert.equal(queued.status, "queued");
+    assert.equal(daemonStore.get().ideas.some((idea) => idea.id === queued.id), false, "the daemon refresh boundary is explicit");
+    assert.equal(await daemonStore.refresh(), true);
+    assert.equal(daemonStore.get().ideas.some((idea) => idea.id === queued.id), true);
+    assert.equal(daemonStore.get().orchestrator.enabled, true);
+    assert.equal(daemonStore.get().agentRuns.find((run) => run.id === "live-agent")?.status, "evaluating");
+
+    await daemonStore.addActivity({ type: "system", message: "Daemon kept running" });
+    const reloaded = new StateStore(root);
+    await reloaded.init({ recoverInterrupted: false });
+    assert.equal(reloaded.get().ideas.some((idea) => idea.id === queued.id), true, "a later daemon write must retain the CLI idea");
+    assert.equal(reloaded.get().orchestrator.enabled, true, "CLI initialization must not pause a live server");
+    assert.equal(reloaded.get().agentRuns.find((run) => run.id === "live-agent")?.status, "evaluating", "CLI initialization must not fail live work");
+
+    await assert.rejects(
+      () => exec(root, "node", [cli, "queue", "run-next", "-C", root]),
+      /Burner server is active/,
+      "orchestration commands must fail clearly instead of starting a competing orchestrator",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("command evaluations return deterministic structured scores without Codex", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-command-eval-test-"));
   const evaluator = join(root, "evaluate");

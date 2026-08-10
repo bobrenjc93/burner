@@ -2119,6 +2119,7 @@ export class Orchestrator {
     if (this.ticking) return;
     this.ticking = true;
     try {
+      await this.store.refresh();
       await this.syncPullRequests();
       const initial = this.store.get();
       if (!initial.orchestrator.enabled && !force) return;

@@ -99,6 +99,14 @@ function print(value: unknown): void {
 
 async function withOrchestrator<T>(root: string, task: (orchestrator: Orchestrator, store: StateStore) => Promise<T>): Promise<T> {
   const store = new StateStore(root);
+  await store.init({ recoverInterrupted: false });
+  const live = store.get();
+  const active = live.agentRuns.some((run) => ["starting", "running", "reviewing", "revising", "evaluating", "opening_pr"].includes(run.status)) ||
+    live.composites.some((composite) => ["queued", "building", "reviewing", "revising", "evaluating", "rebuilding"].includes(composite.status)) ||
+    live.evaluationRuns.some((run) => run.status === "running");
+  if (live.orchestrator.enabled || active) {
+    throw new Error("A Burner server is active for this repository. Use its local API/dashboard for orchestration commands; CLI configuration commands remain safe while it runs.");
+  }
   await store.init();
   const orchestrator = new Orchestrator(root, store, new EventHub());
   await orchestrator.init();
@@ -113,7 +121,7 @@ async function runHeadless(args: string[]): Promise<boolean> {
 
   if (command === "eval" && subcommand === "add") {
     const store = new StateStore(root);
-    await store.init();
+    await store.init({ recoverInterrupted: false });
     const input = validateEvaluation({ name: required(args, "--name"), prompt: required(args, "--prompt"), command: option(args, "--command"), screeningCommand: option(args, "--screening-command"), weight: numberOption(args, "--weight", 1, Number.EPSILON, 10), enabled: true });
     const evaluation = { ...input, id: id("eval"), createdAt: now(), definitionVersion: id("evaldef") };
     await store.update((state) => {
@@ -128,7 +136,7 @@ async function runHeadless(args: string[]): Promise<boolean> {
   if (command === "eval" && subcommand === "clear") {
     if (!has(args, "--yes")) throw new Error("eval clear requires --yes.");
     const store = new StateStore(root);
-    await store.init();
+    await store.init({ recoverInterrupted: false });
     const removed = store.get().evaluations.length;
     await store.update((state) => {
       state.evaluations = [];
@@ -142,7 +150,7 @@ async function runHeadless(args: string[]): Promise<boolean> {
 
   if (command === "eval" && subcommand === "list") {
     const store = new StateStore(root);
-    await store.init();
+    await store.init({ recoverInterrupted: false });
     const latest = store.latestRuns();
     print(store.get().evaluations.map((evaluation) => ({ ...evaluation, latest: latest.get(evaluation.id) })));
     return true;
@@ -157,7 +165,7 @@ async function runHeadless(args: string[]): Promise<boolean> {
 
   if (command === "idea" && subcommand === "add") {
     const store = new StateStore(root);
-    await store.init();
+    await store.init({ recoverInterrupted: false });
     const state = store.get();
     const timestamp = now();
     const idea: Idea = {
@@ -181,7 +189,7 @@ async function runHeadless(args: string[]): Promise<boolean> {
 
   if (command === "idea" && subcommand === "list") {
     const store = new StateStore(root);
-    await store.init();
+    await store.init({ recoverInterrupted: false });
     print(store.get().ideas);
     return true;
   }
@@ -207,7 +215,7 @@ async function runHeadless(args: string[]): Promise<boolean> {
 
   if (command === "settings" && subcommand === "set") {
     const store = new StateStore(root);
-    await store.init();
+    await store.init({ recoverInterrupted: false });
     let updated!: BurnerSettings;
     await store.update((state) => {
       const settings = state.settings;
@@ -232,10 +240,11 @@ async function runHeadless(args: string[]): Promise<boolean> {
   }
 
   if (command === "status") {
-    const output = await withOrchestrator(root, async (orchestrator, store) => {
-      const scores = store.compositeScores();
-      return { project: store.get(), runtime: await orchestrator.runtimeStatus(true), compositeScore: scores.current, previousCompositeScore: scores.previous };
-    });
+    const store = new StateStore(root);
+    await store.init({ recoverInterrupted: false });
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    const scores = store.compositeScores();
+    const output = { project: store.get(), runtime: await orchestrator.runtimeStatus(true), compositeScore: scores.current, previousCompositeScore: scores.previous };
     print(output);
     return true;
   }

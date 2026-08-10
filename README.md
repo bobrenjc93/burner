@@ -83,6 +83,14 @@ burner queue run-next -C ./my-project
 burner queue retry -C ./my-project --run agent_12345678
 ```
 
+Configuration, list, and status commands are safe to run while the local Burner
+server is active. State updates are serialized across processes and the daemon
+loads them on its next scheduler tick, so a scripted `eval add`, `idea add`, or
+`settings set` cannot overwrite live agents or disappear behind a later server
+write. Commands that would start a second orchestrator (`eval run`, `queue`, and
+`pr merge`) instead fail clearly while automation is active; use the local API
+or pause the server first.
+
 `queue run-next` is deliberately bounded: it claims the highest-impact queued idea, waits through implementation, the reviewer/author loop, candidate evaluation, and PR delivery, then exits. This makes Burner usable from CI, cron, or a larger local automation script without enabling the continuous timer.
 
 ### YOLO portfolio
