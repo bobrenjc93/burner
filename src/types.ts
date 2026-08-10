@@ -117,6 +117,7 @@ export type AgentRun = {
   absorbedAt?: string;
   quarantinedAt?: string;
   quarantineReason?: string;
+  cadenceFallback?: boolean;
   evaluationRetryCount?: number;
   fullMergeValidation?: {
     baseCommit: string;

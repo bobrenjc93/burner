@@ -323,7 +323,11 @@ export function agentReviewCadenceHeadroom(
   if (!Number.isFinite(headroom.remainingMs)) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
   const fallback = selectYoloMergeCandidate(state, baseCommit, true);
   const fallbackReady = Boolean(fallback && (fallback.kind !== "agent" || fallback.id !== currentRunId));
-  const queuedReplacement = state.ideas.some((idea) => idea.status === "queued");
+  const currentRun = state.agentRuns.find((run) => run.id === currentRunId);
+  // Once Burner has deliberately yielded one candidate to a cadence fallback,
+  // finish that fallback's review instead of recursively yielding it to the
+  // next queued idea. A genuinely merge-ready candidate may still take over.
+  const queuedReplacement = !currentRun?.cadenceFallback && state.ideas.some((idea) => idea.status === "queued");
   if (!fallbackReady && !queuedReplacement) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
   const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
   const reviewCycleReserveMs = Math.min(10 * 60_000, Math.max(5 * 60_000, cadenceMs / 6));
@@ -2303,7 +2307,16 @@ export class Orchestrator {
       if (!lease) continue;
       started += 1;
       this.activeAgents.add(idea.id);
-      void this.runIdea(idea, base, resources, lease.locks, lease.release);
+      const mergeWindowStartedAt = state.orchestrator.mergeWindowStartedAt
+        ? new Date(state.orchestrator.mergeWindowStartedAt).getTime()
+        : Number.NEGATIVE_INFINITY;
+      const cadenceFallback = this.portfolioMode() && state.agentRuns.some((run) =>
+        run.baseCommit === base.commit &&
+        run.quarantineReason?.startsWith("Review yielded") &&
+        Boolean(run.quarantinedAt) &&
+        new Date(run.quarantinedAt!).getTime() >= mergeWindowStartedAt,
+      );
+      void this.runIdea(idea, base, resources, lease.locks, lease.release, cadenceFallback);
     }
   }
 
@@ -2352,6 +2365,7 @@ export class Orchestrator {
     resources: string[],
     heldLocks: HeldLock[],
     releaseLocks: () => Promise<void>,
+    cadenceFallback = false,
   ): Promise<void> {
     const runId = id("agent");
     const branch = `burner/${slugify(idea.title)}-${runId.slice(-6)}`;
@@ -2368,6 +2382,7 @@ export class Orchestrator {
       baseRef: base.ref,
       baseCommit: base.commit,
       parentCompositeId: base.compositeId,
+      ...(cadenceFallback ? { cadenceFallback: true } : {}),
     };
     await this.store.update((state) => {
       state.agentRuns.push(initialRun);

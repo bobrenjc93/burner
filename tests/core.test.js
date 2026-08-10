@@ -645,6 +645,17 @@ test("YOLO yields a long review loop while an approved fallback can still use th
       remainingMs: 51 * 60_000,
       requiredMs: 50 * 60_000,
     });
+
+    await store.update((state) => {
+      state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 41 * 60_000).toISOString();
+      const current = state.agentRuns.find((run) => run.id === "current");
+      current.cadenceFallback = true;
+    });
+    assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
+      allowed: true,
+      remainingMs: 19 * 60_000,
+      requiredMs: 0,
+    }, "a dispatched cadence fallback must not recursively yield to a lower-priority queued replacement");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -675,17 +686,24 @@ test("YOLO reserves authoring and review time before dispatching a portfolio age
     orchestrator.git = { resolveRef: async () => "base" };
     orchestrator.locks = { tryAcquireAll: async () => ({ locks: [], release: async () => {} }) };
     let dispatched = false;
-    orchestrator.runIdea = async () => { dispatched = true; };
+    let cadenceFallback = false;
+    orchestrator.runIdea = async (...args) => { dispatched = true; cadenceFallback = args[5]; };
     await orchestrator.schedule();
     assert.equal(dispatched, false);
     assert.match(store.get().activity[0].message, /dispatch held for merge cadence/i);
 
     await store.update((state) => {
       state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 10 * 60_000).toISOString();
+      state.agentRuns.push({
+        id: "yielded", ideaId: "yielded-idea", status: "failed", branch: "burner/yielded", worktree: "", startedAt: timestamp,
+        completedAt: timestamp, baseCommit: "base", deltas: [], resources: [], reviewRounds: [],
+        quarantinedAt: timestamp, quarantineReason: "Review yielded with 30 minutes left so fallback work can use the merge reserve.",
+      });
     });
     assert.equal(agentDispatchCadenceHeadroom(store.get(), "base", currentTime).allowed, true);
     await orchestrator.schedule();
     assert.equal(dispatched, true);
+    assert.equal(cadenceFallback, true, "the replacement dispatched after a cadence yield must be marked as the fallback");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
