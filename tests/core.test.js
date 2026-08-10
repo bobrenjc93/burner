@@ -644,10 +644,10 @@ test("YOLO yields a long review loop while an approved fallback can still use th
       state.ideas.push({ id: "replacement-idea", title: "Smaller fallback", description: "Narrow work", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "planner" });
     });
     assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
-      allowed: false,
+      allowed: true,
       remainingMs: 19 * 60_000,
-      requiredMs: 50 * 60_000,
-    }, "a queued replacement needs enough handoff time to remain dispatchable after the current review yields");
+      requiredMs: 0,
+    }, "a queued idea must not discard a candidate that already reached review");
 
     assert.equal(agentDispatchCadenceHeadroom(store.get(), "base", currentTime).allowed, false,
       "the replacement is already too late to dispatch at the old review-yield boundary");
@@ -658,7 +658,7 @@ test("YOLO yields a long review loop while an approved fallback can still use th
     assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
       allowed: true,
       remainingMs: 51 * 60_000,
-      requiredMs: 50 * 60_000,
+      requiredMs: 0,
     });
 
     await store.update((state) => {
@@ -670,7 +670,7 @@ test("YOLO yields a long review loop while an approved fallback can still use th
       allowed: true,
       remainingMs: 19 * 60_000,
       requiredMs: 0,
-    }, "a dispatched cadence fallback must not recursively yield to a lower-priority queued replacement");
+    }, "a queued replacement cannot recursively evict a cadence fallback");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

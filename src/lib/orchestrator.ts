@@ -338,20 +338,15 @@ export function agentReviewCadenceHeadroom(
   if (!Number.isFinite(headroom.remainingMs)) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
   const fallback = selectYoloMergeCandidate(state, baseCommit, true);
   const fallbackReady = Boolean(fallback && (fallback.kind !== "agent" || fallback.id !== currentRunId));
-  const currentRun = state.agentRuns.find((run) => run.id === currentRunId);
-  // Once Burner has deliberately yielded one candidate to a cadence fallback,
-  // finish that fallback's review instead of recursively yielding it to the
-  // next queued idea. A genuinely merge-ready candidate may still take over.
-  const queuedReplacement = !currentRun?.cadenceFallback && state.ideas.some((idea) => idea.status === "queued");
-  if (!fallbackReady && !queuedReplacement) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
+  // Do not discard completed author work merely because another idea is
+  // queued. Dispatch headroom already prevents starting work too late, and a
+  // queued replacement is not safer than the candidate that reached review.
+  // Only an independently approved fallback can justify yielding this loop.
+  if (!fallbackReady) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
   const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
   const reviewCycleReserveMs = Math.min(10 * 60_000, Math.max(5 * 60_000, cadenceMs / 6));
-  // An approved leaf only needs full validation and merge. With no approved
-  // fallback, release a monopolized slot earlier so one queued replacement can
-  // still author, review, evaluate, and receive direct-leaf validation.
-  const requiredMs = fallbackReady
-    ? reviewCycleReserveMs * 2
-    : agentDispatchCadenceHeadroom(state, baseCommit, currentTimeMs).requiredMs + reviewCycleReserveMs;
+  // An approved leaf only needs full validation and merge.
+  const requiredMs = reviewCycleReserveMs * 2;
   return { allowed: headroom.remainingMs > requiredMs, remainingMs: headroom.remainingMs, requiredMs };
 }
 
