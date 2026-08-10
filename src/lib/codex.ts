@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BurnerSettings, Evaluation, EvaluationRun, Idea, ReviewFinding } from "../types.js";
 import { runCommand, type CommandResult } from "./process.js";
-import { clampScore, errorMessage, parseJsonObject } from "./utils.js";
+import { clampScore, errorMessage, parseJsonObject, truncateText } from "./utils.js";
 
 const UNRESTRICTED_FLAG = "--dangerously-bypass-approvals-and-sandbox";
 const META_DISABLE_SANDBOX_FLAG = "--dangerously-disable-osx-sandbox";
@@ -83,7 +83,7 @@ function commandFailure(result: CommandResult, fallback: string): string {
   const stdout = result.stdout.trim();
   const raw = stderr && stdout ? `${stderr}\n${stdout}` : stderr || stdout || fallback;
   if (result.exitCode === 124) return raw.split("\n").reverse().find((line) => /timed out/i.test(line)) ?? fallback;
-  return raw.length > 8_000 ? `…[truncated]\n${raw.slice(-8_000)}` : raw;
+  return raw.length > 8_000 ? `…[truncated]\n${truncateText(raw, 8_000, true)}` : truncateText(raw, 8_000);
 }
 
 function isInconclusiveCommandOutput(output: EvaluationOutput): boolean {
@@ -186,9 +186,9 @@ export class CodexClient {
     }
     return {
       score: clampScore(output.score),
-      summary: output.summary.trim().slice(0, 1_000),
-      evidence: output.evidence.map((item) => String(item).slice(0, 1_500)).slice(0, 8),
-      suggestions: output.suggestions.map((item) => String(item).slice(0, 750)).slice(0, 6),
+      summary: truncateText(output.summary.trim(), 1_000),
+      evidence: output.evidence.map((item) => truncateText(String(item), 1_500)).slice(0, 8),
+      suggestions: output.suggestions.map((item) => truncateText(String(item), 750)).slice(0, 6),
     };
   }
 

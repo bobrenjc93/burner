@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Activity, BurnerState, Evaluation, EvaluationRun } from "../types.js";
-import { id, now, weightedScore } from "./utils.js";
+import { id, now, weightedScore, wellFormedText } from "./utils.js";
 
 type Listener = (state: BurnerState) => void;
 export type StateStoreInitOptions = { recoverInterrupted?: boolean };
@@ -267,7 +267,10 @@ export class StateStore {
   private async persistUnlocked(): Promise<void> {
     const temp = `${this.statePath}.${process.pid}.${Date.now()}.tmp`;
     try {
-      await writeFile(temp, `${JSON.stringify(this.state, null, 2)}\n`, "utf8");
+      const serialized = JSON.stringify(this.state, (_key, value: unknown) =>
+        typeof value === "string" ? wellFormedText(value) : value, 2);
+      this.state = JSON.parse(serialized) as BurnerState;
+      await writeFile(temp, `${serialized}\n`, "utf8");
       await rename(temp, this.statePath);
     } finally {
       await rm(temp, { force: true }).catch(() => undefined);

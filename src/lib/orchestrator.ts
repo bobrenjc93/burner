@@ -248,6 +248,53 @@ export function compositeRevisionHeadroom(
   return { allowed: remainingMs >= reserveMs, remainingMs, reserveMs };
 }
 
+export function portfolioMergeTailHeadroom(
+  state: BurnerState,
+  currentTimeMs = Date.now(),
+): { allowed: boolean; remainingMs: number; requiredMs: number } {
+  const anchor = state.orchestrator.mergeWindowStartedAt;
+  if (!anchor) return { allowed: true, remainingMs: Infinity, requiredMs: 0 };
+  const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
+  const remainingMs = new Date(anchor).getTime() + cadenceMs - currentTimeMs;
+  const observedDuration = (evaluation: Evaluation): number => {
+    const samples = state.evaluationRuns
+      .filter((run) =>
+        run.evaluationId === evaluation.id &&
+        run.status === "completed" &&
+        Number.isFinite(run.durationMs) &&
+        run.durationMs > 0 &&
+        run.context !== "agent" &&
+        run.context !== "screening_baseline" &&
+        run.evaluationDefinitionVersion === evaluation.definitionVersion,
+      )
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, 5)
+      .map((run) => run.durationMs)
+      .sort((left, right) => left - right);
+    if (!samples.length) return 0;
+    const middle = Math.floor(samples.length / 2);
+    return samples.length % 2 === 1
+      ? samples[middle]
+      : (samples[middle - 1] + samples[middle]) / 2;
+  };
+  let commandMs = 0;
+  let promptMs = 0;
+  for (const evaluation of state.evaluations.filter((item) => item.enabled)) {
+    // Wall-clock duration includes host sleep. Use a recent median so one
+    // suspended run cannot make every following generation cook early.
+    const duration = observedDuration(evaluation);
+    if (evaluation.command) commandMs += duration;
+    else promptMs = Math.max(promptMs, duration);
+  }
+  // Full validation is followed by README graph stamping and the stamped-head
+  // CI/merge gate. Compare that measured tail with the conservative static
+  // revision reserve and use whichever is larger.
+  const observedTailMs = commandMs + promptMs + 10 * 60_000;
+  const staticReserveMs = compositeRevisionHeadroom(anchor, state.settings.mergeCadenceMinutes, currentTimeMs).reserveMs;
+  const requiredMs = Math.min(Math.max(staticReserveMs, observedTailMs), Math.max(0, cadenceMs - 5 * 60_000));
+  return { allowed: remainingMs > requiredMs, remainingMs, requiredMs };
+}
+
 export function leafValidationHeadroom(
   mergeWindowStartedAt: string | undefined,
   mergeCadenceMinutes: number,
@@ -570,8 +617,7 @@ export class Orchestrator {
   }
 
   private cadenceCompositeTailExhausted(state = this.store.get()): boolean {
-    return this.portfolioMode() &&
-      !compositeRevisionHeadroom(state.orchestrator.mergeWindowStartedAt, state.settings.mergeCadenceMinutes).allowed;
+    return this.portfolioMode() && !portfolioMergeTailHeadroom(state).allowed;
   }
 
   private cadenceLeafValidationTailExhausted(state = this.store.get()): boolean {
@@ -584,42 +630,7 @@ export class Orchestrator {
     const anchor = state.orchestrator.mergeWindowStartedAt;
     if (!anchor) return false;
     const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
-    const observedDuration = (evaluation: Evaluation): number => {
-      const samples = state.evaluationRuns
-        .filter((run) =>
-          run.evaluationId === evaluation.id &&
-          run.status === "completed" &&
-          Number.isFinite(run.durationMs) &&
-          run.durationMs > 0 &&
-          run.context !== "agent" &&
-          run.context !== "screening_baseline" &&
-          run.evaluationDefinitionVersion === evaluation.definitionVersion,
-        )
-        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-        .slice(0, 5)
-        .map((run) => run.durationMs)
-        .sort((left, right) => left - right);
-      if (!samples.length) return 0;
-      const middle = Math.floor(samples.length / 2);
-      return samples.length % 2 === 1
-        ? samples[middle]
-        : (samples[middle - 1] + samples[middle]) / 2;
-    };
-    let commandMs = 0;
-    let promptMs = 0;
-    for (const evaluation of state.evaluations.filter((item) => item.enabled)) {
-      // Wall-clock duration includes host sleep. Use a recent median so one
-      // suspended run cannot make every following generation cook early.
-      const duration = observedDuration(evaluation);
-      if (evaluation.command) commandMs += duration;
-      else promptMs = Math.max(promptMs, duration);
-    }
-    // Full validation is followed by integration/review, README graph stamping,
-    // and the stamped-head CI gate. Reserve that measured tail as well as the
-    // evaluation wall time so cadence forecasting covers the complete merge.
-    const observedLeadMs = commandMs + promptMs + 10 * 60_000;
-    const revisionReserveMs = compositeRevisionHeadroom(anchor, state.settings.mergeCadenceMinutes).reserveMs;
-    const leadMs = Math.min(Math.max(revisionReserveMs, observedLeadMs), Math.max(0, cadenceMs - 5 * 60_000));
+    const leadMs = portfolioMergeTailHeadroom(state).requiredMs;
     const elapsedMs = Date.now() - new Date(anchor).getTime();
     if (elapsedMs >= cadenceMs - leadMs) return true;
     // Forecast before dispatching another author even when only one reviewed
@@ -635,7 +646,8 @@ export class Orchestrator {
       .filter((duration) => Number.isFinite(duration) && duration >= 0);
     const estimatedLeafMs = Math.max(5 * 60_000, ...recentLeafDurations);
     const remainingMs = cadenceMs - elapsedMs;
-    return remainingMs <= leadMs + estimatedLeafMs;
+    const forecastMarginMs = Math.min(3 * 60_000, Math.max(60_000, cadenceMs / 20));
+    return remainingMs <= leadMs + estimatedLeafMs + forecastMarginMs;
   }
 
   private portfolioReviewLimit(settings: BurnerState["settings"]): number {

@@ -4,6 +4,36 @@ export const now = () => new Date().toISOString();
 
 export const id = (prefix: string) => `${prefix}_${randomUUID().slice(0, 8)}`;
 
+export function wellFormedText(value: string): string {
+  let result = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        result += value[index] + value[index + 1];
+        index += 1;
+      } else {
+        result += "\ufffd";
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      result += "\ufffd";
+    } else {
+      result += value[index];
+    }
+  }
+  return result;
+}
+
+export function truncateText(value: string, maxLength: number, fromEnd = false): string {
+  const sliced = value.length <= maxLength
+    ? value
+    : fromEnd
+      ? value.slice(-maxLength)
+      : value.slice(0, maxLength);
+  return wellFormedText(sliced);
+}
+
 export function slugify(value: string, maxLength = 42): string {
   return value
     .toLowerCase()

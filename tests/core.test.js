@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, TransientMergeGateError } from "../dist/lib/git.js";
@@ -430,6 +430,39 @@ test("composite evaluation revisions reserve enough merge-cadence headroom", () 
   assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 35 * 60_000), { allowed: true, remainingMs: 25 * 60_000, reserveMs: 24 * 60_000 });
   assert.deepEqual(compositeRevisionHeadroom(anchor, 60, started + 37 * 60_000), { allowed: false, remainingMs: 23 * 60_000, reserveMs: 24 * 60_000 });
   assert.equal(compositeRevisionHeadroom(undefined, 60).allowed, true);
+});
+
+test("composite admission uses the observed full validation tail", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-observed-composite-tail-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const currentTime = Date.now();
+    const timestamp = new Date(currentTime).toISOString();
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 35 * 60_000).toISOString();
+      state.evaluations = [
+        { id: "benchmark", name: "Benchmark", prompt: "Measure", command: "./full", weight: 1, enabled: true, createdAt: timestamp, definitionVersion: "v1" },
+        { id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp, definitionVersion: "v1" },
+      ];
+      state.evaluationRuns = [
+        { id: "benchmark-run", evaluationId: "benchmark", score: 100, commit: "base", createdAt: timestamp, durationMs: 23 * 60_000, status: "completed", context: "composite", evaluationDefinitionVersion: "v1" },
+        { id: "quality-run", evaluationId: "quality", score: 95, commit: "base", createdAt: timestamp, durationMs: 2 * 60_000, status: "completed", context: "composite", evaluationDefinitionVersion: "v1" },
+      ];
+    });
+
+    assert.deepEqual(portfolioMergeTailHeadroom(store.get(), currentTime), {
+      allowed: false,
+      remainingMs: 25 * 60_000,
+      requiredMs: 35 * 60_000,
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    assert.equal(orchestrator.cadenceCompositeTailExhausted(store.get()), true,
+      "Burner must not begin a composite whose observed validation tail cannot meet cadence");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("unchanged leaves reuse both accepted and rejected full merge validation", () => {
@@ -3295,11 +3328,16 @@ test("state persists evaluation configuration and excludes candidate scores from
         { id: "candidate", evaluationId: evaluation.id, score: 99, commit: "b", createdAt: "2026-01-02T00:00:00.000Z", durationMs: 1, status: "completed", context: "agent", error: "x".repeat(20_000) },
         { id: "rejected-screen", evaluationId: evaluation.id, score: 0, summary: "Benchmark rejected: no timing score was accepted.", evidence: ["unstable timing: max/min spread 11.7"], commit: "a", createdAt: "2026-01-03T00:00:00.000Z", durationMs: 1, status: "completed", context: "screening_baseline" },
         { id: "rejected-saturated", evaluationId: evaluation.id, score: 0, summary: "Benchmark rejected: no timing score was accepted.", evidence: ["primary timing saturated: every case reached the parity cap"], commit: "a", createdAt: "2026-01-04T00:00:00.000Z", durationMs: 1, status: "completed", context: "baseline" },
+        { id: "split-surrogate", evaluationId: evaluation.id, score: 80, summary: `split low ${"\uDC00"}`, evidence: [`split high ${"\uD83D"}`], commit: "a", createdAt: "2026-01-05T00:00:00.000Z", durationMs: 1, status: "completed", context: "agent" },
       );
     });
     assert.equal(store.latestRuns().get(evaluation.id)?.score, 61);
     assert.equal(store.latestScreeningRuns().has(evaluation.id), false);
     assert.ok(store.get().evaluationRuns.find((run) => run.id === "candidate").error.length <= 8_020);
+    assert.equal(store.get().evaluationRuns.find((run) => run.id === "split-surrogate").summary, "split low �");
+    assert.deepEqual(store.get().evaluationRuns.find((run) => run.id === "split-surrogate").evidence, ["split high �"]);
+    const serializedState = await readFile(join(root, ".burner", "state.json"), "utf8");
+    assert.doesNotMatch(serializedState, /\\ud83d|\\udc00/i, "persisted state must contain only well-formed Unicode strings");
     const reloaded = new StateStore(root);
     await reloaded.init();
     assert.equal(reloaded.get().projectName, root.split("/").at(-1));
