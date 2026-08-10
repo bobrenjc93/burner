@@ -262,6 +262,21 @@ export function leafValidationHeadroom(
   return { allowed: remainingMs >= reserveMs, remainingMs, reserveMs };
 }
 
+export function leafPromptRecoveryHeadroom(
+  mergeWindowStartedAt: string | undefined,
+  mergeCadenceMinutes: number,
+  currentTimeMs = Date.now(),
+): { allowed: boolean; remainingMs: number; reserveMs: number } {
+  if (!mergeWindowStartedAt) return { allowed: true, remainingMs: Infinity, reserveMs: 0 };
+  const cadenceMs = mergeCadenceMinutes * 60_000;
+  const remainingMs = new Date(mergeWindowStartedAt).getTime() + cadenceMs - currentTimeMs;
+  // When every deterministic command already completed on the exact leaf
+  // head, recovery only needs the prompt lane (including its bounded retry)
+  // plus graph stamping, required checks, and merge synchronization.
+  const reserveMs = Math.min(15 * 60_000, Math.max(10 * 60_000, cadenceMs / 5));
+  return { allowed: remainingMs >= reserveMs, remainingMs, reserveMs };
+}
+
 export function cachedFullMergeValidationResult(
   run: Pick<AgentRun, "fullMergeValidation">,
   baseCommit: string,
@@ -280,11 +295,11 @@ export function reusableFullAgentCommandRuns(
   candidateCommit: string,
 ): EvaluationRun[] {
   return state.evaluations
-    .filter((evaluation) => evaluation.enabled && evaluation.command && !evaluation.screeningCommand)
+    .filter((evaluation) => evaluation.enabled && evaluation.command)
     .flatMap((evaluation) => {
       const run = state.evaluationRuns.filter((item) =>
         item.agentRunId === agentRunId &&
-        item.context === "agent" &&
+        (item.context === "composite" || (item.context === "agent" && !evaluation.screeningCommand)) &&
         item.evaluationId === evaluation.id &&
         item.commit === candidateCommit &&
         item.evaluationDefinitionVersion === evaluation.definitionVersion &&
@@ -830,14 +845,26 @@ export class Orchestrator {
     if (candidate.kind === "agent" && this.portfolioMode()) {
       if (this.cadenceLeafValidationTailExhausted(state)) {
         const evaluationFingerprint = fullMergeValidationFingerprint(state);
-        const cachedCandidate = (await Promise.all(eligibleYoloLeaves(state, baseCommit).map(async (leaf) => {
+        const fullCommandCount = state.evaluations.filter((evaluation) => evaluation.enabled && evaluation.command).length;
+        const evaluatedCandidates = await Promise.all(eligibleYoloLeaves(state, baseCommit).map(async (leaf) => {
           const candidateCommit = await this.git.resolveRef(leaf.branch);
-          return cachedFullMergeValidationResult(leaf, baseCommit, candidateCommit, evaluationFingerprint, currentlyQualifiesForYoloMerge(state, leaf)) === true
-            ? leaf
-            : undefined;
-        }))).find((leaf) => leaf !== undefined);
-        if (!cachedCandidate?.prNumber || cachedCandidate.impact === undefined) return false;
-        candidate = { kind: "agent", id: cachedCandidate.id, prNumber: cachedCandidate.prNumber, impact: cachedCandidate.impact };
+          return {
+            leaf,
+            fullyValidated: cachedFullMergeValidationResult(leaf, baseCommit, candidateCommit, evaluationFingerprint, currentlyQualifiesForYoloMerge(state, leaf)) === true,
+            reusableCommandCount: reusableFullAgentCommandRuns(state, leaf.id, candidateCommit).length,
+          };
+        }));
+        const cachedCandidate = evaluatedCandidates.find(({ fullyValidated }) => fullyValidated)?.leaf;
+        const promptRecoveryAllowed = leafPromptRecoveryHeadroom(
+          state.orchestrator.mergeWindowStartedAt,
+          state.settings.mergeCadenceMinutes,
+        ).allowed;
+        const promptRecoveryCandidate = promptRecoveryAllowed && fullCommandCount > 0
+          ? evaluatedCandidates.find(({ reusableCommandCount }) => reusableCommandCount === fullCommandCount)?.leaf
+          : undefined;
+        const recoverableCandidate = cachedCandidate ?? promptRecoveryCandidate;
+        if (!recoverableCandidate?.prNumber || recoverableCandidate.impact === undefined) return false;
+        candidate = { kind: "agent", id: recoverableCandidate.id, prNumber: recoverableCandidate.prNumber, impact: recoverableCandidate.impact };
       }
       const candidateId = candidate.id;
       if (!(await this.fullyValidateLeafForMerge(candidateId, baseCommit))) return false;

@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, TransientMergeGateError } from "../dist/lib/git.js";
@@ -457,7 +457,7 @@ test("unchanged leaves reuse both accepted and rejected full merge validation", 
   }, baseCommit, candidateCommit, "changed-evaluations"), undefined, "changed evaluation policy requires fresh validation");
 });
 
-test("full leaf validation reuses only exact-head unscreened command results", () => {
+test("full leaf validation reuses exact-head full command results but not quick screens", () => {
   const createdAt = "2026-01-01T00:00:00.000Z";
   const completed = (evaluationId, overrides = {}) => ({
     id: `run-${evaluationId}`,
@@ -482,13 +482,14 @@ test("full leaf validation reuses only exact-head unscreened command results", (
     evaluationRuns: [
       completed("full"),
       completed("screened"),
+      completed("screened", { id: "run-screened-full", context: "composite" }),
       completed("prompt"),
       completed("disabled"),
       completed("full", { id: "wrong-commit", commit: "old" }),
       completed("full", { id: "wrong-definition", evaluationDefinitionVersion: "v0" }),
     ],
   };
-  assert.deepEqual(reusableFullAgentCommandRuns(state, "leaf", "candidate").map((run) => run.id), ["run-full"]);
+  assert.deepEqual(reusableFullAgentCommandRuns(state, "leaf", "candidate").map((run) => run.id), ["run-full", "run-screened-full"]);
   assert.deepEqual(reusableFullAgentCommandRuns(state, "other-leaf", "candidate"), []);
 });
 
@@ -571,6 +572,20 @@ test("leaf validation reserves the complete confirmation and merge tail", () => 
     allowed: false,
     remainingMs: 17 * 60_000,
     reserveMs: 18 * 60_000,
+  });
+});
+
+test("exact-head command completion permits a shorter prompt-only recovery tail", () => {
+  const currentTime = Date.now();
+  assert.deepEqual(leafPromptRecoveryHeadroom(new Date(currentTime - 47 * 60_000).toISOString(), 60, currentTime), {
+    allowed: true,
+    remainingMs: 13 * 60_000,
+    reserveMs: 12 * 60_000,
+  });
+  assert.deepEqual(leafPromptRecoveryHeadroom(new Date(currentTime - 49 * 60_000).toISOString(), 60, currentTime), {
+    allowed: false,
+    remainingMs: 11 * 60_000,
+    reserveMs: 12 * 60_000,
   });
 });
 
@@ -2326,14 +2341,13 @@ test("cadence fallback skips an unchanged rejected leaf and validates the next c
   }
 });
 
-test("late cadence tail waits for cached leaf validation but still merges a cached-qualified leaf", async () => {
+test("late cadence tail permits prompt-only recovery after exact-head full commands complete", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-late-leaf-validation-test-"));
   try {
     const store = new StateStore(root);
     await store.init();
     const timestamp = new Date().toISOString();
     const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
-    const fingerprint = JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v1", threshold: 0, evaluations: [{ id: "quality", name: "Quality", prompt: "Score", weight: 1 }] });
     await store.update((state) => {
       state.settings.mergeCadenceMinutes = 60;
       state.orchestrator.mergeWindowStartedAt = new Date(Date.now() - 43 * 60_000).toISOString();
@@ -2358,7 +2372,12 @@ test("late cadence tail waits for cached leaf validation but still merges a cach
     assert.equal(validated, 0, "an uncached full suite must not begin inside the reserved tail");
 
     await store.update((state) => {
-      state.agentRuns[0].fullMergeValidation = { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: fingerprint, qualified: true, completedAt: timestamp };
+      state.evaluations.push({ id: "bench", name: "Benchmark", prompt: "Measure", command: "full", screeningCommand: "quick", definitionVersion: "v1", weight: 1, enabled: true, createdAt: timestamp });
+      state.agentRuns[0].deltas.push({ evaluationId: "bench", name: "Benchmark", before: 90, after: 90, delta: 0, screening: true });
+      state.evaluationRuns.push({
+        id: "full-bench", evaluationId: "bench", score: 90, commit: "candidate", createdAt: timestamp,
+        durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf", evaluationDefinitionVersion: "v1",
+      });
     });
     assert.equal(await orchestrator.autoMergeNext(), true);
     assert.equal(validated, 1);
