@@ -455,11 +455,14 @@ test("composite admission uses the observed full validation tail", async () => {
     assert.deepEqual(portfolioMergeTailHeadroom(store.get(), currentTime), {
       allowed: false,
       remainingMs: 25 * 60_000,
-      requiredMs: 35 * 60_000,
+      requiredMs: 40 * 60_000,
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
     assert.equal(orchestrator.cadenceCompositeTailExhausted(store.get()), true,
       "Burner must not begin a composite whose observed validation tail cannot meet cadence");
+    assert.throws(() => orchestrator.assertCompositeEvaluationHeadroom(store.get()),
+      /stopped before full evaluation.*25\.0 minutes remain.*40 minutes/i,
+      "headroom must be rechecked after integration and review consume the admission margin");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1736,7 +1739,7 @@ test("YOLO cadence forecasting ignores one suspended-host duration outlier", asy
         { id: "quality-b", evaluationId: "quality", score: 90, commit: "b", createdAt: new Date(now - 20_000).toISOString(), durationMs: 3 * 60_000, status: "completed", context: "composite" },
         { id: "quality-c", evaluationId: "quality", score: 90, commit: "c", createdAt: new Date(now - 10_000).toISOString(), durationMs: 2 * 60_000, status: "completed", context: "baseline" },
       ];
-      state.orchestrator.mergeWindowStartedAt = new Date(now - 10 * 60_000).toISOString();
+      state.orchestrator.mergeWindowStartedAt = new Date(now - 5 * 60_000).toISOString();
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
     assert.equal(orchestrator.portfolioCookDue(store.get(), "base"), false, "one sleep-inflated run must not force an immediate singleton cook");
@@ -1778,14 +1781,14 @@ test("YOLO validates one reviewed leaf before another leaf cycle would miss cade
         evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp,
         source: "manual", agentRunId: "leaf",
       });
-      state.orchestrator.mergeWindowStartedAt = new Date(now - 10 * 60_000).toISOString();
+      state.orchestrator.mergeWindowStartedAt = new Date(now - 5 * 60_000).toISOString();
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
     orchestrator.git = { resolveRef: async () => "base" };
     assert.equal(orchestrator.portfolioCookDue(store.get(), "base"), false, "the singleton should not merge prematurely while another leaf still fits");
 
-    await store.update((state) => { state.orchestrator.mergeWindowStartedAt = new Date(now - 19 * 60_000).toISOString(); });
-    assert.equal(orchestrator.portfolioCookDue(store.get(), "base"), true, "the forecast must work before a second leaf exists");
+    await store.update((state) => { state.orchestrator.mergeWindowStartedAt = new Date(now - 10 * 60_000).toISOString(); });
+    assert.equal(orchestrator.portfolioCookDue(store.get(), "base"), true, "a nominal four-minute surplus is not enough to risk another leaf cycle");
     let merged;
     orchestrator.fullyValidateLeafForMerge = async () => true;
     orchestrator.mergeAgent = async (id) => { merged = id; return {}; };
@@ -1886,7 +1889,7 @@ test("YOLO cooks validated leaves before another observed leaf cycle can consume
     });
     await store.update((state) => {
       state.settings.mergeCadenceMinutes = 60;
-      state.orchestrator.mergeWindowStartedAt = new Date(now - 35 * 60_000).toISOString();
+      state.orchestrator.mergeWindowStartedAt = new Date(now - 30 * 60_000).toISOString();
       state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
       state.agentRuns = [leaf("first", 1, 30, 10), leaf("second", 2, 18, 1)];
       state.ideas.push(
@@ -1897,7 +1900,7 @@ test("YOLO cooks validated leaves before another observed leaf cycle can consume
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     orchestrator.git = { resolveRef: async () => "base" };
     assert.equal(orchestrator.mergeCadenceDue(), false);
-    assert.equal(orchestrator.portfolioCookDue(store.get(), "base"), true, "a recent 20-minute leaf must not be launched with only 25 minutes left");
+    assert.equal(orchestrator.portfolioCookDue(store.get(), "base"), true, "a recent 20-minute leaf must not be launched with only 30 minutes left");
     let cooked;
     orchestrator.createComposite = async (...args) => { cooked = args; return {}; };
     assert.equal(await orchestrator.autoCookNext(), true);

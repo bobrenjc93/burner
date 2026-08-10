@@ -291,7 +291,11 @@ export function portfolioMergeTailHeadroom(
   // revision reserve and use whichever is larger.
   const observedTailMs = commandMs + promptMs + 10 * 60_000;
   const staticReserveMs = compositeRevisionHeadroom(anchor, state.settings.mergeCadenceMinutes, currentTimeMs).reserveMs;
-  const requiredMs = Math.min(Math.max(staticReserveMs, observedTailMs), Math.max(0, cadenceMs - 5 * 60_000));
+  // Integration/review and host variance must not consume a razor-thin
+  // forecast surplus. In particular, do not admit a composite with seconds of
+  // nominal headroom when the observed tail itself lasts tens of minutes.
+  const forecastMarginMs = Math.min(5 * 60_000, Math.max(2 * 60_000, cadenceMs / 12));
+  const requiredMs = Math.min(Math.max(staticReserveMs, observedTailMs) + forecastMarginMs, Math.max(0, cadenceMs - 5 * 60_000));
   return { allowed: remainingMs > requiredMs, remainingMs, requiredMs };
 }
 
@@ -646,8 +650,18 @@ export class Orchestrator {
       .filter((duration) => Number.isFinite(duration) && duration >= 0);
     const estimatedLeafMs = Math.max(5 * 60_000, ...recentLeafDurations);
     const remainingMs = cadenceMs - elapsedMs;
-    const forecastMarginMs = Math.min(3 * 60_000, Math.max(60_000, cadenceMs / 20));
-    return remainingMs <= leadMs + estimatedLeafMs + forecastMarginMs;
+    return remainingMs <= leadMs + estimatedLeafMs;
+  }
+
+  private assertCompositeEvaluationHeadroom(state = this.store.get()): void {
+    if (!this.portfolioMode()) return;
+    const headroom = portfolioMergeTailHeadroom(state);
+    if (headroom.allowed) return;
+    throw new Error(
+      `Composite stopped before full evaluation: ${Math.max(0, headroom.remainingMs / 60_000).toFixed(1)} minutes remain, ` +
+      `but the observed validation and merge tail requires ${Math.ceil(headroom.requiredMs / 60_000)} minutes. ` +
+      "Burner will release the source leaves for a fully validated cadence fallback.",
+    );
   }
 
   private portfolioReviewLimit(settings: BurnerState["settings"]): number {
@@ -2662,6 +2676,7 @@ export class Orchestrator {
       let impact = 0;
       let compositeScore = 0;
       for (let evaluationRevision = 1; evaluationRevision <= 3; evaluationRevision += 1) {
+        this.assertCompositeEvaluationHeadroom(this.store.get());
         afterRuns = await this.runCandidateEvaluations("composite", worktree, undefined, compositeId);
         state = this.store.get();
         const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
