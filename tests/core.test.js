@@ -3080,7 +3080,9 @@ test("merged composites supersede source PRs and queue overlapping composites fo
     const timestamp = new Date().toISOString();
     const run = (id, number) => ({ id, ideaId: `idea-${id}`, status: "completed", branch: `branch-${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp, prUrl: `https://example.test/pull/${number}`, prNumber: number, prState: "open", deltas: [], resources: [], reviewRounds: [], reviewApproved: true });
     await store.update((state) => {
-      state.agentRuns.push(run("a", 1), run("b", 2), run("c", 3), run("d", 4));
+      const alreadyClosedSource = run("b", 2);
+      alreadyClosedSource.prState = "closed";
+      state.agentRuns.push(run("a", 1), alreadyClosedSource, run("c", 3), run("d", 4));
       state.composites.push(
         { id: "merged", title: "Merged composite", description: "", status: "open", branch: "composite-merged", worktree: "", sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a", kind: "pull_request" }, { agentRunId: "b", prNumber: 2, title: "B", branch: "branch-b", kind: "pull_request" }], deltas: [], reviewRounds: [], prNumber: 100, prUrl: "https://example.test/pull/100", createdAt: timestamp, updatedAt: timestamp, isLiving: true, error: "stale mergeability diagnostic" },
         { id: "overlap", title: "Overlap", description: "", status: "open", branch: "composite-overlap", worktree: "", sources: [{ agentRunId: "a", prNumber: 1, title: "A", branch: "branch-a", kind: "pull_request" }, { agentRunId: "c", prNumber: 3, title: "C", branch: "branch-c", kind: "pull_request" }, { agentRunId: "d", prNumber: 4, title: "D", branch: "branch-d", kind: "pull_request" }], deltas: [], reviewRounds: [], prNumber: 101, prUrl: "https://example.test/pull/101", createdAt: timestamp, updatedAt: timestamp, isLiving: false },
@@ -3093,7 +3095,7 @@ test("merged composites supersede source PRs and queue overlapping composites fo
     orchestrator.git = {
       remoteExists: async () => true,
       listPullRequests: async () => [
-        { number: 1, state: "OPEN", headRefName: "branch-a", url: "" }, { number: 2, state: "OPEN", headRefName: "branch-b", url: "" },
+        { number: 1, state: "OPEN", headRefName: "branch-a", url: "" }, { number: 2, state: "CLOSED", headRefName: "branch-b", url: "" },
         { number: 3, state: "OPEN", headRefName: "branch-c", url: "" }, { number: 4, state: "OPEN", headRefName: "branch-d", url: "" },
         { number: 100, state: "MERGED", headRefName: "composite-merged", url: "" }, { number: 101, state: "OPEN", headRefName: "composite-overlap", url: "" },
       ],
@@ -3110,8 +3112,8 @@ test("merged composites supersede source PRs and queue overlapping composites fo
     const overlap = state.composites.find((item) => item.id === "overlap");
     assert.equal(overlap.status, "rebuilding");
     assert.deepEqual(overlap.sources.map((source) => source.agentRunId), ["c", "d"]);
-    assert.deepEqual(closed.sort(), [[1, "merged"], [2, "merged"]]);
-    assert.deepEqual(labeled, [[100, "merged"]]);
+    assert.deepEqual(closed, [[1, "merged"]]);
+    assert.deepEqual(labeled, [[100, "merged"], [2, "merged"]]);
     assert.equal(state.orchestrator.baseSyncPending, false);
     assert.equal(state.orchestrator.lastEvaluationAt, undefined);
     assert.ok(state.orchestrator.lastMergeAt);

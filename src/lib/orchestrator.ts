@@ -2041,11 +2041,19 @@ export class Orchestrator {
       if (!composite) continue;
       for (const source of composite.sources) {
         const run = this.store.get().agentRuns.find((item) => item.id === source.agentRunId);
-        if (source.prNumber && run?.prState === "open") {
-          await this.git.closePr(this.root, source.prNumber, `Superseded by merged composite PR #${composite.prNumber}.`, "merged");
+        if (source.prNumber && run) {
+          if (run.prState === "open") {
+            await this.git.closePr(this.root, source.prNumber, `Superseded by merged composite PR #${composite.prNumber}.`, "merged");
+          } else {
+            // A source may be closed externally while its composite is still
+            // evaluating. Inclusion in the merged composite remains
+            // authoritative, so correct its disposition even though there is
+            // no open PR left for Burner to close.
+            await this.git.markPrDisposition(this.root, source.prNumber, "merged");
+          }
           await this.store.update((draft) => {
             const current = draft.agentRuns.find((item) => item.id === source.agentRunId);
-            if (current) { current.prState = "superseded"; current.supersededByCompositeId = compositeId; }
+            if (current && current.prState !== "merged") { current.prState = "superseded"; current.supersededByCompositeId = compositeId; }
           });
           changedRunIds.add(source.agentRunId);
         }
