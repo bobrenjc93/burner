@@ -2356,7 +2356,14 @@ export class Orchestrator {
       let base: AgentBase;
       try { base = await this.resolveAgentBase(idea, state); } catch { continue; }
       if (this.portfolioMode()) {
-        const cadence = agentDispatchCadenceHeadroom(state, base.commit);
+        // A living-composite experiment branches from the composite head, but
+        // the mergeable fallback itself is still based on main. Compare the
+        // cadence against main or the scheduler will fail to see that open
+        // composite and spend its merge reserve on another experiment.
+        const cadenceBaseCommit = base.compositeId
+          ? await this.git.resolveRef(state.settings.baseBranch)
+          : base.commit;
+        const cadence = agentDispatchCadenceHeadroom(state, cadenceBaseCommit);
         if (!cadence.allowed) {
           const window = state.orchestrator.mergeWindowStartedAt;
           if (window && this.agentDispatchHoldWindow !== window) {
@@ -2820,7 +2827,10 @@ export class Orchestrator {
       const liveSettings = liveState.settings;
       if (roundsUsed >= this.portfolioReviewLimit(liveSettings)) break;
       if (this.portfolioMode() && currentRun?.baseCommit) {
-        const cadence = agentReviewCadenceHeadroom(liveState, currentRun.baseCommit, runId);
+        const cadenceBaseCommit = currentRun.parentCompositeId
+          ? await this.git.resolveRef(liveSettings.baseBranch)
+          : currentRun.baseCommit;
+        const cadence = agentReviewCadenceHeadroom(liveState, cadenceBaseCommit, runId);
         if (!cadence.allowed) throw new PortfolioCadenceYieldError(lastFindings, cadence.remainingMs, cadence.requiredMs);
       }
       const roundNumber = roundsUsed + 1;
@@ -2844,7 +2854,10 @@ export class Orchestrator {
       const revisionState = this.store.get();
       const revisionRun = revisionState.agentRuns.find((run) => run.id === runId);
       if (this.portfolioMode() && revisionRun?.baseCommit) {
-        const cadence = agentReviewCadenceHeadroom(revisionState, revisionRun.baseCommit, runId);
+        const cadenceBaseCommit = revisionRun.parentCompositeId
+          ? await this.git.resolveRef(revisionState.settings.baseBranch)
+          : revisionRun.baseCommit;
+        const cadence = agentReviewCadenceHeadroom(revisionState, cadenceBaseCommit, runId);
         if (!cadence.allowed) throw new PortfolioCadenceYieldError(lastFindings, cadence.remainingMs, cadence.requiredMs);
       }
       await this.updateAgent(runId, { status: "revising" });

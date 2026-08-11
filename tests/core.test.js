@@ -771,6 +771,61 @@ test("YOLO keeps authoring when idling cannot preserve the merge cadence", async
   }
 });
 
+test("living-composite experiments reserve cadence against the mergeable main-based composite", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-living-cadence-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const currentTime = Date.now();
+    const timestamp = new Date(currentTime).toISOString();
+    const evaluation = store.get().evaluations[0];
+    const approvedRound = { id: "approved", round: 1, commit: "living-head", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    await store.update((state) => {
+      state.evaluations = [evaluation];
+      state.settings.mergeCadenceMinutes = 40;
+      state.settings.parallelism = 1;
+      state.orchestrator.enabled = true;
+      state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 20 * 60_000).toISOString();
+      state.orchestrator.livingCompositeId = "living";
+      state.ideas.push({ id: "queued", title: "Extend living", description: "Narrow work", rationale: "Improve", predictedImpact: 1, evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "planner" });
+      state.composites.push({
+        id: "living", title: "Living line", description: "", status: "open", branch: "burner/living", worktree: "", baseCommit: "main-base",
+        sources: [], deltas: [{ evaluationId: evaluation.id, name: evaluation.name, before: 80, after: 80, delta: 0 }], impact: 0,
+        reviewRounds: [approvedRound], reviewApproved: true, prNumber: 10, prState: "open", createdAt: timestamp, updatedAt: timestamp, isLiving: true,
+      });
+      state.agentRuns.push({
+        id: "experiment", ideaId: "experiment-idea", status: "reviewing", branch: "burner/experiment", worktree: root, startedAt: timestamp,
+        baseRef: "burner/living", baseCommit: "living-head", parentCompositeId: "living", deltas: [], resources: [], reviewRounds: [],
+      });
+    });
+
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.git = {
+      fetchBranch: async () => "origin/burner/living",
+      resolveRef: async (ref) => ref === "main" ? "main-base" : "living-head",
+    };
+    orchestrator.locks = { tryAcquireAll: async () => ({ locks: [], release: async () => {} }) };
+    let dispatched = false;
+    orchestrator.runIdea = async () => { dispatched = true; };
+    await orchestrator.schedule();
+    assert.equal(dispatched, false, "the open living composite must keep the remaining merge reserve");
+    assert.match(store.get().activity[0].message, /dispatch held for merge cadence/i);
+
+    await store.update((state) => {
+      state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 28 * 60_000).toISOString();
+    });
+    let reviewed = false;
+    orchestrator.codex = { review: async () => { reviewed = true; throw new Error("review should not start"); } };
+    await assert.rejects(
+      () => orchestrator.reviewAgent(root, "experiment", "Experiment", "burner/living", "thread", store.get().settings),
+      /yielded its slot to preserve the merge cadence reserve/,
+    );
+    assert.equal(reviewed, false, "a living experiment must yield review time to its main-based composite fallback");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("resuming the orchestrator does not force a redundant fresh baseline", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-resume-test-"));
   try {
