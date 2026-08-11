@@ -283,7 +283,7 @@ export class GitService {
         return;
       }
       lastError = result.stderr.trim() || result.stdout.trim() || `Could not merge PR #${number}`;
-      const transientState = /not mergeable|mergeability|head (?:branch|sha).*(?:changed|updated)|base branch.*(?:changed|updated)/i.test(lastError);
+      const transientState = /not mergeable|mergeability|pull request.*(?:not open|closed)|head (?:branch|sha).*(?:changed|updated)|base branch.*(?:changed|updated)/i.test(lastError);
       const transientTransport = isTransientGitHubFailure(lastError);
       if (!transientState && !transientTransport) throw new Error(lastError);
       if (attempt === mergeAttempts) throw new TransientMergeGateError(lastError);
@@ -304,6 +304,10 @@ export class GitService {
         `inspect PR #${number} checks`,
       );
       if (status.state === "MERGED") return;
+      if (status.state === "CLOSED" && status.headRefOid === expectedHead) {
+        await this.reopenExactPr(cwd, number, expectedHead);
+        if (attempt < attempts) { await wait(intervalMs); continue; }
+      }
       if (status.state !== "OPEN") throw new Error(`PR #${number} is ${status.state.toLowerCase()} instead of open.`);
       if (status.headRefOid !== expectedHead) {
         if (attempt < attempts) { await wait(intervalMs); continue; }
@@ -345,6 +349,10 @@ export class GitService {
         `inspect PR #${number} mergeability`,
       );
       if (lastStatus.state === "MERGED") return lastStatus;
+      if (lastStatus.state === "CLOSED" && lastStatus.headRefOid === expectedHead) {
+        await this.reopenExactPr(cwd, number, expectedHead);
+        if (attempt < attempts) { await wait(intervalMs); continue; }
+      }
       if (lastStatus.state !== "OPEN") throw new Error(`PR #${number} is ${lastStatus.state.toLowerCase()} instead of open.`);
       if (lastStatus.headRefOid === expectedHead && lastStatus.mergeable === "MERGEABLE") return lastStatus;
       if (lastStatus.headRefOid === expectedHead && lastStatus.mergeable === "CONFLICTING") {
@@ -361,6 +369,13 @@ export class GitService {
     }
     const observed = lastStatus?.headRefOid ? lastStatus.headRefOid.slice(0, 8) : "unknown";
     throw new Error(`GitHub did not report PR #${number} mergeable at head ${expectedHead.slice(0, 8)} after ${attempts} checks (observed ${observed}, ${lastStatus?.mergeable ?? "UNKNOWN"}).`);
+  }
+
+  private async reopenExactPr(cwd: string, number: number, expectedHead: string): Promise<void> {
+    const result = await runCommand("gh", ["pr", "reopen", String(number)], { cwd, timeoutMs: 2 * 60 * 1000 });
+    if (result.exitCode !== 0) {
+      throw new Error(result.stderr.trim() || `Could not reopen externally closed PR #${number} at validated head ${expectedHead.slice(0, 8)}.`);
+    }
   }
 
   async markPrDisposition(cwd: string, number: number, disposition: PullRequestDisposition): Promise<void> {

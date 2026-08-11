@@ -1521,7 +1521,8 @@ test("GitHub merge waits for the pushed head and retries transient not-mergeable
   await writeFile(executable, `#!/usr/bin/env node
 const fs=require("fs");const args=process.argv.slice(2);const path=process.env.BURNER_TEST_GH_STATE;const state=fs.existsSync(path)?JSON.parse(fs.readFileSync(path,"utf8")):{views:0,checkViews:0,merges:0};
 if(args[0]==="pr"&&args[1]==="view"&&args.includes("state,headRefOid,statusCheckRollup")){state.checkViews++;fs.writeFileSync(path,JSON.stringify(state));const pending=state.checkViews===1;const failed=process.env.BURNER_TEST_CHECK_FAIL==="1";const checks=process.env.BURNER_TEST_NO_CHECKS==="1"?[]:[{__typename:"CheckRun",name:"CI",status:pending?"IN_PROGRESS":"COMPLETED",conclusion:pending?null:failed?"FAILURE":"SUCCESS"}];console.log(JSON.stringify({state:"OPEN",headRefOid:process.env.BURNER_TEST_HEAD,statusCheckRollup:checks}));process.exit(0);}
-if(args[0]==="pr"&&args[1]==="view"){state.views++;if(process.env.BURNER_TEST_RESET_ONCE==="1"&&!state.reset){state.reset=1;fs.writeFileSync(path,JSON.stringify(state));console.error("read: connection reset by peer");process.exit(1);}fs.writeFileSync(path,JSON.stringify(state));const mergeable=process.env.BURNER_TEST_CONFLICT==="1"?"CONFLICTING":process.env.BURNER_TEST_ALWAYS_UNKNOWN==="1"?"UNKNOWN":state.views===1?"UNKNOWN":"MERGEABLE";console.log(JSON.stringify({state:"OPEN",mergeable,headRefOid:process.env.BURNER_TEST_HEAD}));process.exit(0);}
+if(args[0]==="pr"&&args[1]==="view"){state.views++;if(process.env.BURNER_TEST_RESET_ONCE==="1"&&!state.reset){state.reset=1;fs.writeFileSync(path,JSON.stringify(state));console.error("read: connection reset by peer");process.exit(1);}fs.writeFileSync(path,JSON.stringify(state));const mergeable=process.env.BURNER_TEST_CONFLICT==="1"?"CONFLICTING":process.env.BURNER_TEST_ALWAYS_UNKNOWN==="1"?"UNKNOWN":state.views===1?"UNKNOWN":"MERGEABLE";const prState=process.env.BURNER_TEST_CLOSED_ONCE==="1"&&!state.reopened?"CLOSED":"OPEN";console.log(JSON.stringify({state:prState,mergeable,headRefOid:process.env.BURNER_TEST_HEAD}));process.exit(0);}
+if(args[0]==="pr"&&args[1]==="reopen"){state.reopened=(state.reopened||0)+1;fs.writeFileSync(path,JSON.stringify(state));process.exit(0);}
 if(args[0]==="pr"&&args[1]==="merge"){state.merges++;fs.writeFileSync(path,JSON.stringify(state));if(state.merges===1){console.error("GraphQL: Pull Request is not mergeable (mergePullRequest)");process.exit(1);}process.exit(0);}
 process.exit(0);
 `);
@@ -1555,6 +1556,12 @@ process.exit(0);
     const recovered = JSON.parse(await readFile(statePath, "utf8"));
     assert.equal(recovered.reset, 1);
     assert.equal(recovered.merges, 5, "a transient GitHub inspection reset must retry without losing the validated head");
+    process.env.BURNER_TEST_RESET_ONCE = "0";
+    process.env.BURNER_TEST_CLOSED_ONCE = "1";
+    await git.mergePr(root, 48, head);
+    const reopened = JSON.parse(await readFile(statePath, "utf8"));
+    assert.equal(reopened.reopened, 1, "an externally closed exact head must be reopened before merge");
+    assert.equal(reopened.merges, 6);
   } finally {
     process.env.PATH = previousPath;
     delete process.env.BURNER_TEST_GH_STATE;
@@ -1564,6 +1571,7 @@ process.exit(0);
     delete process.env.BURNER_TEST_NO_CHECKS;
     delete process.env.BURNER_TEST_ALWAYS_UNKNOWN;
     delete process.env.BURNER_TEST_RESET_ONCE;
+    delete process.env.BURNER_TEST_CLOSED_ONCE;
     await rm(root, { recursive: true, force: true });
   }
 });
