@@ -402,7 +402,7 @@ function Settings({ dashboard, onSaved, setError }: { dashboard: DashboardPayloa
           <Toggle checked={form.autoCreatePrs} onChange={(value) => change("autoCreatePrs", value)} label="Open pull requests automatically" body="When disabled, completed branches remain local for inspection." />
         </SettingsSection>
       </div>
-      <aside className="settings-aside"><div className="panel sticky-save"><h3>Project configuration</h3><p>Saved to <code>.burner/state.json</code> in this repository.</p><div className="readiness"><Readiness ok={dashboard.runtime.codex.available} label="Codex CLI" /><Readiness ok={dashboard.runtime.git.available} label="Git repository" /><Readiness ok={dashboard.runtime.gh.authenticated || !form.autoCreatePrs} label="GitHub auth" /></div><button className="button button-primary full" disabled={saving}>{saving ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />} Save settings</button></div></aside>
+      <aside className="settings-aside"><div className="panel sticky-save"><h3>Project configuration</h3><p>Evaluation definitions are ready to commit in <code>.burner/evaluations.json</code>. Machine-local settings and history stay in <code>.burner/state.json</code>.</p><div className="readiness"><Readiness ok={dashboard.runtime.codex.available} label="Codex CLI" /><Readiness ok={dashboard.runtime.git.available} label="Git repository" /><Readiness ok={dashboard.runtime.gh.authenticated || !form.autoCreatePrs} label="GitHub auth" /></div><button className="button button-primary full" disabled={saving}>{saving ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />} Save settings</button></div></aside>
     </form>
   </>;
 }

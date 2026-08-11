@@ -18,7 +18,7 @@ burner --yolo
 ## What it does
 
 - Runs as a CLI-launched local web server in the target repository. One Burner improves one repository, so several can run at once; each takes the next free port from 4321 unless you pass an explicit `--port`, which never moves.
-- Stores configuration and run history locally in `.burner/state.json`.
+- Stores repository-owned evaluation definitions in `.burner/evaluations.json`, ready to commit, while keeping run history and machine-local settings in ignored `.burner/state.json`.
 - Evaluates arbitrary prompts with structured `codex exec` output.
 - Plans cadence-sized improvements from the latest evaluation evidence, decomposing oversized or quarantined scopes before retrying them.
 - Runs coding agents in separate git worktrees and branches.
@@ -67,6 +67,8 @@ Commands:
 ```
 
 Run `burner` from the repo you want to improve, configure evaluation prompts in the UI, and run a baseline. “Ignite” starts the continuous loop. Pausing stops new dispatches but lets already-running agents finish safely.
+
+Burner creates `.burner/evaluations.json` and a sibling `.gitignore` that exposes only that file to Git. Commit both files with the repository so fresh checkouts use the same scoring rubric; existing projects copy their definitions into this file automatically. Repositories that already ignore the entire `.burner/` directory may need one initial `git add -f .burner/.gitignore .burner/evaluations.json`. Command-backed evaluations are executable project configuration, so review changes to this file before running them.
 
 The same workflow is scriptable. Commands emit JSON, and `-C` selects the target repository:
 

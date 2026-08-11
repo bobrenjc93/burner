@@ -3424,6 +3424,10 @@ test("state persists evaluation configuration and excludes candidate scores from
     const store = new StateStore(root);
     await store.init();
     const evaluation = store.get().evaluations[0];
+    const config = JSON.parse(await readFile(join(root, ".burner", "evaluations.json"), "utf8"));
+    assert.equal(config.version, 1);
+    assert.deepEqual(config.evaluations, store.get().evaluations);
+    assert.match(await readFile(join(root, ".burner", ".gitignore"), "utf8"), /!evaluations\.json/);
     await store.update((state) => {
       state.evaluationRuns.push(
         { id: "baseline", evaluationId: evaluation.id, score: 61, commit: "a", createdAt: "2026-01-01T00:00:00.000Z", durationMs: 1, status: "completed", context: "manual" },
@@ -3454,6 +3458,50 @@ test("state persists evaluation configuration and excludes candidate scores from
     assert.deepEqual(validateEvaluation({ name: " UX ", prompt: " Score it ", weight: 2 }), { name: "UX", prompt: "Score it", weight: 2, enabled: true });
     assert.deepEqual(validateEvaluation({ name: "Bench", prompt: "Score", command: " full ", screeningCommand: " quick " }), { name: "Bench", prompt: "Score", command: "full", screeningCommand: "quick", weight: 1, enabled: true });
     assert.throws(() => validateEvaluation({ name: "Bench", prompt: "Score", screeningCommand: "quick" }), /requires a full evaluation command/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Burner exposes only repository-owned evaluation files to Git", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-evaluation-ignore-test-"));
+  try {
+    await exec(root, "git", ["init", "-q"]);
+    const store = new StateStore(root);
+    await store.init();
+    const status = await exec(root, "git", ["status", "--short", "--untracked-files=all"]);
+    assert.deepEqual(status.trim().split("\n").sort(), ["?? .burner/.gitignore", "?? .burner/evaluations.json"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("checked-in evaluations override local state and invalidate changed definitions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-evaluation-config-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const evaluation = store.get().evaluations[0];
+    await store.update((state) => {
+      const configured = state.evaluations.find((item) => item.id === evaluation.id);
+      configured.definitionVersion = "definition-v1";
+      state.evaluationRuns.push({
+        id: "baseline", evaluationId: evaluation.id, score: 80, commit: "base", createdAt: new Date().toISOString(), durationMs: 1,
+        status: "completed", context: "baseline", promptSampleCount: 3, evaluationDefinitionVersion: "definition-v1",
+      });
+    });
+    const config = JSON.parse(await readFile(store.evaluationsPath, "utf8"));
+    config.evaluations[0].prompt = "Score the changed repository definition out of 100.";
+    await writeFile(store.evaluationsPath, `${JSON.stringify(config, null, 2)}\n`);
+
+    const reloaded = new StateStore(root);
+    await reloaded.init();
+    const changed = reloaded.get().evaluations[0];
+    assert.equal(changed.prompt, "Score the changed repository definition out of 100.");
+    assert.notEqual(changed.definitionVersion, "definition-v1");
+    assert.equal(isAuthoritativeFullBaseline(changed, reloaded.latestRuns().get(changed.id), "base"), false);
+    const persisted = JSON.parse(await readFile(reloaded.evaluationsPath, "utf8"));
+    assert.equal(persisted.evaluations[0].definitionVersion, changed.definitionVersion);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

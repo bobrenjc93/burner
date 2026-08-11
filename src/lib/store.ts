@@ -7,6 +7,13 @@ import { id, now, weightedScore, wellFormedText } from "./utils.js";
 type Listener = (state: BurnerState) => void;
 export type StateStoreInitOptions = { recoverInterrupted?: boolean };
 
+type EvaluationConfig = {
+  version: 1;
+  evaluations: Evaluation[];
+};
+
+const DATA_IGNORE = `# Burner runtime data stays local; evaluation definitions are repository configuration.\n*\n!.gitignore\n!evaluations.json\n`;
+
 const isInconclusiveMeasurement = (run: EvaluationRun): boolean =>
   run.score === 0 &&
   /\b(?:benchmark rejected|no timing score was accepted|invalid measurement)\b/i.test(run.summary ?? "") &&
@@ -86,21 +93,26 @@ export class StateStore {
   readonly dataDir: string;
   readonly statePath: string;
   readonly lockPath: string;
+  readonly evaluationsPath: string;
   private state!: BurnerState;
   private listeners = new Set<Listener>();
   private operationChain: Promise<void> = Promise.resolve();
+  private persistedEvaluations?: string;
 
   constructor(readonly root: string) {
     this.dataDir = join(root, ".burner");
     this.statePath = join(this.dataDir, "state.json");
     this.lockPath = join(this.dataDir, "state.lock");
+    this.evaluationsPath = join(this.dataDir, "evaluations.json");
   }
 
   async init(options: StateStoreInitOptions = {}): Promise<BurnerState> {
     await mkdir(this.dataDir, { recursive: true });
+    await this.ensureDataIgnore();
     return this.enqueue(async () => this.withStateLock(async () => {
       this.state = await this.readState();
       this.migrate();
+      await this.loadEvaluationConfig();
       if (options.recoverInterrupted !== false) {
         this.state.orchestrator.enabled = false;
         for (const run of this.state.agentRuns) {
@@ -144,6 +156,7 @@ export class StateStore {
       const snapshot = await this.withStateLock(async () => {
         this.state = await this.readState(this.state);
         this.migrate();
+        await this.loadEvaluationConfig();
         mutator(this.state);
         this.trim();
         await this.persistUnlocked();
@@ -160,6 +173,8 @@ export class StateStore {
       const snapshot = await this.withStateLock(async () => {
         this.state = await this.readState(this.state);
         this.migrate();
+        await this.loadEvaluationConfig();
+        if (this.persistedEvaluations !== this.serializeEvaluations()) await this.persistUnlocked();
         return this.get();
       });
       const changed = before !== JSON.stringify(snapshot);
@@ -265,15 +280,26 @@ export class StateStore {
   }
 
   private async persistUnlocked(): Promise<void> {
-    const temp = `${this.statePath}.${process.pid}.${Date.now()}.tmp`;
+    const suffix = `${process.pid}.${Date.now()}.tmp`;
+    const stateTemp = `${this.statePath}.${suffix}`;
+    const evaluationsTemp = `${this.evaluationsPath}.${suffix}`;
     try {
       const serialized = JSON.stringify(this.state, (_key, value: unknown) =>
         typeof value === "string" ? wellFormedText(value) : value, 2);
       this.state = JSON.parse(serialized) as BurnerState;
-      await writeFile(temp, `${serialized}\n`, "utf8");
-      await rename(temp, this.statePath);
+      const evaluations = this.serializeEvaluations();
+      if (evaluations !== this.persistedEvaluations) {
+        await writeFile(evaluationsTemp, evaluations, "utf8");
+        await rename(evaluationsTemp, this.evaluationsPath);
+        this.persistedEvaluations = evaluations;
+      }
+      await writeFile(stateTemp, `${serialized}\n`, "utf8");
+      await rename(stateTemp, this.statePath);
     } finally {
-      await rm(temp, { force: true }).catch(() => undefined);
+      await Promise.all([
+        rm(stateTemp, { force: true }).catch(() => undefined),
+        rm(evaluationsTemp, { force: true }).catch(() => undefined),
+      ]);
     }
   }
 
@@ -314,6 +340,58 @@ export class StateStore {
     finally { await rm(this.lockPath, { recursive: true, force: true }); }
   }
 
+  private async ensureDataIgnore(): Promise<void> {
+    try {
+      await writeFile(join(this.dataDir, ".gitignore"), DATA_IGNORE, { encoding: "utf8", flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+
+  private serializeEvaluations(): string {
+    const config: EvaluationConfig = { version: 1, evaluations: this.state.evaluations };
+    return `${JSON.stringify(config, null, 2)}\n`;
+  }
+
+  private async loadEvaluationConfig(): Promise<void> {
+    let source: string;
+    try {
+      source = await readFile(this.evaluationsPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.persistedEvaluations = undefined;
+        return;
+      }
+      throw error;
+    }
+    if (source === this.persistedEvaluations) return;
+    const parsed = JSON.parse(source) as Partial<EvaluationConfig>;
+    if (parsed.version !== 1 || !Array.isArray(parsed.evaluations)) {
+      throw new Error(".burner/evaluations.json must contain a version 1 evaluation configuration.");
+    }
+    const previous = new Map((this.state.evaluations ?? []).map((evaluation) => [evaluation.id, evaluation]));
+    const seen = new Set<string>();
+    this.state.evaluations = parsed.evaluations.map((candidate, index) => {
+      if (!candidate || typeof candidate !== "object") throw new Error(`Evaluation ${index + 1} must be an object.`);
+      const evaluationId = typeof candidate.id === "string" && candidate.id.trim() ? candidate.id.trim() : id("eval");
+      if (seen.has(evaluationId)) throw new Error(`Duplicate evaluation id '${evaluationId}' in .burner/evaluations.json.`);
+      seen.add(evaluationId);
+      const validated = validateEvaluation(candidate);
+      const existing = previous.get(evaluationId);
+      const definitionChanged = existing && JSON.stringify(validateEvaluation(existing)) !== JSON.stringify(validated);
+      const definitionVersion = definitionChanged && candidate.definitionVersion === existing.definitionVersion
+        ? id("evaldef")
+        : candidate.definitionVersion;
+      return {
+        ...validated,
+        id: evaluationId,
+        createdAt: typeof candidate.createdAt === "string" && candidate.createdAt ? candidate.createdAt : now(),
+        ...(definitionVersion ? { definitionVersion } : {}),
+      };
+    });
+    this.persistedEvaluations = source === this.serializeEvaluations() ? source : undefined;
+  }
+
   private trim(): void {
     this.state.activity = this.state.activity.slice(0, 250);
     this.state.evaluationRuns = this.state.evaluationRuns.slice(-1000);
@@ -336,6 +414,7 @@ export class StateStore {
   private migrate(): void {
     const legacy = this.state as BurnerState & { version: number; composites?: BurnerState["composites"] };
     legacy.version = 3;
+    legacy.evaluations ??= [];
     legacy.composites ??= [];
     legacy.settings.maxReviewRounds ??= 12;
     legacy.settings.portfolioReviewRounds ??= 12;
