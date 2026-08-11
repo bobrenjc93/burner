@@ -660,6 +660,8 @@ test("YOLO yields a long review loop while an approved fallback can still use th
       remainingMs: 19 * 60_000,
       requiredMs: 20 * 60_000,
     });
+    assert.equal(agentDispatchCadenceHeadroom(store.get(), "base", currentTime).allowed, false,
+      "a late replacement must not displace an independently mergeable fallback");
 
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     let reviewed = false;
@@ -690,8 +692,11 @@ test("YOLO yields a long review loop while an approved fallback can still use th
       requiredMs: 0,
     }, "a queued idea must not discard a candidate that already reached review");
 
-    assert.equal(agentDispatchCadenceHeadroom(store.get(), "base", currentTime).allowed, false,
-      "the replacement is already too late to dispatch at the old review-yield boundary");
+    assert.deepEqual(agentDispatchCadenceHeadroom(store.get(), "base", currentTime), {
+      allowed: true,
+      remainingMs: 19 * 60_000,
+      requiredMs: 0,
+    }, "without a mergeable fallback, idling would only make the cadence miss worse");
 
     await store.update((state) => {
       state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 9 * 60_000).toISOString();
@@ -717,7 +722,7 @@ test("YOLO yields a long review loop while an approved fallback can still use th
   }
 });
 
-test("YOLO reserves authoring and review time before dispatching a portfolio agent", async () => {
+test("YOLO keeps authoring when idling cannot preserve the merge cadence", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-dispatch-cadence-test-"));
   try {
     const store = new StateStore(root);
@@ -733,9 +738,9 @@ test("YOLO reserves authoring and review time before dispatching a portfolio age
     });
 
     assert.deepEqual(agentDispatchCadenceHeadroom(store.get(), "base", currentTime), {
-      allowed: false,
+      allowed: true,
       remainingMs: 20 * 60_000,
-      requiredMs: 80 * 60_000 / 3,
+      requiredMs: 0,
     });
 
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
@@ -745,8 +750,7 @@ test("YOLO reserves authoring and review time before dispatching a portfolio age
     let cadenceFallback = false;
     orchestrator.runIdea = async (...args) => { dispatched = true; cadenceFallback = args[5]; };
     await orchestrator.schedule();
-    assert.equal(dispatched, false);
-    assert.match(store.get().activity[0].message, /dispatch held for merge cadence/i);
+    assert.equal(dispatched, true, "Burner must start the only path to a candidate instead of idling until the deadline");
 
     await store.update((state) => {
       state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 10 * 60_000).toISOString();
@@ -757,6 +761,8 @@ test("YOLO reserves authoring and review time before dispatching a portfolio age
       });
     });
     assert.equal(agentDispatchCadenceHeadroom(store.get(), "base", currentTime).allowed, true);
+    dispatched = false;
+    orchestrator.activeAgents.clear();
     await orchestrator.schedule();
     assert.equal(dispatched, true);
     assert.equal(cadenceFallback, true, "the replacement dispatched after a cadence yield must be marked as the fallback");

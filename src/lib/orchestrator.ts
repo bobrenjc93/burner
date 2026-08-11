@@ -424,9 +424,13 @@ export function agentDispatchCadenceHeadroom(
   const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
   const authorCycleReserveMs = Math.min(10 * 60_000, Math.max(5 * 60_000, cadenceMs / 6));
   const fallbackReady = Boolean(selectYoloMergeCandidate(state, baseCommit, true));
-  const downstreamReserveMs = fallbackReady
-    ? authorCycleReserveMs * 2
-    : Math.min(30 * 60_000, Math.max(10 * 60_000, cadenceMs / 2));
+  // If there is nothing mergeable, idling cannot preserve the cadence: it
+  // only guarantees that the next candidate starts even later. Keep making
+  // forward progress and let recordCadenceBreach open a recovery window if
+  // this author actually crosses the deadline. Headroom remains strict when
+  // an independently validated fallback is available to merge instead.
+  if (!fallbackReady) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
+  const downstreamReserveMs = authorCycleReserveMs * 2;
   // Starting an author consumes time before the candidate reaches the review
   // guard. Reserve both phases up front so Burner never starts work that its
   // own cadence policy is already destined to quarantine.
@@ -2194,7 +2198,6 @@ export class Orchestrator {
         if (await this.autoMergeNext()) return;
         if (await this.autoCookNext()) return;
       }
-      if (this.cadenceCompositeTailExhausted(this.store.get())) return;
       if (await this.shouldDrainForPortfolio()) return;
       const settings = initial.settings;
       const evaluationDue =
