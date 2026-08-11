@@ -897,8 +897,13 @@ export class Orchestrator {
           ? evaluatedCandidates.find(({ reusableCommandCount }) => reusableCommandCount === fullCommandCount)?.leaf
           : undefined;
         const recoverableCandidate = cachedCandidate ?? promptRecoveryCandidate;
-        if (!recoverableCandidate?.prNumber || recoverableCandidate.impact === undefined) return false;
-        candidate = { kind: "agent", id: recoverableCandidate.id, prNumber: recoverableCandidate.prNumber, impact: recoverableCandidate.impact };
+        if (recoverableCandidate?.prNumber && recoverableCandidate.impact !== undefined) {
+          candidate = { kind: "agent", id: recoverableCandidate.id, prNumber: recoverableCandidate.prNumber, impact: recoverableCandidate.impact };
+        }
+        // With no cheaper validated alternative, idling until the cadence
+        // clock resets only makes the inevitable miss larger. Continue with
+        // the best selected leaf; recordCadenceBreach will preserve urgency
+        // and open a recovery window if validation crosses the deadline.
       }
       const candidateId = candidate.id;
       if (!(await this.fullyValidateLeafForMerge(candidateId, baseCommit))) return false;
@@ -2194,9 +2199,13 @@ export class Orchestrator {
       if (!initial.orchestrator.enabled && !force) return;
       if (await this.terminateIfStalled()) return;
       if (this.portfolioMode()) await this.recordCadenceBreach();
-      if (this.yolo && this.runningEvaluations === 0 && this.activeAgents.size === 0 && this.activeComposites.size === 0) {
-        if (await this.autoMergeNext()) return;
-        if (await this.autoCookNext()) return;
+      if (this.yolo && this.runningEvaluations === 0 && this.activeComposites.size === 0) {
+        if (this.activeAgents.size === 0 && await this.autoMergeNext()) return;
+        // Once a full leaf batch is ready, use a free parallelism slot to
+        // integrate it while an unrelated author drains. Waiting for every
+        // author to finish can consume the entire composite-validation tail
+        // and force a direct-leaf fallback even though capacity was idle.
+        if (this.activeAgents.size < initial.settings.parallelism && await this.autoCookNext()) return;
       }
       if (await this.shouldDrainForPortfolio()) return;
       const settings = initial.settings;

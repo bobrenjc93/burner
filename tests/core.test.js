@@ -1900,6 +1900,34 @@ test("YOLO rechecks merge urgency after planning before dispatching an author", 
   }
 });
 
+test("YOLO cooks a ready leaf batch in a free slot while an unrelated author drains", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-concurrent-cook-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.settings.parallelism = 2;
+      state.orchestrator.enabled = true;
+      state.orchestrator.lastEvaluationAt = timestamp;
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.activeAgents.add("draining-author");
+    orchestrator.syncPullRequests = async () => {};
+    orchestrator.recordCadenceBreach = async () => {};
+    let mergeChecks = 0;
+    let cookChecks = 0;
+    orchestrator.autoMergeNext = async () => { mergeChecks += 1; return false; };
+    orchestrator.autoCookNext = async () => { cookChecks += 1; return true; };
+
+    await orchestrator.tick(false);
+    assert.equal(mergeChecks, 0, "main must not merge while an author still depends on the current base");
+    assert.equal(cookChecks, 1, "the free slot must integrate the ready batch before its validation margin expires");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a missed merge cadence opens a bounded recovery window without losing urgency", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-yolo-cadence-recovery-test-"));
   try {
@@ -2443,7 +2471,7 @@ test("cadence fallback skips an unchanged rejected leaf and validates the next c
   }
 });
 
-test("late cadence tail permits prompt-only recovery after exact-head full commands complete", async () => {
+test("late cadence tail keeps the only merge path moving and prefers reusable full commands", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-late-leaf-validation-test-"));
   try {
     const store = new StateStore(root);
@@ -2470,8 +2498,9 @@ test("late cadence tail permits prompt-only recovery after exact-head full comma
     orchestrator.fullyValidateLeafForMerge = async () => { validated += 1; return true; };
     orchestrator.mergeAgent = async (id) => { merged = id; return {}; };
 
-    assert.equal(await orchestrator.autoMergeNext(), false);
-    assert.equal(validated, 0, "an uncached full suite must not begin inside the reserved tail");
+    assert.equal(await orchestrator.autoMergeNext(), true);
+    assert.equal(validated, 1, "idling cannot preserve cadence when no cheaper validated fallback exists");
+    assert.equal(merged, "leaf");
 
     await store.update((state) => {
       state.evaluations.push({ id: "bench", name: "Benchmark", prompt: "Measure", command: "full", screeningCommand: "quick", definitionVersion: "v1", weight: 1, enabled: true, createdAt: timestamp });
@@ -2481,6 +2510,8 @@ test("late cadence tail permits prompt-only recovery after exact-head full comma
         durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf", evaluationDefinitionVersion: "v1",
       });
     });
+    validated = 0;
+    merged = undefined;
     assert.equal(await orchestrator.autoMergeNext(), true);
     assert.equal(validated, 1);
     assert.equal(merged, "leaf");
