@@ -251,6 +251,7 @@ export function compositeRevisionHeadroom(
 export function portfolioMergeTailHeadroom(
   state: BurnerState,
   currentTimeMs = Date.now(),
+  phase: "admission" | "evaluation" = "admission",
 ): { allowed: boolean; remainingMs: number; requiredMs: number } {
   const anchor = state.orchestrator.mergeWindowStartedAt;
   if (!anchor) return { allowed: true, remainingMs: Infinity, requiredMs: 0 };
@@ -289,12 +290,20 @@ export function portfolioMergeTailHeadroom(
   // Full validation is followed by README graph stamping and the stamped-head
   // CI/merge gate. Compare that measured tail with the conservative static
   // revision reserve and use whichever is larger.
-  const observedTailMs = commandMs + promptMs + 10 * 60_000;
+  // Command evaluations may serialize behind shared-resource locks, while
+  // prompt evaluations run alongside that command lane. Reserve the slower
+  // lane instead of adding two wall-clock intervals that overlap in practice.
+  const observedTailMs = Math.max(commandMs, promptMs) + 10 * 60_000;
   const staticReserveMs = compositeRevisionHeadroom(anchor, state.settings.mergeCadenceMinutes, currentTimeMs).reserveMs;
   // Integration/review and host variance must not consume a razor-thin
   // forecast surplus. In particular, do not admit a composite with seconds of
   // nominal headroom when the observed tail itself lasts tens of minutes.
-  const forecastMarginMs = Math.min(5 * 60_000, Math.max(2 * 60_000, cadenceMs / 12));
+  // Admission needs enough surplus for integration and independent review.
+  // Once those phases have completed, that margin has been consumed and the
+  // pre-evaluation check should reserve only the still-unrun validation tail.
+  const forecastMarginMs = phase === "admission"
+    ? Math.min(5 * 60_000, Math.max(2 * 60_000, cadenceMs / 12))
+    : 0;
   const requiredMs = Math.min(Math.max(staticReserveMs, observedTailMs) + forecastMarginMs, Math.max(0, cadenceMs - 5 * 60_000));
   return { allowed: remainingMs > requiredMs, remainingMs, requiredMs };
 }
@@ -655,7 +664,7 @@ export class Orchestrator {
 
   private assertCompositeEvaluationHeadroom(state = this.store.get()): void {
     if (!this.portfolioMode()) return;
-    const headroom = portfolioMergeTailHeadroom(state);
+    const headroom = portfolioMergeTailHeadroom(state, Date.now(), "evaluation");
     if (headroom.allowed) return;
     throw new Error(
       `Composite stopped before full evaluation: ${Math.max(0, headroom.remainingMs / 60_000).toFixed(1)} minutes remain, ` +

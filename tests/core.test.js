@@ -455,14 +455,19 @@ test("composite admission uses the observed full validation tail", async () => {
     assert.deepEqual(portfolioMergeTailHeadroom(store.get(), currentTime), {
       allowed: false,
       remainingMs: 25 * 60_000,
-      requiredMs: 40 * 60_000,
+      requiredMs: 38 * 60_000,
     });
+    assert.deepEqual(portfolioMergeTailHeadroom(store.get(), currentTime, "evaluation"), {
+      allowed: false,
+      remainingMs: 25 * 60_000,
+      requiredMs: 33 * 60_000,
+    }, "integration margin is consumed before the full-evaluation recheck");
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
     assert.equal(orchestrator.cadenceCompositeTailExhausted(store.get()), true,
       "Burner must not begin a composite whose observed validation tail cannot meet cadence");
     assert.throws(() => orchestrator.assertCompositeEvaluationHeadroom(store.get()),
-      /stopped before full evaluation.*25\.0 minutes remain.*40 minutes/i,
-      "headroom must be rechecked after integration and review consume the admission margin");
+      /stopped before full evaluation.*25\.0 minutes remain.*33 minutes/i,
+      "headroom must be rechecked against only the still-unrun tail after integration and review");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
