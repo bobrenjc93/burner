@@ -860,6 +860,7 @@ export class Orchestrator {
       this.cadenceCompositeTailExhausted(state) ||
       ((cadenceDue || cookDue) && selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize, 2).length === 0);
     let candidate = selectYoloMergeCandidate(state, baseCommit, this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf);
+    let candidateNeedsFullLeafValidation = false;
     if (!candidate && (this.yoloBatchSize === 1 || cadenceNeedsSingleLeaf)) {
       const evaluationFingerprint = fullMergeValidationFingerprint(state);
       for (const leaf of eligibleYoloLeaves(state, baseCommit)) {
@@ -867,6 +868,7 @@ export class Orchestrator {
         if (cachedFullMergeValidationResult(leaf, baseCommit, candidateCommit, evaluationFingerprint, currentlyQualifiesForYoloMerge(state, leaf)) === false) continue;
         if (leaf.prNumber !== undefined && leaf.impact !== undefined) {
           candidate = { kind: "agent", id: leaf.id, prNumber: leaf.prNumber, impact: leaf.impact };
+          candidateNeedsFullLeafValidation = true;
           break;
         }
       }
@@ -876,8 +878,13 @@ export class Orchestrator {
     const retryAfter = this.mergeRetryAfter.get(retryKey) ?? 0;
     if (retryAfter > Date.now()) return false;
     this.mergeRetryAfter.delete(retryKey);
-    if (candidate.kind === "agent" && this.portfolioMode()) {
-      if (this.cadenceLeafValidationTailExhausted(state)) {
+    // The fallback pool intentionally admits leaves that have complete
+    // measurements but do not yet satisfy the strict prompt/impact gate so a
+    // fresh median can rehabilitate noisy scores. Never let that relaxed
+    // admission become a merge decision, including in direct single-leaf
+    // mode: exact-head full validation must make the final decision.
+    if (candidate.kind === "agent" && (this.portfolioMode() || candidateNeedsFullLeafValidation)) {
+      if (this.portfolioMode() && this.cadenceLeafValidationTailExhausted(state)) {
         const evaluationFingerprint = fullMergeValidationFingerprint(state);
         const fullCommandCount = state.evaluations.filter((evaluation) => evaluation.enabled && evaluation.command).length;
         const evaluatedCandidates = await Promise.all(eligibleYoloLeaves(state, baseCommit).map(async (leaf) => {

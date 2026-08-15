@@ -2171,6 +2171,37 @@ test("hard direct-leaf merge-gate failures quarantine the leaf instead of retryi
   }
 });
 
+test("direct YOLO fully validates relaxed fallback leaves before merge", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-direct-leaf-validation-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp };
+    await store.update((state) => {
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.agentRuns.push({
+        id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp,
+        prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base",
+        deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 79, delta: -1 }], impact: -1,
+        resources: [], reviewRounds: [approvedRound], reviewApproved: true,
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 1 });
+    orchestrator.git = { resolveRef: async (ref) => ref === "main" ? "base" : "candidate" };
+    let validated;
+    let merged = false;
+    orchestrator.fullyValidateLeafForMerge = async (id) => { validated = id; return false; };
+    orchestrator.mergeAgent = async () => { merged = true; return {}; };
+
+    assert.equal(await orchestrator.autoMergeNext(), false);
+    assert.equal(validated, "leaf");
+    assert.equal(merged, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("cadence-driven single leaves receive full evaluation validation before merge", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-full-leaf-validation-test-"));
   try {
