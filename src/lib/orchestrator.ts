@@ -229,7 +229,7 @@ export function shouldRefillIdeaQueue(
   activeComposites: number,
 ): boolean {
   return portfolioMode
-    ? queuedIdeas === 0 && activeAgents === 0 && activeComposites === 0
+    ? queuedIdeas === 0 && activeComposites === 0 && activeAgents < parallelism
     : queuedIdeas < parallelism * 2;
 }
 

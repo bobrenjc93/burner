@@ -415,9 +415,10 @@ test("benchmark-oriented ideas conservatively infer the shared CPU resource", ()
   assert.deepEqual(inferIdeaResources({ title: "Improve SQL docs", description: "Add examples", rationale: "Clarity" }), []);
 });
 
-test("portfolio planning preserves the current generation until its queue and active work drain", () => {
+test("portfolio planning refills genuinely idle author slots without disrupting active work", () => {
   assert.equal(shouldRefillIdeaQueue(true, 1, 1, 0, 0), false, "an existing queued leaf must not be displaced by replanning");
-  assert.equal(shouldRefillIdeaQueue(true, 0, 1, 1, 0), false, "an in-flight final leaf must finish before replenishment");
+  assert.equal(shouldRefillIdeaQueue(true, 0, 1, 1, 0), false, "a full author pool must not be replenished");
+  assert.equal(shouldRefillIdeaQueue(true, 0, 3, 1, 0), true, "an under-filled author pool should replenish while healthy work continues");
   assert.equal(shouldRefillIdeaQueue(true, 0, 1, 0, 1), false, "a composite generation must finish before replenishment");
   assert.equal(shouldRefillIdeaQueue(true, 0, 1, 0, 0), true, "an idle empty portfolio may refill");
   assert.equal(shouldRefillIdeaQueue(false, 1, 1, 1, 0), true, "non-portfolio mode retains its queue watermark behavior");
