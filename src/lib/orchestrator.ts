@@ -1932,7 +1932,12 @@ export class Orchestrator {
       if (await this.git.hasChanges(worktree)) {
         changed = true;
         await this.git.commit(worktree, `burner: record evaluation progress for PR #${prNumber}`);
-        await this.git.push(worktree, state.settings.remote, candidate.branch);
+        // Composite PR branches are Burner-owned and may have been rewritten
+        // while acting as a living experiment base. Publish the exact validated
+        // head with a lease so stale or accidental remote advances cannot block
+        // the final merge stamp. Leaf branches remain fail-closed on divergence.
+        if (kind === "composite") await this.git.forcePush(worktree, state.settings.remote, candidate.branch);
+        else await this.git.push(worktree, state.settings.remote, candidate.branch);
       }
       expectedHead = await this.git.head(worktree);
     } finally {

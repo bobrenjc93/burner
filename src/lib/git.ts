@@ -121,7 +121,10 @@ export class GitService {
     const worktreesDir = join(this.dataDir, "worktrees");
     const path = join(worktreesDir, runId);
     await this.prepareWorktreePath(path, worktreesDir);
-    const result = await runCommand("git", ["worktree", "add", "-b", branch, path, baseBranch], { cwd: this.root });
+    // Agent branches may start from a remote-tracking living composite. Do not
+    // inherit that ref as their upstream: an agent-side plain `git push` would
+    // otherwise update the shared composite PR branch instead of its own branch.
+    const result = await runCommand("git", ["worktree", "add", "--no-track", "-b", branch, path, baseBranch], { cwd: this.root });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not create worktree");
     return path;
   }
@@ -197,7 +200,15 @@ export class GitService {
   }
 
   async forcePush(cwd: string, remote: string, branch: string): Promise<void> {
-    const result = await runCommand("git", ["push", "--force-with-lease", "-u", remote, branch], { cwd, timeoutMs: 10 * 60 * 1000 });
+    const destination = `refs/heads/${branch}`;
+    const remoteHead = await runCommand("git", ["ls-remote", "--heads", remote, destination], { cwd, timeoutMs: 10 * 60 * 1000 });
+    if (remoteHead.exitCode !== 0) throw new Error(remoteHead.stderr.trim() || "Could not inspect composite branch before updating it");
+    const expected = remoteHead.stdout.trim().split(/\s+/)[0] ?? "";
+    const result = await runCommand(
+      "git",
+      ["push", `--force-with-lease=${destination}:${expected}`, "-u", remote, `${destination}:${destination}`],
+      { cwd, timeoutMs: 10 * 60 * 1000 },
+    );
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not update composite branch");
   }
 

@@ -1476,6 +1476,80 @@ test("git service assembles source branches into an actual composite worktree", 
   }
 });
 
+test("agent worktrees based on remote living branches do not inherit the composite upstream", async () => {
+  const outer = await mkdtemp(join(tmpdir(), "burner-agent-upstream-test-"));
+  const root = join(outer, "repo");
+  const remote = join(outer, "remote.git");
+  try {
+    await exec(outer, "git", ["init", "--bare", remote]);
+    await exec(outer, "git", ["init", "-b", "main", root]);
+    await writeFile(join(root, "base.txt"), "base\n");
+    await exec(root, "git", ["add", "."]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "base"]);
+    await exec(root, "git", ["remote", "add", "origin", remote]);
+    await exec(root, "git", ["push", "-u", "origin", "main"]);
+    await exec(root, "git", ["switch", "-c", "burner/living"]);
+    await writeFile(join(root, "living.txt"), "living\n");
+    await exec(root, "git", ["add", "."]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "living"]);
+    await exec(root, "git", ["push", "-u", "origin", "burner/living"]);
+    await exec(root, "git", ["switch", "main"]);
+    await exec(root, "git", ["branch", "-D", "burner/living"]);
+
+    const git = new GitService(root, join(root, ".burner"));
+    const worktree = await git.createWorktree("agent", "burner/agent", "origin/burner/living");
+    const branch = await runCommand("git", ["branch", "--show-current"], { cwd: worktree });
+    const upstream = await runCommand("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], { cwd: worktree });
+    assert.equal(branch.stdout.trim(), "burner/agent");
+    assert.notEqual(upstream.exitCode, 0, "a living-line agent must not push to the composite branch through an inherited upstream");
+    await git.removeWorktree(worktree);
+  } finally {
+    await rm(outer, { recursive: true, force: true });
+  }
+});
+
+test("force-pushing a Burner-owned branch refreshes its lease before replacing a remote advance", async () => {
+  const outer = await mkdtemp(join(tmpdir(), "burner-owned-push-test-"));
+  const root = join(outer, "repo");
+  const remote = join(outer, "remote.git");
+  const other = join(outer, "other");
+  try {
+    await exec(outer, "git", ["init", "--bare", remote]);
+    await exec(outer, "git", ["init", "-b", "main", root]);
+    await writeFile(join(root, "base.txt"), "base\n");
+    await exec(root, "git", ["add", "."]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "base"]);
+    await exec(root, "git", ["remote", "add", "origin", remote]);
+    await exec(root, "git", ["push", "-u", "origin", "main"]);
+    await exec(root, "git", ["switch", "-c", "burner/composite"]);
+    await writeFile(join(root, "composite.txt"), "initial\n");
+    await exec(root, "git", ["add", "."]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "initial composite"]);
+    await exec(root, "git", ["push", "-u", "origin", "burner/composite"]);
+    await exec(root, "git", ["switch", "main"]);
+
+    const git = new GitService(root, join(root, ".burner"));
+    const worktree = await git.createExistingWorktree("owned", "burner/composite");
+    await writeFile(join(worktree, "local.txt"), "validated\n");
+    await git.commit(worktree, "validated composite");
+    const validatedHead = await git.head(worktree);
+
+    await exec(outer, "git", ["clone", remote, other]);
+    await exec(other, "git", ["switch", "burner/composite"]);
+    await writeFile(join(other, "remote.txt"), "unexpected\n");
+    await exec(other, "git", ["add", "."]);
+    await exec(other, "git", ["-c", "user.name=Other", "-c", "user.email=other@localhost", "commit", "-m", "unexpected remote advance"]);
+    await exec(other, "git", ["push", "origin", "burner/composite"]);
+
+    await git.forcePush(worktree, "origin", "burner/composite");
+    const remoteHead = await runCommand("git", ["ls-remote", "--heads", "origin", "refs/heads/burner/composite"], { cwd: root });
+    assert.equal(remoteHead.stdout.trim().split(/\s+/)[0], validatedHead);
+    await git.removeWorktree(worktree);
+  } finally {
+    await rm(outer, { recursive: true, force: true });
+  }
+});
+
 test("GitHub PR disposition labels are mutually exclusive and initialized once", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-label-test-"));
   const bin = join(root, "bin");
@@ -1605,6 +1679,41 @@ test("leaf and composite merges poll the exact post-stamp candidate head", async
       [root, 42, "composite-post-stamp-head"],
       [root, 43, "agent-post-stamp-head"],
     ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("composite progress stamping lease-updates the Burner-owned PR branch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-composite-progress-push-test-"));
+  try {
+    await writeFile(join(root, "README.md"), "# Demo\n");
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.evaluationRuns = [{ id: "baseline", evaluationId: "quality", score: 80, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" }];
+      state.composites.push({
+        id: "composite", title: "Combined", description: "Combined work", status: "open", branch: "burner/composite", worktree: "",
+        baseCommit: "base", sources: [], deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 81, delta: 1 }],
+        reviewRounds: [], reviewApproved: true, prNumber: 42, prUrl: "https://example.test/pull/42", createdAt: timestamp, updatedAt: timestamp,
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    const pushes = [];
+    orchestrator.git = {
+      resolveRef: async () => "base",
+      createExistingWorktree: async () => root,
+      hasChanges: async () => true,
+      commit: async () => "stamped-head",
+      forcePush: async (_cwd, _remote, branch) => pushes.push(["force", branch]),
+      push: async (_cwd, _remote, branch) => pushes.push(["plain", branch]),
+      head: async () => "stamped-head",
+      removeWorktree: async () => undefined,
+    };
+    assert.equal(await orchestrator.stampProgressBeforeMerge("composite", "composite"), "stamped-head");
+    assert.deepEqual(pushes, [["force", "burner/composite"]]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
