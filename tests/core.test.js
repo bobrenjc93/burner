@@ -3194,7 +3194,7 @@ test("candidate prompt retries do not wait for the long command lane", async () 
   }
 });
 
-test("every Codex role and structured fallback uses unrestricted mode with correct flag placement", async () => {
+test("every Codex role and structured fallback uses unrestricted mode without automation hooks", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-codex-test-"));
   const bin = join(root, "bin");
   await import("node:fs/promises").then((fs) => fs.mkdir(bin));
@@ -3223,6 +3223,7 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     for (const { args } of calls) {
       assert.equal(args[0], "--dangerously-bypass-approvals-and-sandbox");
       assert.equal(args[1], "exec");
+      if (!args.includes("--help")) assert.deepEqual(args.slice(2, 4), ["--disable", "hooks"]);
       assert.ok(!args.includes("--sandbox"));
       assert.ok(!args.includes("-s"));
       assert.ok(!args.includes("--ask-for-approval"));
@@ -3260,6 +3261,8 @@ test("every Codex role and structured fallback uses unrestricted mode with corre
     assert.ok(reviewerCalls[0].args.includes("--output-schema"));
     assert.ok(!reviewerCalls[1].args.includes("--output-schema"));
     assert.ok(calls.some(({ args }) => args.includes("resume") && args.includes("thread-test")));
+    const resumeCall = calls.find(({ args }) => args.includes("resume") && args.includes("thread-test"));
+    assert.deepEqual(resumeCall.args.slice(1, 5), ["exec", "--disable", "hooks", "resume"]);
   } finally {
     process.env.PATH = previousPath;
     delete process.env.BURNER_TEST_ARGS;

@@ -7,6 +7,7 @@ import { clampScore, errorMessage, parseJsonObject, truncateText } from "./utils
 
 const UNRESTRICTED_FLAG = "--dangerously-bypass-approvals-and-sandbox";
 const META_DISABLE_SANDBOX_FLAG = "--dangerously-disable-osx-sandbox";
+const AUTOMATION_HOOK_ARGS = ["--disable", "hooks"];
 export const DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS = 4 * 60 * 1000;
 const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation progress artifacts: the managed README section, docs/burner-evaluation-history.json, and docs/burner-evaluation-progress.svg. Burner injects them only after final candidate scores are known. Do not create or modify those artifacts, and do not add repository-side progress generators, validators, tests, or workflows.";
 type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
@@ -452,7 +453,10 @@ export class CodexClient {
 
   private async runCodex(args: string[], options: CodexCommandOptions): Promise<CommandResult> {
     const unrestrictedArgs = await this.unrestrictedArgs(options.cwd);
-    const result = await runCommand("codex", [...unrestrictedArgs, ...args], { ...options, signal: this.abortController.signal });
+    const automationArgs = args[0] === "exec"
+      ? [args[0], ...AUTOMATION_HOOK_ARGS, ...args.slice(1)]
+      : args;
+    const result = await runCommand("codex", [...unrestrictedArgs, ...automationArgs], { ...options, signal: this.abortController.signal });
     await this.afterInvocation?.();
     return result;
   }
