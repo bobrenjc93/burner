@@ -1556,7 +1556,7 @@ test("GitHub PR disposition labels are mutually exclusive and initialized once",
   const argsLog = join(root, "gh-args.jsonl");
   await import("node:fs/promises").then((fs) => fs.mkdir(bin));
   const executable = join(bin, "gh");
-  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");fs.appendFileSync(process.env.BURNER_TEST_GH_ARGS,JSON.stringify(process.argv.slice(2))+"\\n");\n`);
+  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");const args=process.argv.slice(2);fs.appendFileSync(process.env.BURNER_TEST_GH_ARGS,JSON.stringify(args)+"\\n");if(args[0]==="pr"&&args[1]==="view")console.log(JSON.stringify({state:"CLOSED"}));\n`);
   await chmod(executable, 0o755);
   const previousPath = process.env.PATH;
   process.env.PATH = `${bin}:${previousPath}`;
@@ -1566,12 +1566,14 @@ test("GitHub PR disposition labels are mutually exclusive and initialized once",
     await git.openPr({ cwd: root, base: "main", branch: "composite", title: "Composite", body: "Draft", draft: true });
     await git.markPrReady(root, 42);
     await git.markPrDraft(root, 42);
+    await git.reopenPr(root, 42);
     await git.markPrDisposition(root, 42, "unmerged");
     await git.markPrDisposition(root, 42, "merged");
     const calls = (await readFile(argsLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.ok(calls.some((args) => args[0] === "pr" && args[1] === "create" && args.includes("--draft")));
     assert.ok(calls.some((args) => args[0] === "pr" && args[1] === "ready"));
     assert.ok(calls.some((args) => args[0] === "pr" && args[1] === "ready" && args.includes("--undo")));
+    assert.ok(calls.some((args) => args[0] === "pr" && args[1] === "reopen"));
     assert.equal(calls.filter((args) => args[0] === "label" && args[1] === "create").length, 3);
     assert.deepEqual(calls.at(-2), ["pr", "edit", "42", "--add-label", "burner-unmerged", "--remove-label", "burner-merged"]);
     assert.deepEqual(calls.at(-1), ["pr", "edit", "42", "--add-label", "burner-merged", "--remove-label", "burner-unmerged", "--remove-label", "burner-quarantined"]);
@@ -2199,7 +2201,8 @@ test("hard composite merge-gate failures retire the unchanged head instead of re
       state.orchestrator.livingCompositeId = "composite";
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
-    orchestrator.git = { resolveRef: async () => "base" };
+    const closed = [];
+    orchestrator.git = { resolveRef: async () => "base", closePr: async (_cwd, number) => closed.push(number) };
     let attempts = 0;
     orchestrator.mergeComposite = async () => { attempts += 1; throw new Error("required check failed at stamped-head"); };
 
@@ -2209,6 +2212,7 @@ test("hard composite merge-gate failures retire the unchanged head instead of re
     assert.equal(store.get().orchestrator.livingCompositeId, undefined);
     assert.match(store.get().composites[0].error, /required check failed/);
     assert.equal(store.get().activity.filter((item) => item.message === "Merge gate blocked PR #234").length, 1);
+    assert.deepEqual(closed, [234]);
     assert.equal(await orchestrator.autoMergeNext(), false);
     assert.equal(attempts, 1, "the same failed head must not be retried automatically");
   } finally {
@@ -2925,10 +2929,65 @@ test("retrying a failed composite preserves its cumulative review history", asyn
       prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: false,
     }));
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    const reopened = [];
+    orchestrator.git = { reopenPr: async (_cwd, number) => reopened.push(number) };
     orchestrator.scheduleComposites = async () => undefined;
     await orchestrator.retryComposite("failed");
+    assert.deepEqual(reopened, [10]);
     assert.equal(store.get().composites[0].status, "rebuilding");
     assert.equal(store.get().composites[0].reviewRounds.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PR synchronization retires untracked Burner PRs and failed composites", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-orphan-pr-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const run = (id, number) => ({
+      id, ideaId: `idea-${id}`, status: "completed", branch: `burner/${id}`, worktree: "", startedAt: timestamp,
+      completedAt: timestamp, prNumber: number, prState: "open", deltas: [], resources: [], reviewRounds: [], reviewApproved: true,
+    });
+    await store.update((state) => {
+      state.agentRuns.push(run("a", 1), run("b", 2));
+      state.composites.push({
+        id: "failed", title: "Interrupted composite", description: "Combined", status: "failed", branch: "burner/composite-failed", worktree: "",
+        sources: [
+          { agentRunId: "a", prNumber: 1, title: "A", branch: "burner/a", kind: "pull_request" },
+          { agentRunId: "b", prNumber: 2, title: "B", branch: "burner/b", kind: "pull_request" },
+        ],
+        deltas: [], reviewRounds: [],
+        error: "Burner stopped before this composite run completed.", createdAt: timestamp, updatedAt: timestamp, isLiving: false,
+      });
+    });
+    const closed = [];
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = {
+      remoteExists: async () => true,
+      listPullRequests: async () => [
+        { number: 1, state: "OPEN", headRefName: "burner/a", url: "", labels: [{ name: "burner-unmerged" }] },
+        { number: 2, state: "OPEN", headRefName: "burner/b", url: "", labels: [{ name: "burner-unmerged" }] },
+        { number: 100, state: "OPEN", headRefName: "burner/composite-failed", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
+        { number: 200, state: "OPEN", headRefName: "burner/composite-orphan", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
+        { number: 201, state: "OPEN", headRefName: "burner/orphan-leaf", url: "", labels: [{ name: "burner-unmerged" }] },
+        { number: 202, state: "OPEN", headRefName: "feature/manual", url: "", labels: [{ name: "burner-unmerged" }] },
+        { number: 203, state: "OPEN", headRefName: "burner/manual", url: "", labels: [] },
+      ],
+      closePr: async (_cwd, number, comment) => closed.push([number, comment]),
+      markPrDisposition: async () => undefined,
+    };
+
+    await orchestrator.syncPullRequests(true);
+
+    assert.deepEqual(closed.map(([number]) => number), [200, 201, 100]);
+    assert.match(closed.find(([number]) => number === 200)[1], /no longer represented/);
+    assert.match(closed.find(([number]) => number === 100)[1], /failed composite/);
+    assert.equal(store.get().composites[0].prNumber, 100, "an interrupted publication must be recovered by its exact branch before cleanup");
+    assert.equal(store.get().composites[0].status, "failed", "retirement must preserve explicit retry state");
+    assert.equal(store.get().agentRuns.every((item) => item.prState === "open"), true, "tracked source leaves remain available for fallback");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

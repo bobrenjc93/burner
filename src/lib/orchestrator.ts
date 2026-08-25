@@ -4,6 +4,7 @@ import type { AgentRun, BurnerState, CompositePr, CompositeSource, Evaluation, E
 import { CodexClient, type ReviewResult, type SessionResult } from "./codex.js";
 import { EventHub } from "./events.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, isTransientGitHubFailure } from "./git.js";
+import type { PullRequestSummary } from "./git.js";
 import type { HeldLock } from "./locks.js";
 import { LockManager } from "./locks.js";
 import { commandExists, runCommand } from "./process.js";
@@ -114,6 +115,12 @@ function reservedCompositeSourceIds(state: BurnerState): Set<string> {
   return new Set(state.composites
     .filter((composite) => ["queued", "building", "reviewing", "revising", "evaluating", "rebuilding", "open"].includes(composite.status))
     .flatMap((composite) => composite.sources.map((source) => source.agentRunId)));
+}
+
+function isManagedBurnerPullRequest(pr: PullRequestSummary): boolean {
+  return pr.state === "OPEN" &&
+    pr.headRefName.startsWith("burner/") &&
+    pr.labels?.some((label) => label.name === "burner-unmerged") === true;
 }
 
 function eligibleYoloLeaves(state: BurnerState, baseCommit: string): AgentRun[] {
@@ -466,6 +473,7 @@ export class Orchestrator {
   private protectedParentRepository?: { root: string; excludedTarget: string; snapshot: string };
   private boundaryTripped = false;
   private readonly mergeRetryAfter = new Map<string, number>();
+  private readonly retryingCompositeIds = new Set<string>();
   private agentDispatchHoldWindow?: string;
 
   private async isIndependentUntrackedRepository(root: string, path: string): Promise<boolean> {
@@ -970,6 +978,13 @@ export class Orchestrator {
         quarantineReason: `Merge gate rejected PR #${candidate.prNumber}: ${message}`,
       });
     });
+    if (candidate.kind === "composite") {
+      try {
+        await this.git.closePr(this.root, candidate.prNumber, `Burner retired this composite after its merge gate failed. The source leaves remain available for an independently validated fallback. Failure: ${message}`.slice(0, 2_000));
+      } catch (closeError) {
+        await this.store.addActivity({ type: "error", message: `Could not retire failed composite PR #${candidate.prNumber}`, detail: errorMessage(closeError) });
+      }
+    }
     await this.store.addActivity({
       type: "error",
       message: `Merge gate blocked PR #${candidate.prNumber}`,
@@ -1953,17 +1968,25 @@ export class Orchestrator {
   }
 
   async retryComposite(compositeId: string): Promise<void> {
+    const candidate = this.store.get().composites.find((item) => item.id === compositeId);
+    if (!candidate || candidate.status !== "failed") throw new Error("Only a failed composite can be retried.");
+    this.retryingCompositeIds.add(compositeId);
     let found = false;
-    await this.store.update((state) => {
-      const composite = state.composites.find((item) => item.id === compositeId);
-      if (composite && composite.status === "failed") {
-        composite.status = composite.prNumber ? "rebuilding" : "queued";
-        composite.error = undefined;
-        composite.reviewApproved = false;
-        composite.updatedAt = now();
-        found = true;
-      }
-    });
+    try {
+      if (candidate.prNumber) await this.git.reopenPr(this.root, candidate.prNumber);
+      await this.store.update((state) => {
+        const composite = state.composites.find((item) => item.id === compositeId);
+        if (composite && composite.status === "failed") {
+          composite.status = composite.prNumber ? "rebuilding" : "queued";
+          composite.error = undefined;
+          composite.reviewApproved = false;
+          composite.updatedAt = now();
+          found = true;
+        }
+      });
+    } finally {
+      this.retryingCompositeIds.delete(compositeId);
+    }
     if (!found) throw new Error("Only a failed composite can be retried.");
     void this.scheduleComposites(true);
   }
@@ -1971,7 +1994,7 @@ export class Orchestrator {
   async syncPullRequests(force = false): Promise<void> {
     if (!force && Date.now() - this.lastPrSyncAt < 20_000) return;
     this.lastPrSyncAt = Date.now();
-    const state = this.store.get();
+    let state = this.store.get();
     if (!(await this.git.remoteExists(state.settings.remote)) || !(await commandExists("gh", this.root))) return;
     let pullRequests: Awaited<ReturnType<GitService["listPullRequests"]>>;
     try {
@@ -1980,7 +2003,91 @@ export class Orchestrator {
       if (force) throw error;
       return;
     }
+    const openByBranch = new Map(pullRequests.filter((pr) => pr.state === "OPEN").map((pr) => [pr.headRefName, pr]));
+    const recoverableAgentPrs = state.agentRuns.flatMap((run) => {
+      const pr = run.prNumber === undefined ? openByBranch.get(run.branch) : undefined;
+      return pr ? [{ runId: run.id, pr }] : [];
+    });
+    const recoverableCompositePrs = state.composites.flatMap((composite) => {
+      const pr = composite.prNumber === undefined ? openByBranch.get(composite.branch) : undefined;
+      return pr ? [{ compositeId: composite.id, pr }] : [];
+    });
+    if (recoverableAgentPrs.length || recoverableCompositePrs.length) {
+      await this.store.update((draft) => {
+        for (const recovery of recoverableAgentPrs) {
+          const run = draft.agentRuns.find((item) => item.id === recovery.runId);
+          if (run && run.prNumber === undefined) Object.assign(run, { prNumber: recovery.pr.number, prUrl: recovery.pr.url, prState: "open" });
+        }
+        for (const recovery of recoverableCompositePrs) {
+          const composite = draft.composites.find((item) => item.id === recovery.compositeId);
+          if (composite && composite.prNumber === undefined) Object.assign(composite, { prNumber: recovery.pr.number, prUrl: recovery.pr.url });
+        }
+      });
+      state = this.store.get();
+      await this.store.addActivity({
+        type: "pr",
+        message: `${recoverableAgentPrs.length + recoverableCompositePrs.length} interrupted PR publication${recoverableAgentPrs.length + recoverableCompositePrs.length === 1 ? "" : "s"} recovered`,
+        detail: "Burner matched open GitHub PR branches back to local runs before orphan cleanup.",
+      });
+    }
+    const trackedPrNumbers = new Set([
+      ...state.agentRuns.flatMap((run) => run.prNumber === undefined ? [] : [run.prNumber]),
+      ...state.composites.flatMap((composite) => composite.prNumber === undefined ? [] : [composite.prNumber]),
+    ]);
+    const orphanedPullRequests = pullRequests
+      .filter((pr) => isManagedBurnerPullRequest(pr) && !trackedPrNumbers.has(pr.number))
+      .sort((left, right) => Number(!left.headRefName.startsWith("burner/composite-")) - Number(!right.headRefName.startsWith("burner/composite-")));
+    const orphanCleanupErrors: string[] = [];
+    let orphanedClosed = 0;
+    for (const pr of orphanedPullRequests) {
+      try {
+        await this.git.closePr(
+          this.root,
+          pr.number,
+          "Burner closed this orphaned PR because it is no longer represented in this repository's .burner state. Its review and evaluation provenance cannot be recovered safely; rerun the work from the current base.",
+        );
+        orphanedClosed += 1;
+      } catch (error) {
+        orphanCleanupErrors.push(`#${pr.number}: ${errorMessage(error)}`);
+      }
+    }
+    if (orphanedClosed) {
+      await this.store.addActivity({
+        type: "pr",
+        message: `${orphanedClosed} orphaned Burner PR${orphanedClosed === 1 ? "" : "s"} retired`,
+        detail: "Open burner-unmerged branches missing from .burner state were closed instead of being left without trustworthy review and evaluation provenance.",
+      });
+    }
+    if (orphanCleanupErrors.length) {
+      await this.store.addActivity({ type: "error", message: "Orphaned PR cleanup incomplete", detail: orphanCleanupErrors.join("; ").slice(0, 2_000) });
+    }
     const byNumber = new Map(pullRequests.map((pr) => [pr.number, pr]));
+    const failedOpenComposites = state.composites.filter((composite) =>
+      composite.status === "failed" &&
+      composite.prNumber !== undefined &&
+      byNumber.get(composite.prNumber)?.state === "OPEN" &&
+      !this.retryingCompositeIds.has(composite.id));
+    const failedCleanupErrors: string[] = [];
+    let failedCompositesClosed = 0;
+    for (const composite of failedOpenComposites) {
+      try {
+        const reason = composite.error ? ` Failure: ${composite.error}` : "";
+        await this.git.closePr(this.root, composite.prNumber!, `Burner retired this failed composite so its source leaves can be retried or merged independently.${reason}`.slice(0, 2_000));
+        failedCompositesClosed += 1;
+      } catch (error) {
+        failedCleanupErrors.push(`#${composite.prNumber}: ${errorMessage(error)}`);
+      }
+    }
+    if (failedCompositesClosed) {
+      await this.store.addActivity({
+        type: "pr",
+        message: `${failedCompositesClosed} failed composite PR${failedCompositesClosed === 1 ? "" : "s"} retired`,
+        detail: "Their source leaves remain available for a fresh batch or independently validated fallback.",
+      });
+    }
+    if (failedCleanupErrors.length) {
+      await this.store.addActivity({ type: "error", message: "Failed composite PR cleanup incomplete", detail: failedCleanupErrors.join("; ").slice(0, 2_000) });
+    }
     const newlyMergedCompositeIds: string[] = [];
     const newlyMergedAgentIds: string[] = [];
     const changedRunIds = new Set<string>();
@@ -2039,7 +2146,7 @@ export class Orchestrator {
             if (draft.orchestrator.livingCompositeId === composite.id) draft.orchestrator.livingCompositeId = undefined;
             dispositionUpdates.push({ number: composite.prNumber, disposition: "merged" });
           }
-        } else if (remote.state === "CLOSED" && composite.status !== "merged" && composite.status !== "closed") {
+        } else if (remote.state === "CLOSED" && composite.status !== "merged" && composite.status !== "closed" && composite.status !== "failed") {
           composite.status = "closed";
           composite.updatedAt = now();
           composite.isLiving = false;
@@ -2830,6 +2937,16 @@ export class Orchestrator {
       const baseMoved = message.startsWith("BASE_CHANGED:");
       const currentMode = this.store.get().composites.find((item) => item.id === compositeId)?.rebuildMode;
       await this.updateComposite(compositeId, { status: baseMoved ? "rebuilding" : "failed", rebuildMode: baseMoved ? "from_base" : currentMode, ...(baseMoved ? {} : { isLiving: false }), error: message.replace("BASE_CHANGED: ", ""), updatedAt: now() });
+      if (!baseMoved) {
+        const failed = this.store.get().composites.find((item) => item.id === compositeId);
+        if (failed?.prNumber) {
+          try {
+            await this.git.closePr(this.root, failed.prNumber, `Burner retired this failed composite so its source leaves can be retried or merged independently. Failure: ${message}`.slice(0, 2_000));
+          } catch (closeError) {
+            await this.store.addActivity({ type: "error", message: `Could not retire failed composite PR #${failed.prNumber}`, detail: errorMessage(closeError) });
+          }
+        }
+      }
       if (!baseMoved) await this.ensureLivingComposite();
       await this.store.addActivity({ type: baseMoved ? "system" : "error", message: baseMoved ? "Composite queued for a fresh base" : "Composite build failed", detail: message.replace("BASE_CHANGED: ", "") });
     } finally {

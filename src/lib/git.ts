@@ -5,6 +5,14 @@ import { runCommand } from "./process.js";
 
 export type PullRequestDisposition = "merged" | "unmerged";
 
+export type PullRequestSummary = {
+  number: number;
+  state: "OPEN" | "CLOSED" | "MERGED";
+  headRefName: string;
+  url: string;
+  labels?: Array<{ name: string }>;
+};
+
 export class TransientMergeGateError extends Error {
   constructor(message: string) {
     super(message);
@@ -277,6 +285,20 @@ export class GitService {
     await this.markPrDisposition(cwd, number, disposition).catch(() => undefined);
   }
 
+  async reopenPr(cwd: string, number: number): Promise<void> {
+    const current = await this.githubJson<{ state: "OPEN" | "CLOSED" | "MERGED" }>(
+      cwd,
+      ["pr", "view", String(number), "--json", "state"],
+      `inspect PR #${number} before retry`,
+    );
+    if (current.state === "MERGED") throw new Error(`Cannot retry merged PR #${number}.`);
+    if (current.state === "CLOSED") {
+      const result = await runCommand("gh", ["pr", "reopen", String(number)], { cwd, timeoutMs: 2 * 60 * 1000 });
+      if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not reopen PR #${number}`);
+    }
+    await this.markPrDisposition(cwd, number, "unmerged").catch(() => undefined);
+  }
+
   async mergePr(cwd: string, number: number, expectedHead: string): Promise<void> {
     if (!expectedHead.trim()) throw new Error(`Cannot merge PR #${number} without its exact pushed head commit.`);
     const mergeAttempts = this.mergePolling.mergeAttempts ?? 24;
@@ -431,10 +453,10 @@ export class GitService {
     this.dispositionLabelsReady = true;
   }
 
-  async listPullRequests(cwd = this.root): Promise<Array<{ number: number; state: "OPEN" | "CLOSED" | "MERGED"; headRefName: string; url: string }>> {
-    const result = await runCommand("gh", ["pr", "list", "--state", "all", "--limit", "1000", "--json", "number,state,headRefName,url"], { cwd, timeoutMs: 2 * 60 * 1000 });
+  async listPullRequests(cwd = this.root): Promise<PullRequestSummary[]> {
+    const result = await runCommand("gh", ["pr", "list", "--state", "all", "--limit", "1000", "--json", "number,state,headRefName,url,labels"], { cwd, timeoutMs: 2 * 60 * 1000 });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not synchronize pull requests");
-    return JSON.parse(result.stdout) as Array<{ number: number; state: "OPEN" | "CLOSED" | "MERGED"; headRefName: string; url: string }>;
+    return JSON.parse(result.stdout) as PullRequestSummary[];
   }
 
   async syncBase(remote: string, baseBranch: string): Promise<string> {
