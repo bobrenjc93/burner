@@ -473,6 +473,7 @@ export class Orchestrator {
   private protectedParentRepository?: { root: string; excludedTarget: string; snapshot: string };
   private boundaryTripped = false;
   private readonly mergeRetryAfter = new Map<string, number>();
+  private readonly retryingAgentIds = new Set<string>();
   private readonly retryingCompositeIds = new Set<string>();
   private agentDispatchHoldWindow?: string;
 
@@ -978,12 +979,23 @@ export class Orchestrator {
         quarantineReason: `Merge gate rejected PR #${candidate.prNumber}: ${message}`,
       });
     });
-    if (candidate.kind === "composite") {
-      try {
-        await this.git.closePr(this.root, candidate.prNumber, `Burner retired this composite after its merge gate failed. The source leaves remain available for an independently validated fallback. Failure: ${message}`.slice(0, 2_000));
-      } catch (closeError) {
-        await this.store.addActivity({ type: "error", message: `Could not retire failed composite PR #${candidate.prNumber}`, detail: errorMessage(closeError) });
+    try {
+      const comment = candidate.kind === "composite"
+        ? `Burner retired this composite after its merge gate failed. The source leaves remain available for an independently validated fallback. Failure: ${message}`
+        : `Burner retired this leaf after its merge gate failed. Retry the failed run to repair the same PR. Failure: ${message}`;
+      await this.git.closePr(this.root, candidate.prNumber, comment.slice(0, 2_000));
+      if (candidate.kind === "agent") {
+        await this.store.update((state) => {
+          const run = state.agentRuns.find((item) => item.id === candidate.id);
+          if (run?.prNumber === candidate.prNumber && run.prState !== "merged") run.prState = "closed";
+        });
       }
+    } catch (closeError) {
+      await this.store.addActivity({
+        type: "error",
+        message: `Could not retire failed ${candidate.kind === "composite" ? "composite" : "leaf"} PR #${candidate.prNumber}`,
+        detail: errorMessage(closeError),
+      });
     }
     await this.store.addActivity({
       type: "error",
@@ -1278,25 +1290,28 @@ export class Orchestrator {
           }],
         }
       : undefined;
+    this.retryingAgentIds.add(run.id);
     this.activeAgents.add(idea.id);
-    await this.store.update((draft) => {
-      const currentRun = draft.agentRuns.find((item) => item.id === run.id);
-      const currentIdea = draft.ideas.find((item) => item.id === idea.id);
-      if (currentRun) Object.assign(currentRun, {
-        status: unresolvedReview && !unresolvedReview.approved || mergeGateFeedback ? "revising" : "reviewing",
-        error: undefined,
-        completedAt: undefined,
-        reviewApproved: false,
-        deltas: [],
-        impact: undefined,
-        fullMergeValidation: undefined,
-        quarantinedAt: undefined,
-        quarantineReason: undefined,
-      });
-      if (currentIdea) Object.assign(currentIdea, { status: "running", updatedAt: now() });
-    });
-    await this.store.addActivity({ type: "agent", message: `Agent retry resumed: ${idea.title}`, detail: "Reusing the existing candidate and author session." });
     try {
+      if (run.prNumber && run.prState !== "open") await this.git.reopenPr(this.root, run.prNumber);
+      await this.store.update((draft) => {
+        const currentRun = draft.agentRuns.find((item) => item.id === run.id);
+        const currentIdea = draft.ideas.find((item) => item.id === idea.id);
+        if (currentRun) Object.assign(currentRun, {
+          status: unresolvedReview && !unresolvedReview.approved || mergeGateFeedback ? "revising" : "reviewing",
+          error: undefined,
+          completedAt: undefined,
+          reviewApproved: false,
+          deltas: [],
+          impact: undefined,
+          fullMergeValidation: undefined,
+          quarantinedAt: undefined,
+          quarantineReason: undefined,
+          ...(run.prNumber ? { prState: "open" as const } : {}),
+        });
+        if (currentIdea) Object.assign(currentIdea, { status: "running", updatedAt: now() });
+      });
+      await this.store.addActivity({ type: "agent", message: `Agent retry resumed: ${idea.title}`, detail: "Reusing the existing candidate, pull request, and author session." });
       let authorThreadId = run.authorThreadId;
       let lastMessage = run.lastMessage ?? "";
       const retryReview = unresolvedReview && !unresolvedReview.approved && unresolvedReview.findings.length
@@ -1348,6 +1363,7 @@ export class Orchestrator {
           : quarantined ? "The review budget was exhausted. Burner released the portfolio slot so healthier work can advance." : message,
       });
     } finally {
+      this.retryingAgentIds.delete(run.id);
       await lease.release();
       this.activeAgents.delete(idea.id);
       this.runtimeCache = undefined;
@@ -2067,8 +2083,16 @@ export class Orchestrator {
       composite.prNumber !== undefined &&
       byNumber.get(composite.prNumber)?.state === "OPEN" &&
       !this.retryingCompositeIds.has(composite.id));
+    const failedOpenLeaves = state.agentRuns.filter((run) =>
+      run.status === "failed" &&
+      run.prNumber !== undefined &&
+      run.prState === "open" &&
+      run.quarantineReason?.startsWith("Merge gate rejected") &&
+      byNumber.get(run.prNumber)?.state === "OPEN" &&
+      !this.retryingAgentIds.has(run.id));
     const failedCleanupErrors: string[] = [];
     let failedCompositesClosed = 0;
+    let failedLeavesClosed = 0;
     for (const composite of failedOpenComposites) {
       try {
         const reason = composite.error ? ` Failure: ${composite.error}` : "";
@@ -2078,6 +2102,17 @@ export class Orchestrator {
         failedCleanupErrors.push(`#${composite.prNumber}: ${errorMessage(error)}`);
       }
     }
+    for (const run of failedOpenLeaves) {
+      try {
+        const reason = run.error ? ` Failure: ${run.error}` : "";
+        await this.git.closePr(this.root, run.prNumber!, `Burner retired this leaf after its merge gate failed. Retry the failed run to repair the same PR.${reason}`.slice(0, 2_000));
+        const remote = byNumber.get(run.prNumber!);
+        if (remote) remote.state = "CLOSED";
+        failedLeavesClosed += 1;
+      } catch (error) {
+        failedCleanupErrors.push(`#${run.prNumber}: ${errorMessage(error)}`);
+      }
+    }
     if (failedCompositesClosed) {
       await this.store.addActivity({
         type: "pr",
@@ -2085,8 +2120,15 @@ export class Orchestrator {
         detail: "Their source leaves remain available for a fresh batch or independently validated fallback.",
       });
     }
+    if (failedLeavesClosed) {
+      await this.store.addActivity({
+        type: "pr",
+        message: `${failedLeavesClosed} failed leaf PR${failedLeavesClosed === 1 ? "" : "s"} retired`,
+        detail: "Their failed runs remain available for an explicit retry, which will reopen the same pull request.",
+      });
+    }
     if (failedCleanupErrors.length) {
-      await this.store.addActivity({ type: "error", message: "Failed composite PR cleanup incomplete", detail: failedCleanupErrors.join("; ").slice(0, 2_000) });
+      await this.store.addActivity({ type: "error", message: "Failed PR cleanup incomplete", detail: failedCleanupErrors.join("; ").slice(0, 2_000) });
     }
     const newlyMergedCompositeIds: string[] = [];
     const newlyMergedAgentIds: string[] = [];

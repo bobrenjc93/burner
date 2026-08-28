@@ -1268,7 +1268,7 @@ test("merge-gate retry recreates a delivered worktree and sends the failure to t
       state.agentRuns.push({
         id: "agent", ideaId: "idea", status: "failed", branch: "burner/stable-cli", worktree: join(root, "removed"),
         startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1",
-        baseRef: "main", baseCommit: "base", prNumber: 7, prUrl: "https://example.test/pr/7", prState: "open",
+        baseRef: "main", baseCommit: "base", prNumber: 7, prUrl: "https://example.test/pr/7", prState: "closed",
         error: "PR #7 required check failed: Rust quality gate", quarantinedAt: timestamp,
         quarantineReason: "Merge gate rejected PR #7: Rust quality gate failed.",
         reviewApproved: true,
@@ -1280,12 +1280,14 @@ test("merge-gate retry recreates a delivered worktree and sends the failure to t
     orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
     let recreated = 0;
     let changeChecks = 0;
+    const reopened = [];
     orchestrator.git = {
       resolveRef: async () => "base",
       head: async (cwd) => { if (cwd.endsWith("removed")) throw new Error("missing"); return "candidate"; },
       createExistingWorktree: async () => { recreated += 1; return root; },
       hasChanges: async () => ++changeChecks > 1,
       commit: async () => "fixed",
+      reopenPr: async (_cwd, number) => reopened.push(number),
     };
     let retryReview;
     orchestrator.codex = {
@@ -1298,6 +1300,7 @@ test("merge-gate retry recreates a delivered worktree and sends the failure to t
     await orchestrator.retryAgent("agent");
     const run = store.get().agentRuns.find((item) => item.id === "agent");
     assert.equal(recreated, 1);
+    assert.deepEqual(reopened, [7]);
     assert.equal(retryReview.findings[0].title, "Repair the failed merge gate");
     assert.match(retryReview.findings[0].detail, /Rust quality gate/);
     assert.equal(run.worktree, root);
@@ -2270,14 +2273,18 @@ test("hard direct-leaf merge-gate failures quarantine the leaf instead of retryi
       });
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 1 });
-    orchestrator.git = { resolveRef: async () => "base" };
+    const closed = [];
+    orchestrator.git = { resolveRef: async () => "base", closePr: async (_cwd, number, comment) => closed.push([number, comment]) };
     let attempts = 0;
     orchestrator.mergeAgent = async () => { attempts += 1; throw new Error("required check failed at stamped-head"); };
 
     assert.equal(await orchestrator.autoMergeNext(), true);
     assert.equal(store.get().agentRuns[0].status, "failed");
+    assert.equal(store.get().agentRuns[0].prState, "closed");
     assert.ok(store.get().agentRuns[0].quarantinedAt);
     assert.match(store.get().agentRuns[0].quarantineReason, /Merge gate rejected PR #10/);
+    assert.deepEqual(closed.map(([number]) => number), [10]);
+    assert.match(closed[0][1], /retry the failed run to repair the same PR/i);
     assert.equal(await orchestrator.autoMergeNext(), false);
     assert.equal(attempts, 1, "the same failed leaf head must not be retried automatically");
   } finally {
@@ -2952,7 +2959,12 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
       completedAt: timestamp, prNumber: number, prState: "open", deltas: [], resources: [], reviewRounds: [], reviewApproved: true,
     });
     await store.update((state) => {
-      state.agentRuns.push(run("a", 1), run("b", 2));
+      const failedLeaf = run("gate", 3);
+      failedLeaf.status = "failed";
+      failedLeaf.error = "Python 3.14 compatibility failed";
+      failedLeaf.quarantinedAt = timestamp;
+      failedLeaf.quarantineReason = "Merge gate rejected PR #3: Python 3.14 compatibility failed";
+      state.agentRuns.push(run("a", 1), run("b", 2), failedLeaf);
       state.composites.push({
         id: "failed", title: "Interrupted composite", description: "Combined", status: "failed", branch: "burner/composite-failed", worktree: "",
         sources: [
@@ -2970,6 +2982,7 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
       listPullRequests: async () => [
         { number: 1, state: "OPEN", headRefName: "burner/a", url: "", labels: [{ name: "burner-unmerged" }] },
         { number: 2, state: "OPEN", headRefName: "burner/b", url: "", labels: [{ name: "burner-unmerged" }] },
+        { number: 3, state: "OPEN", headRefName: "burner/gate", url: "", labels: [{ name: "burner-unmerged" }] },
         { number: 100, state: "OPEN", headRefName: "burner/composite-failed", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 200, state: "OPEN", headRefName: "burner/composite-orphan", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 201, state: "OPEN", headRefName: "burner/orphan-leaf", url: "", labels: [{ name: "burner-unmerged" }] },
@@ -2982,12 +2995,14 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
 
     await orchestrator.syncPullRequests(true);
 
-    assert.deepEqual(closed.map(([number]) => number), [200, 201, 100]);
+    assert.deepEqual(closed.map(([number]) => number), [200, 201, 100, 3]);
     assert.match(closed.find(([number]) => number === 200)[1], /no longer represented/);
     assert.match(closed.find(([number]) => number === 100)[1], /failed composite/);
     assert.equal(store.get().composites[0].prNumber, 100, "an interrupted publication must be recovered by its exact branch before cleanup");
     assert.equal(store.get().composites[0].status, "failed", "retirement must preserve explicit retry state");
-    assert.equal(store.get().agentRuns.every((item) => item.prState === "open"), true, "tracked source leaves remain available for fallback");
+    assert.equal(store.get().agentRuns.find((item) => item.id === "a").prState, "open", "tracked source leaves remain available for fallback");
+    assert.equal(store.get().agentRuns.find((item) => item.id === "b").prState, "open", "tracked source leaves remain available for fallback");
+    assert.equal(store.get().agentRuns.find((item) => item.id === "gate").prState, "closed", "hard-gate failures are retired on reconciliation");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
