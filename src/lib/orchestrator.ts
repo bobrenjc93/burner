@@ -391,6 +391,21 @@ function fullMergeValidationFingerprint(state: BurnerState): string {
   });
 }
 
+function evaluationScoreFingerprint(state: BurnerState): string {
+  return JSON.stringify(state.evaluations
+    .filter((evaluation) => evaluation.enabled)
+    .map((evaluation) => ({
+      id: evaluation.id,
+      name: evaluation.name,
+      prompt: evaluation.prompt,
+      command: evaluation.command,
+      screeningCommand: evaluation.screeningCommand,
+      weight: evaluation.weight,
+      definitionVersion: evaluation.definitionVersion,
+    }))
+    .sort((left, right) => left.id.localeCompare(right.id)));
+}
+
 export function agentReviewCadenceHeadroom(
   state: BurnerState,
   baseCommit: string,
@@ -716,22 +731,33 @@ export class Orchestrator {
   private async terminateIfStalled(): Promise<boolean> {
     const state = this.store.get();
     const hours = state.settings.stallTerminationHours;
-    if (!hours || hours <= 0 || state.orchestrator.stalledAt) return false;
-    const score = this.store.compositeScores().current;
+    if (!hours || hours <= 0) return false;
+    const baseline = this.store.latestRuns("baseline");
+    const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
+    if (!enabled.length || enabled.some((evaluation) => !baseline.has(evaluation.id))) return false;
+    const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
+    if (!enabled.every((evaluation) => isAuthoritativeFullBaseline(evaluation, baseline.get(evaluation.id), baseCommit))) return false;
+    const score = weightedScore(state.evaluations, new Map(enabled.map((evaluation) => [evaluation.id, baseline.get(evaluation.id)!.score!])));
     if (score === undefined) return false;
+    const evaluationFingerprint = evaluationScoreFingerprint(state);
 
     // Arm the clock on the first score, and restart it whenever the base
-    // branch beats its own record. Anything else -- a merge that scores flat,
-    // a rejected candidate, a contended benchmark -- leaves the clock running.
+    // branch beats its own record or the scoring rubric changes. Anything else
+    // -- a merge that scores flat, a rejected candidate, a contended benchmark
+    // -- leaves the clock running.
     const best = state.orchestrator.bestScore;
-    if (best === undefined || score > best) {
+    if (state.orchestrator.bestScoreEvaluationFingerprint !== evaluationFingerprint || best === undefined || score > best) {
       const improvedAt = now();
       await this.store.update((draft) => {
         draft.orchestrator.bestScore = score;
         draft.orchestrator.bestScoreAt = improvedAt;
+        draft.orchestrator.bestScoreEvaluationFingerprint = evaluationFingerprint;
+        draft.orchestrator.stalledAt = undefined;
       });
       return false;
     }
+
+    if (state.orchestrator.stalledAt) return false;
 
     const since = state.orchestrator.bestScoreAt;
     if (!since) {

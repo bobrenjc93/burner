@@ -215,6 +215,7 @@ export type BurnerState = {
     lastMergeCadenceAlertAt?: string;
     bestScore?: number;
     bestScoreAt?: string;
+    bestScoreEvaluationFingerprint?: string;
     stalledAt?: string;
   };
 };

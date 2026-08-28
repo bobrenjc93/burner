@@ -3777,7 +3777,7 @@ async function stallHarness(hours, runs) {
   await store.update((state) => {
     state.settings.stallTerminationHours = hours;
     state.orchestrator.enabled = true;
-    state.evaluations = [{ id: "eval_a", name: "A", prompt: "p", weight: 1, enabled: true, createdAt: "2026-01-01T00:00:00.000Z" }];
+    state.evaluations = [{ id: "eval_a", name: "A", prompt: "p", weight: 1, enabled: true, createdAt: "2026-01-01T00:00:00.000Z", definitionVersion: "definition-a" }];
     state.evaluationRuns = runs.map((score, index) => ({
       id: `run_${index}`,
       evaluationId: "eval_a",
@@ -3785,11 +3785,15 @@ async function stallHarness(hours, runs) {
       status: "completed",
       score,
       attempts: 1,
+      commit: "base",
+      evaluationDefinitionVersion: "definition-a",
+      promptSampleCount: 3,
       createdAt: new Date(Date.UTC(2026, 0, 1, index)).toISOString(),
     }));
   });
   const terminations = [];
   const orchestrator = new Orchestrator(root, store, new EventHub(), { onTerminate: (reason) => terminations.push(reason) });
+  orchestrator.git = { resolveRef: async () => "base" };
   return { root, store, orchestrator, terminations };
 }
 
@@ -3804,7 +3808,7 @@ test("stall termination arms on the first score and resets on a new best", async
     // Backdate the clock well past the window, then beat the record: the
     // improvement must restart the window rather than terminate the run.
     await store.update((state) => { state.orchestrator.bestScoreAt = "2020-01-01T00:00:00.000Z"; });
-    await store.update((state) => { state.evaluationRuns.push({ id: "run_best", evaluationId: "eval_a", context: "baseline", status: "completed", score: 55, attempts: 1, createdAt: "2026-06-01T00:00:00.000Z" }); });
+    await store.update((state) => { state.evaluationRuns.push({ id: "run_best", evaluationId: "eval_a", context: "baseline", status: "completed", score: 55, attempts: 1, commit: "base", evaluationDefinitionVersion: "definition-a", promptSampleCount: 3, createdAt: "2026-06-01T00:00:00.000Z" }); });
     assert.equal(await orchestrator.terminateIfStalled(), false);
     assert.equal(store.get().orchestrator.bestScore, 55);
     assert.ok(store.get().orchestrator.bestScoreAt > "2020-01-01T00:00:00.000Z");
@@ -3820,7 +3824,7 @@ test("stall termination stops the orchestrator after the configured window", asy
     await orchestrator.terminateIfStalled();
     await store.update((state) => { state.orchestrator.bestScoreAt = new Date(Date.now() - 25 * 3_600_000).toISOString(); });
     // A later run that merely ties the record is not progress.
-    await store.update((state) => { state.evaluationRuns.push({ id: "run_flat", evaluationId: "eval_a", context: "baseline", status: "completed", score: 70, attempts: 1, createdAt: "2026-06-01T00:00:00.000Z" }); });
+    await store.update((state) => { state.evaluationRuns.push({ id: "run_flat", evaluationId: "eval_a", context: "baseline", status: "completed", score: 70, attempts: 1, commit: "base", evaluationDefinitionVersion: "definition-a", promptSampleCount: 3, createdAt: "2026-06-01T00:00:00.000Z" }); });
 
     assert.equal(await orchestrator.terminateIfStalled(), true);
     assert.equal(store.get().orchestrator.enabled, false);
@@ -3843,6 +3847,26 @@ test("stall termination is disabled when the window is zero", async () => {
     assert.equal(await orchestrator.terminateIfStalled(), false);
     assert.equal(store.get().orchestrator.enabled, true);
     assert.deepEqual(terminations, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stall termination re-arms against an authoritative baseline when the evaluation rubric changes", async () => {
+  const { root, store, orchestrator } = await stallHarness(24, [90]);
+  try {
+    await orchestrator.terminateIfStalled();
+    const originalFingerprint = store.get().orchestrator.bestScoreEvaluationFingerprint;
+    await store.update((state) => {
+      state.orchestrator.bestScoreAt = "2020-01-01T00:00:00.000Z";
+      state.evaluations.push({ id: "eval_b", name: "B", prompt: "new rubric", weight: 1, enabled: true, createdAt: "2026-01-02T00:00:00.000Z", definitionVersion: "definition-b" });
+      state.evaluationRuns.push({ id: "run_b", evaluationId: "eval_b", context: "baseline", status: "completed", score: 10, attempts: 1, commit: "base", evaluationDefinitionVersion: "definition-b", promptSampleCount: 3, createdAt: "2026-06-02T00:00:00.000Z" });
+    });
+
+    assert.equal(await orchestrator.terminateIfStalled(), false);
+    assert.equal(store.get().orchestrator.bestScore, 50);
+    assert.notEqual(store.get().orchestrator.bestScoreEvaluationFingerprint, originalFingerprint);
+    assert.ok(store.get().orchestrator.bestScoreAt > "2020-01-01T00:00:00.000Z");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
