@@ -2964,7 +2964,12 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
       failedLeaf.error = "Python 3.14 compatibility failed";
       failedLeaf.quarantinedAt = timestamp;
       failedLeaf.quarantineReason = "Merge gate rejected PR #3: Python 3.14 compatibility failed";
-      state.agentRuns.push(run("a", 1), run("b", 2), failedLeaf);
+      const yieldedLeaf = run("yielded", 4);
+      yieldedLeaf.status = "failed";
+      yieldedLeaf.error = "Portfolio agent yielded its slot to preserve the merge cadence reserve.";
+      yieldedLeaf.quarantinedAt = timestamp;
+      yieldedLeaf.quarantineReason = "Review yielded with 10 minutes left so fallback work can use the merge reserve.";
+      state.agentRuns.push(run("a", 1), run("b", 2), failedLeaf, yieldedLeaf);
       state.composites.push({
         id: "failed", title: "Interrupted composite", description: "Combined", status: "failed", branch: "burner/composite-failed", worktree: "",
         sources: [
@@ -2983,6 +2988,7 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
         { number: 1, state: "OPEN", headRefName: "burner/a", url: "", labels: [{ name: "burner-unmerged" }] },
         { number: 2, state: "OPEN", headRefName: "burner/b", url: "", labels: [{ name: "burner-unmerged" }] },
         { number: 3, state: "OPEN", headRefName: "burner/gate", url: "", labels: [{ name: "burner-unmerged" }] },
+        { number: 4, state: "OPEN", headRefName: "burner/yielded", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 100, state: "OPEN", headRefName: "burner/composite-failed", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 200, state: "OPEN", headRefName: "burner/composite-orphan", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 201, state: "OPEN", headRefName: "burner/orphan-leaf", url: "", labels: [{ name: "burner-unmerged" }] },
@@ -2995,7 +3001,7 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
 
     await orchestrator.syncPullRequests(true);
 
-    assert.deepEqual(closed.map(([number]) => number), [200, 201, 100, 3]);
+    assert.deepEqual(closed.map(([number]) => number), [200, 201, 100, 3, 4]);
     assert.match(closed.find(([number]) => number === 200)[1], /no longer represented/);
     assert.match(closed.find(([number]) => number === 100)[1], /failed composite/);
     assert.equal(store.get().composites[0].prNumber, 100, "an interrupted publication must be recovered by its exact branch before cleanup");
@@ -3003,6 +3009,8 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
     assert.equal(store.get().agentRuns.find((item) => item.id === "a").prState, "open", "tracked source leaves remain available for fallback");
     assert.equal(store.get().agentRuns.find((item) => item.id === "b").prState, "open", "tracked source leaves remain available for fallback");
     assert.equal(store.get().agentRuns.find((item) => item.id === "gate").prState, "closed", "hard-gate failures are retired on reconciliation");
+    assert.equal(store.get().agentRuns.find((item) => item.id === "yielded").prState, "closed", "cadence-yielded drafts are retired on reconciliation");
+    assert.match(closed.find(([number]) => number === 4)[1], /explicit retry will reopen this same PR/i);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -3031,6 +3039,35 @@ test("review-budget exhaustion preserves leaf work as a quarantined draft PR", a
     assert.match(opened[0].body, /not approved, fully evaluated, or eligible for YOLO merge/);
     assert.deepEqual(quarantined, [12]);
     assert.equal(store.get().agentRuns[0].prState, "open");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cadence-yielded checkpoints close immediately and retain their retry PR", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-cadence-checkpoint-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => state.agentRuns.push({
+      id: "run", ideaId: "idea", status: "failed", branch: "burner/yielded", worktree: root,
+      startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], reviewRounds: [],
+      prNumber: 12, prUrl: "https://example.test/pull/12", prState: "open",
+      error: "Portfolio agent yielded its slot to preserve the merge cadence reserve.",
+      quarantinedAt: timestamp,
+      quarantineReason: "Review yielded with 10 minutes left so fallback work can use the merge reserve.",
+    }));
+    const closed = [];
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { closePr: async (_cwd, number, comment) => closed.push([number, comment]) };
+
+    await orchestrator.retireCadenceYieldedAgentPr("run");
+
+    assert.deepEqual(closed.map(([number]) => number), [12]);
+    assert.match(closed[0][1], /explicit retry will reopen this same PR/i);
+    assert.equal(store.get().agentRuns[0].prNumber, 12);
+    assert.equal(store.get().agentRuns[0].prState, "closed");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

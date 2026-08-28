@@ -1354,12 +1354,13 @@ export class Orchestrator {
       if (quarantined) await this.publishAgentCheckpoint(idea, run.id, run.worktree, run.branch, state.settings).catch(async (checkpointError) => {
         await this.store.addActivity({ type: "error", message: `Could not publish review checkpoint: ${idea.title}`, detail: errorMessage(checkpointError) });
       });
+      if (cadenceYield) await this.retireCadenceYieldedAgentPr(run.id);
       await this.finishIdea(idea.id, "failed");
       await this.store.addActivity({
         type: "error",
         message: cadenceYield ? `Agent yielded to merge cadence: ${idea.title}` : quarantined ? `Agent quarantined: ${idea.title}` : `Agent retry failed: ${idea.title}`,
         detail: cadenceYield
-          ? `Burner preserved this unapproved draft and released the slot with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes remaining; approved or queued fallback work can now advance toward validation and merge.`
+          ? `Burner preserved this review checkpoint in a closed draft and released the slot with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes remaining; approved or queued fallback work can now advance toward validation and merge.`
           : quarantined ? "The review budget was exhausted. Burner released the portfolio slot so healthier work can advance." : message,
       });
     } finally {
@@ -2087,7 +2088,7 @@ export class Orchestrator {
       run.status === "failed" &&
       run.prNumber !== undefined &&
       run.prState === "open" &&
-      run.quarantineReason?.startsWith("Merge gate rejected") &&
+      (run.quarantineReason?.startsWith("Merge gate rejected") || run.quarantineReason?.startsWith("Review yielded")) &&
       byNumber.get(run.prNumber)?.state === "OPEN" &&
       !this.retryingAgentIds.has(run.id));
     const failedCleanupErrors: string[] = [];
@@ -2105,7 +2106,11 @@ export class Orchestrator {
     for (const run of failedOpenLeaves) {
       try {
         const reason = run.error ? ` Failure: ${run.error}` : "";
-        await this.git.closePr(this.root, run.prNumber!, `Burner retired this leaf after its merge gate failed. Retry the failed run to repair the same PR.${reason}`.slice(0, 2_000));
+        const cadenceYielded = run.quarantineReason?.startsWith("Review yielded");
+        const explanation = cadenceYielded
+          ? "Burner retired this draft after its run yielded to preserve the merge cadence. The checkpoint and author session remain available; an explicit retry will reopen this same PR."
+          : "Burner retired this leaf after its merge gate failed. Retry the failed run to repair the same PR.";
+        await this.git.closePr(this.root, run.prNumber!, `${explanation}${reason}`.slice(0, 2_000));
         const remote = byNumber.get(run.prNumber!);
         if (remote) remote.state = "CLOSED";
         failedLeavesClosed += 1;
@@ -2605,6 +2610,33 @@ export class Orchestrator {
     await this.updateAgent(runId, { prNumber, prUrl, prState: prNumber ? "open" : undefined });
   }
 
+  private async retireCadenceYieldedAgentPr(runId: string): Promise<void> {
+    const run = this.store.get().agentRuns.find((item) => item.id === runId);
+    if (!run?.prNumber || run.prState !== "open") return;
+    try {
+      await this.git.closePr(
+        this.root,
+        run.prNumber,
+        "Burner retired this draft after its run yielded to preserve the merge cadence. The checkpoint and author session remain available; an explicit retry will reopen this same PR.",
+      );
+      await this.store.update((state) => {
+        const current = state.agentRuns.find((item) => item.id === runId);
+        if (current && current.prNumber === run.prNumber && current.prState !== "merged") current.prState = "closed";
+      });
+      await this.store.addActivity({
+        type: "pr",
+        message: `Cadence-yielded leaf PR #${run.prNumber} retired`,
+        detail: "Its review checkpoint remains available for an explicit retry, which will reopen the same pull request.",
+      });
+    } catch (error) {
+      await this.store.addActivity({
+        type: "error",
+        message: `Could not retire cadence-yielded leaf PR #${run.prNumber}`,
+        detail: errorMessage(error),
+      });
+    }
+  }
+
   private async runIdea(
     idea: Idea,
     base: AgentBase,
@@ -2689,12 +2721,13 @@ export class Orchestrator {
       if (quarantined && worktree) await this.publishAgentCheckpoint(idea, runId, worktree, branch, this.store.get().settings).catch(async (checkpointError) => {
         await this.store.addActivity({ type: "error", message: `Could not publish review checkpoint: ${idea.title}`, detail: errorMessage(checkpointError) });
       });
+      if (cadenceYield) await this.retireCadenceYieldedAgentPr(runId);
       await this.finishIdea(idea.id, "failed");
       await this.store.addActivity({
         type: "error",
         message: cadenceYield ? `Agent yielded to merge cadence: ${idea.title}` : quarantined ? `Agent quarantined: ${idea.title}` : `Agent failed: ${idea.title}`,
         detail: cadenceYield
-          ? `Burner preserved this unapproved draft and released the slot with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes remaining; approved or queued fallback work can now advance toward validation and merge.`
+          ? `Burner preserved this review checkpoint in a closed draft and released the slot with ${Math.max(0, Math.ceil(cadenceYield.remainingMs / 60_000))} minutes remaining; approved or queued fallback work can now advance toward validation and merge.`
           : quarantined ? "The review budget was exhausted. Burner released the portfolio slot so healthier work can advance." : message,
       });
       this.events.emit("agent", { runId, status: "failed", error: message });
