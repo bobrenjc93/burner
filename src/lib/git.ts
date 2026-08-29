@@ -9,8 +9,10 @@ export type PullRequestSummary = {
   number: number;
   state: "OPEN" | "CLOSED" | "MERGED";
   headRefName: string;
+  headRefOid?: string;
   url: string;
   labels?: Array<{ name: string }>;
+  statusCheckRollup?: PullRequestCheck[];
 };
 
 export class TransientMergeGateError extends Error {
@@ -34,7 +36,7 @@ type PullRequestMergeStatus = {
   headRefOid: string;
 };
 
-type PullRequestCheck = {
+export type PullRequestCheck = {
   __typename?: string;
   name?: string;
   context?: string;
@@ -454,9 +456,16 @@ export class GitService {
   }
 
   async listPullRequests(cwd = this.root): Promise<PullRequestSummary[]> {
-    const result = await runCommand("gh", ["pr", "list", "--state", "all", "--limit", "1000", "--json", "number,state,headRefName,url,labels"], { cwd, timeoutMs: 2 * 60 * 1000 });
-    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not synchronize pull requests");
-    return JSON.parse(result.stdout) as PullRequestSummary[];
+    const [allResult, openResult] = await Promise.all([
+      runCommand("gh", ["pr", "list", "--state", "all", "--limit", "1000", "--json", "number,state,headRefName,url,labels"], { cwd, timeoutMs: 2 * 60 * 1000 }),
+      runCommand("gh", ["pr", "list", "--state", "open", "--limit", "1000", "--json", "number,headRefOid,statusCheckRollup"], { cwd, timeoutMs: 2 * 60 * 1000 }),
+    ]);
+    if (allResult.exitCode !== 0) throw new Error(allResult.stderr.trim() || "Could not synchronize pull requests");
+    if (openResult.exitCode !== 0) throw new Error(openResult.stderr.trim() || "Could not synchronize open pull request checks");
+    const pullRequests = JSON.parse(allResult.stdout) as PullRequestSummary[];
+    const openDetails = JSON.parse(openResult.stdout) as Array<Pick<PullRequestSummary, "number" | "headRefOid" | "statusCheckRollup">>;
+    const openByNumber = new Map(openDetails.map((pr) => [pr.number, pr]));
+    return pullRequests.map((pr) => ({ ...pr, ...openByNumber.get(pr.number) }));
   }
 
   async syncBase(remote: string, baseBranch: string): Promise<string> {

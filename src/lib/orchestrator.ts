@@ -123,6 +123,16 @@ function isManagedBurnerPullRequest(pr: PullRequestSummary): boolean {
     pr.labels?.some((label) => label.name === "burner-unmerged") === true;
 }
 
+function failedPullRequestChecks(pr: PullRequestSummary): string[] {
+  return (pr.statusCheckRollup ?? []).flatMap((check) => {
+    const outcome = String(check.conclusion ?? check.state ?? "").toUpperCase();
+    const execution = String(check.status ?? "").toUpperCase();
+    if (["SUCCESS", "NEUTRAL", "SKIPPED"].includes(outcome)) return [];
+    if (!["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"].includes(outcome) && execution !== "COMPLETED") return [];
+    return [check.name ?? check.context ?? check.__typename ?? "unnamed check"];
+  });
+}
+
 function eligibleYoloLeaves(state: BurnerState, baseCommit: string): AgentRun[] {
   const { enabled, commands } = yoloEvaluationSets(state);
   if (!enabled.size) return [];
@@ -2105,6 +2115,36 @@ export class Orchestrator {
       await this.store.addActivity({ type: "error", message: "Orphaned PR cleanup incomplete", detail: orphanCleanupErrors.join("; ").slice(0, 2_000) });
     }
     const byNumber = new Map(pullRequests.map((pr) => [pr.number, pr]));
+    const newlyFailedOpenLeaves = state.agentRuns.flatMap((run) => {
+      if (run.status !== "completed" || run.prNumber === undefined || run.prState !== "open" || this.retryingAgentIds.has(run.id)) return [];
+      const remote = byNumber.get(run.prNumber);
+      if (remote?.state !== "OPEN") return [];
+      const failures = failedPullRequestChecks(remote);
+      return failures.length ? [{ runId: run.id, prNumber: run.prNumber, failures }] : [];
+    });
+    if (newlyFailedOpenLeaves.length) {
+      const failedAt = now();
+      await this.store.update((draft) => {
+        for (const failure of newlyFailedOpenLeaves) {
+          const run = draft.agentRuns.find((item) => item.id === failure.runId);
+          if (!run || run.status !== "completed" || run.prState !== "open") continue;
+          const message = `PR #${failure.prNumber} required check${failure.failures.length === 1 ? "" : "s"} failed: ${failure.failures.join(", ")}`;
+          Object.assign(run, {
+            status: "failed",
+            error: message,
+            completedAt: failedAt,
+            quarantinedAt: failedAt,
+            quarantineReason: `Merge gate rejected PR #${failure.prNumber}: ${message}`,
+          });
+        }
+      });
+      state = this.store.get();
+      await this.store.addActivity({
+        type: "error",
+        message: `${newlyFailedOpenLeaves.length} completed leaf PR${newlyFailedOpenLeaves.length === 1 ? "" : "s"} failed required checks`,
+        detail: newlyFailedOpenLeaves.map((failure) => `#${failure.prNumber}: ${failure.failures.join(", ")}`).join("; ").slice(0, 2_000),
+      });
+    }
     const failedOpenComposites = state.composites.filter((composite) =>
       composite.status === "failed" &&
       composite.prNumber !== undefined &&
