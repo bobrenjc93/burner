@@ -1281,6 +1281,20 @@ export class Orchestrator {
     const state = this.store.get();
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const cadenceDue = this.mergeCadenceUrgent(state);
+    const readyComposite = cadenceDue
+      ? selectYoloMergeCandidate(state, baseCommit, false)
+      : undefined;
+    if (readyComposite) {
+      if (!this.portfolioDraining) {
+        this.portfolioDraining = true;
+        await this.store.addActivity({
+          type: "pr",
+          message: "Merge candidate ready; draining active agents",
+          detail: `Composite PR #${readyComposite.prNumber} is fully reviewed and evaluated. No replacement agents will start until the current ${this.activeAgents.size} finish and the urgent merge can run.`,
+        });
+      }
+      return true;
+    }
     const cookDue = cadenceDue || this.portfolioCookDue(state, baseCommit);
     const eligible = eligibleYoloLeaves(state, baseCommit);
     const selected = cookDue

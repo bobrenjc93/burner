@@ -2084,6 +2084,42 @@ test("YOLO rechecks merge urgency after planning before dispatching an author", 
   }
 });
 
+test("YOLO drains active agents when an urgent composite is ready to merge", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-yolo-urgent-composite-drain-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    await store.update((state) => {
+      state.settings.parallelism = 3;
+      state.settings.compositeAbsorbThreshold = 0;
+      state.orchestrator.enabled = true;
+      state.orchestrator.lastEvaluationAt = timestamp;
+      state.orchestrator.mergeWindowStartedAt = timestamp;
+      state.orchestrator.lastMergeCadenceAlertAt = timestamp;
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.composites = [{
+        id: "ready-composite", title: "Ready composite", description: "", status: "open",
+        branch: "ready-composite", worktree: "", prUrl: "https://example.test/pull/20", prNumber: 20,
+        sources: [{ agentRunId: "source", prNumber: 10, title: "Source", branch: "source", kind: "pull_request", impact: 0 }],
+        deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 80, delta: 0 }],
+        impact: 0, compositeScore: 80, reviewRounds: [approvedRound], reviewApproved: true,
+        baseCommit: "base", createdAt: timestamp, updatedAt: timestamp, isLiving: true,
+      }];
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.activeAgents.add("in-flight-author");
+    orchestrator.git = { resolveRef: async () => "base" };
+
+    assert.equal(await orchestrator.shouldDrainForPortfolio(), true);
+    assert.match(store.get().activity[0].message, /merge candidate ready/i);
+    assert.match(store.get().activity[0].detail, /PR #20/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("YOLO cooks a ready leaf batch in a free slot while an unrelated author drains", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-concurrent-cook-test-"));
   try {
