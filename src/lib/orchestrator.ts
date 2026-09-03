@@ -160,7 +160,13 @@ function eligibleYoloLeaves(state: BurnerState, baseCommit: string): AgentRun[] 
       !reserved.has(run.id) &&
       finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
       isYoloCandidate(run.deltas, run.impact, enabled, commands, state.settings.compositeAbsorbThreshold, false, false))
-    .sort((a, b) => (b.impact ?? -Infinity) - (a.impact ?? -Infinity));
+    .sort((a, b) => leafDeliveryPriority(state, b) - leafDeliveryPriority(state, a));
+}
+
+function leafDeliveryPriority(state: BurnerState, run: AgentRun): number {
+  const idea = (state.ideas ?? []).find((candidate) => candidate.id === run.ideaId);
+  const impact = run.impact ?? Number.NEGATIVE_INFINITY;
+  return idea?.lane === "foundational" ? Math.max(impact, idea.milestoneCredit ?? 0) : impact;
 }
 
 function sourceSetSignature(agentRunIds: readonly string[]): string {
@@ -237,7 +243,7 @@ export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string,
   if (!includeAgents) return undefined;
 
   const compositeSourceIds = reservedCompositeSourceIds(state);
-  return state.agentRuns
+  const candidate = state.agentRuns
     .filter((run) =>
       run.status === "completed" &&
       run.prState === "open" &&
@@ -247,8 +253,10 @@ export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string,
       !compositeSourceIds.has(run.id) &&
       finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
       isYoloCandidate(run.deltas, run.impact, enabledEvaluationIds, commandEvaluationIds, threshold))
-    .map((run) => ({ kind: "agent" as const, id: run.id, prNumber: run.prNumber!, impact: run.impact! }))
-    .sort((a, b) => b.impact - a.impact)[0];
+    .sort((a, b) => leafDeliveryPriority(state, b) - leafDeliveryPriority(state, a))[0];
+  return candidate
+    ? { kind: "agent", id: candidate.id, prNumber: candidate.prNumber!, impact: candidate.impact! }
+    : undefined;
 }
 
 export function shouldRefillIdeaQueue(

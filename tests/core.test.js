@@ -1759,6 +1759,33 @@ test("queue prioritization reserves at most one slot for foundational milestones
   assert.deepEqual(prioritizeQueuedIdeas(ideas, 3, true).map(({ id }) => id), ["incremental-high", "incremental-low"]);
 });
 
+test("milestone credit reserves foundational delivery without changing measured impact", () => {
+  const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
+  const leaf = (id, ideaId, impact, prNumber) => ({
+    id, ideaId, status: "completed", prState: "open", prNumber, baseCommit: "base",
+    reviewApproved: true, reviewRounds: [approvedRound],
+    deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 80 + impact, delta: impact }], impact,
+  });
+  const state = {
+    settings: { compositeAbsorbThreshold: 0 },
+    evaluations: [{ id: "quality", enabled: true }],
+    composites: [],
+    ideas: [
+      { id: "normal-high", lane: "incremental", milestoneCredit: 0 },
+      { id: "foundation", lane: "foundational", milestoneCredit: 90 },
+      { id: "normal-low", lane: "incremental", milestoneCredit: 0 },
+    ],
+    agentRuns: [
+      leaf("normal-high-run", "normal-high", 5, 10),
+      leaf("foundation-run", "foundation", 0, 11),
+      leaf("normal-low-run", "normal-low", 1, 12),
+    ],
+  };
+
+  assert.deepEqual(selectYoloLeafBatch(state, "base", 2), ["foundation-run", "normal-high-run"]);
+  assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "foundation-run", prNumber: 11, impact: 0 });
+});
+
 test("YOLO merge selection prefers reviewed composites, accepts threshold-equal monotonic work, and rejects every regression", () => {
   const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
   const deltas = [
