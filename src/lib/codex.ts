@@ -203,6 +203,7 @@ export class CodexClient {
     latest: Map<string, EvaluationRun>,
     existingIdeas: Idea[],
     settings: BurnerSettings,
+    foundationalDeliveryPending = false,
   ): Promise<PlannedIdea[]> {
     const cadenceMinutes = Math.max(5, settings.mergeCadenceMinutes ?? 60);
     const implementationBudgetMinutes = Math.max(5, Math.floor(cadenceMinutes / 4));
@@ -225,7 +226,7 @@ export class CodexClient {
         suggestions: run?.suggestions,
       };
     });
-    const foundationalLaneOccupied = existingIdeas.some((idea) =>
+    const foundationalLaneOccupied = foundationalDeliveryPending || existingIdeas.some((idea) =>
       idea.lane === "foundational" && (idea.status === "queued" || idea.status === "running"));
     const foundationalTarget = foundationalLaneOccupied
       ? undefined

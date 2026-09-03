@@ -1790,7 +1790,11 @@ export class Orchestrator {
     }
     let planned;
     try {
-      planned = await this.codex.planIdeas(planningCwd, evaluations, latest, state.ideas, state.settings);
+      const foundationalDeliveryPending = state.agentRuns.some((run) => {
+        const idea = state.ideas.find((candidate) => candidate.id === run.ideaId);
+        return idea?.lane === "foundational" && run.status === "completed" && run.prNumber !== undefined && (!run.prState || run.prState === "open");
+      });
+      planned = await this.codex.planIdeas(planningCwd, evaluations, latest, state.ideas, state.settings, foundationalDeliveryPending);
     } finally {
       if (planningWorktree) {
         const cleanupLock = await this.locks.acquire("git-metadata", `plan-cleanup-${living?.id}`);

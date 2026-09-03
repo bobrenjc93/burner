@@ -3356,6 +3356,9 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     const occupiedPlan = await codex.planIdeas(root, [evaluation, lowerWeightEvaluation], baselines, [{ ...planned[0], id: "existing", status: "queued", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "codex" }], settings);
     assert.equal(occupiedPlan[0].lane, "incremental");
     assert.equal(occupiedPlan[0].milestoneCredit, 0);
+    const deliveredPlan = await codex.planIdeas(root, [evaluation, lowerWeightEvaluation], baselines, [{ ...planned[0], id: "delivered", status: "completed", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "codex" }], settings, true);
+    assert.equal(deliveredPlan[0].lane, "incremental");
+    assert.equal(deliveredPlan[0].milestoneCredit, 0);
     const author = await codex.implement(root, { ...planned[0], id: "idea", status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "manual" }, [{ ...evaluation, prompt: "Use read-only inspection. Do not run cargo, builds, or tests." }], settings);
     assert.equal(author.threadId, "thread-test");
     assert.equal((await codex.integrateComposite(root, "Combined", ["Improve"], settings)).message, "Author complete");
