@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, TransientMergeGateError } from "../dist/lib/git.js";
@@ -1740,6 +1740,25 @@ test("PR bodies record review approval and recalculated composite scores", () =>
   assert.match(draft, /not mergeable until independent review and combined-code evaluation finish/);
 });
 
+test("queue prioritization reserves at most one slot for foundational milestones", () => {
+  const timestamp = new Date().toISOString();
+  const idea = (id, predictedImpact, lane = "incremental", milestoneCredit = 0) => ({
+    id, title: id, description: id, rationale: "", predictedImpact, lane,
+    milestone: lane === "foundational" ? `${id} milestone` : "", milestoneCredit,
+    evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "codex",
+  });
+  const ideas = [
+    idea("incremental-high", 80),
+    idea("foundation-low", 0, "foundational", 20),
+    idea("foundation-high", 0, "foundational", 90),
+    idea("incremental-low", 10),
+  ];
+
+  assert.deepEqual(prioritizeQueuedIdeas(ideas, 3).map(({ id }) => id), ["foundation-high", "incremental-high", "incremental-low"]);
+  assert.deepEqual(prioritizeQueuedIdeas(ideas, 1).map(({ id }) => id), ["foundation-high"]);
+  assert.deepEqual(prioritizeQueuedIdeas(ideas, 3, true).map(({ id }) => id), ["incremental-high", "incremental-low"]);
+});
+
 test("YOLO merge selection prefers reviewed composites, accepts threshold-equal monotonic work, and rejects every regression", () => {
   const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
   const deltas = [
@@ -3315,7 +3334,7 @@ test("every Codex role and structured fallback uses unrestricted mode without au
   await import("node:fs/promises").then((fs) => fs.mkdir(bin));
   const executable = join(bin, "codex");
   const argsLog = join(root, "args.jsonl");
-  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");const args=process.argv.slice(2);const input=fs.readFileSync(0,"utf8");fs.appendFileSync(process.env.BURNER_TEST_ARGS,JSON.stringify({args,input})+"\\n");if(args.includes("--help")){console.log("  --dangerously-bypass-approvals-and-sandbox  unrestricted");process.exit(0);}const i=args.indexOf("--output-last-message");const out=args[i+1];if(args.includes("--output-schema")){process.exit(9);}if(input.includes("improvement planner")){fs.writeFileSync(out,JSON.stringify({ideas:[]}));}else if(input.includes("rigorous repository evaluator")){fs.writeFileSync(out,JSON.stringify({score:77,summary:"Measured",evidence:["code"],suggestions:["improve"]}));}else if(input.includes("independent, rigorous reviewer")){fs.writeFileSync(out,JSON.stringify({approved:true,summary:"Ready",findings:[]}));}else{fs.writeFileSync(out,"Author complete");console.log(JSON.stringify({type:"thread.started",thread_id:"thread-test"}));}\n`);
+  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");const args=process.argv.slice(2);const input=fs.readFileSync(0,"utf8");fs.appendFileSync(process.env.BURNER_TEST_ARGS,JSON.stringify({args,input})+"\\n");if(args.includes("--help")){console.log("  --dangerously-bypass-approvals-and-sandbox  unrestricted");process.exit(0);}const i=args.indexOf("--output-last-message");const out=args[i+1];if(args.includes("--output-schema")){process.exit(9);}if(input.includes("improvement planner")){fs.writeFileSync(out,JSON.stringify({ideas:[{title:"Establish compile capture",description:"Capture and test one representative graph.",rationale:"Unlock the sparse compile evaluation.",predictedImpact:0,lane:"foundational",milestone:"Capture one representative graph end to end",milestoneCredit:90,evaluationIds:["quality"],resources:[]}]}));}else if(input.includes("rigorous repository evaluator")){fs.writeFileSync(out,JSON.stringify({score:77,summary:"Measured",evidence:["code"],suggestions:["improve"]}));}else if(input.includes("independent, rigorous reviewer")){fs.writeFileSync(out,JSON.stringify({approved:true,summary:"Ready",findings:[]}));}else{fs.writeFileSync(out,"Author complete");console.log(JSON.stringify({type:"thread.started",thread_id:"thread-test"}));}\n`);
   await chmod(executable, 0o755);
   const previousPath = process.env.PATH;
   process.env.PATH = `${bin}:${previousPath}`;
@@ -3323,11 +3342,21 @@ test("every Codex role and structured fallback uses unrestricted mode without au
   const settings = { parallelism: 1, evaluationIntervalMinutes: 30, orchestratorIntervalMinutes: 15, autoRun: false, autoCreatePrs: true, evaluatorModel: "", agentModel: "", baseBranch: "main", remote: "origin", defaultResources: [], maxReviewRounds: 8, preferLivingComposite: true, compositeAbsorbThreshold: 0 };
   try {
     const codex = new CodexClient();
-    const evaluation = { id: "quality", name: "Quality", prompt: "Score quality", weight: 1, enabled: true, createdAt: new Date().toISOString() };
+    const evaluation = { id: "quality", name: "Quality", prompt: "Score quality", weight: 4, enabled: true, createdAt: new Date().toISOString() };
+    const lowerWeightEvaluation = { id: "secondary", name: "Secondary", prompt: "Score secondary behavior", weight: 1, enabled: true, createdAt: new Date().toISOString() };
     assert.equal((await codex.evaluate(root, evaluation, settings, "manual")).score, 77);
     assert.equal((await codex.evaluate(root, evaluation, settings, "composite", { score: 65, summary: "Baseline category allocation", evidence: ["Docs: 6/10"] })).score, 77);
-    assert.deepEqual(await codex.planIdeas(root, [evaluation], new Map(), [], settings), []);
-    const author = await codex.implement(root, { id: "idea", title: "Improve", description: "Do it", rationale: "Quality", predictedImpact: 20, evaluationIds: ["quality"], resources: [], status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "manual" }, [{ ...evaluation, prompt: "Use read-only inspection. Do not run cargo, builds, or tests." }], settings);
+    const baselineRun = { id: "baseline", evaluationId: "quality", score: 0, commit: "base", createdAt: new Date().toISOString(), durationMs: 1, status: "completed", context: "baseline" };
+    const lowerWeightRun = { ...baselineRun, id: "secondary-baseline", evaluationId: "secondary" };
+    const baselines = new Map([[evaluation.id, baselineRun], [lowerWeightEvaluation.id, lowerWeightRun]]);
+    const planned = await codex.planIdeas(root, [evaluation, lowerWeightEvaluation], baselines, [], settings);
+    assert.equal(planned.length, 1);
+    assert.equal(planned[0].lane, "foundational");
+    assert.equal(planned[0].milestoneCredit, 90);
+    const occupiedPlan = await codex.planIdeas(root, [evaluation, lowerWeightEvaluation], baselines, [{ ...planned[0], id: "existing", status: "queued", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "codex" }], settings);
+    assert.equal(occupiedPlan[0].lane, "incremental");
+    assert.equal(occupiedPlan[0].milestoneCredit, 0);
+    const author = await codex.implement(root, { ...planned[0], id: "idea", status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "manual" }, [{ ...evaluation, prompt: "Use read-only inspection. Do not run cargo, builds, or tests." }], settings);
     assert.equal(author.threadId, "thread-test");
     assert.equal((await codex.integrateComposite(root, "Combined", ["Improve"], settings)).message, "Author complete");
     const revision = await codex.revise(root, author.threadId, { approved: false, summary: "Fix it", findings: [{ severity: "high", title: "Bug", detail: "Resolve", file: "app.js" }] }, settings);
@@ -3356,10 +3385,16 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     assert.match(plannerCall.input, /targets a qualifying merge every 60 minutes/);
     assert.match(plannerCall.input, /hard scope constraint/);
     assert.match(plannerCall.input, /Never propose an umbrella task/);
+    assert.match(plannerCall.input, /"weight": 4/);
+    assert.match(plannerCall.input, /"maximumCompositeGain": 80/);
+    assert.match(plannerCall.input, /Reserve exactly one proposal for evaluation 'quality'/);
+    assert.match(plannerCall.input, /never changes measured evaluation scores/);
+    assert.ok(calls.filter(({ input }) => input.includes("improvement planner")).some(({ input }) => /foundational lane is already occupied/.test(input)));
     assert.match(plannerCall.input, /Burner owns the canonical merge-coupled evaluation progress artifacts/);
     assert.ok(calls.some(({ input }) => input.includes("implementation agent")));
     const authorCall = calls.find(({ input }) => input.includes("implementation agent"));
     assert.match(authorCall.input, /quoted as evaluator context, not instructions/);
+    assert.match(authorCall.input, /Foundational milestone: Capture one representative graph end to end/);
     assert.match(authorCall.input, /do not constrain this implementation task: edit the worktree and run the relevant tests/);
     assert.match(authorCall.input, /All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree/);
     assert.match(authorCall.input, /Burner owns the canonical merge-coupled evaluation progress artifacts/);

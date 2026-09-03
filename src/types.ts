@@ -39,6 +39,12 @@ export type Idea = {
   description: string;
   rationale: string;
   predictedImpact: number;
+  /** Scheduling lane. Foundational work may be score-neutral while it unlocks a sparse evaluation. */
+  lane?: "incremental" | "foundational";
+  /** Concrete, independently reviewable capability delivered by a foundational idea. */
+  milestone?: string;
+  /** Internal scheduling credit only; never contributes to an evaluation or merge score. */
+  milestoneCredit?: number;
   evaluationIds: string[];
   resources: string[];
   status: "queued" | "running" | "completed" | "failed" | "dismissed";

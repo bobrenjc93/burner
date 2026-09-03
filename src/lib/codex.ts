@@ -37,10 +37,13 @@ const ideasSchema = {
           description: { type: "string" },
           rationale: { type: "string" },
           predictedImpact: { type: "number", minimum: 0, maximum: 100 },
+          lane: { type: "string", enum: ["incremental", "foundational"] },
+          milestone: { type: "string" },
+          milestoneCredit: { type: "number", minimum: 0, maximum: 100 },
           evaluationIds: { type: "array", items: { type: "string" } },
           resources: { type: "array", items: { type: "string" } },
         },
-        required: ["title", "description", "rationale", "predictedImpact", "evaluationIds", "resources"],
+        required: ["title", "description", "rationale", "predictedImpact", "lane", "milestone", "milestoneCredit", "evaluationIds", "resources"],
         additionalProperties: false,
       },
     },
@@ -75,7 +78,8 @@ const reviewSchema = {
 };
 
 type EvaluationOutput = { score: number; summary: string; evidence: string[]; suggestions: string[] };
-export type PlannedIdea = Omit<Idea, "id" | "status" | "createdAt" | "updatedAt" | "source" | "agentRunId">;
+export type PlannedIdea = Omit<Idea, "id" | "status" | "createdAt" | "updatedAt" | "source" | "agentRunId" | "lane" | "milestone" | "milestoneCredit"> &
+  Required<Pick<Idea, "lane" | "milestone" | "milestoneCredit">>;
 export type SessionResult = { message: string; threadId: string };
 export type ReviewResult = { approved: boolean; summary: string; findings: ReviewFinding[] };
 
@@ -202,41 +206,76 @@ export class CodexClient {
   ): Promise<PlannedIdea[]> {
     const cadenceMinutes = Math.max(5, settings.mergeCadenceMinutes ?? 60);
     const implementationBudgetMinutes = Math.max(5, Math.floor(cadenceMinutes / 4));
+    const totalWeight = evaluations.reduce((total, evaluation) => total + evaluation.weight, 0);
     const evaluationContext = evaluations.map((evaluation) => {
       const run = latest.get(evaluation.id);
+      const score = run?.score;
       return {
         id: evaluation.id,
         name: evaluation.name,
+        weight: evaluation.weight,
+        maximumCompositeGain: score === undefined || totalWeight === 0
+          ? undefined
+          : Math.round((100 - score) * evaluation.weight / totalWeight * 10) / 10,
         prompt: evaluation.prompt,
         kind: evaluation.command ? "command" : "prompt",
-        score: run?.score,
+        score,
         summary: run?.summary,
         evidence: run?.evidence,
         suggestions: run?.suggestions,
       };
     });
+    const foundationalLaneOccupied = existingIdeas.some((idea) =>
+      idea.lane === "foundational" && (idea.status === "queued" || idea.status === "running"));
+    const foundationalTarget = foundationalLaneOccupied
+      ? undefined
+      : evaluationContext
+        .filter((evaluation) => evaluation.score === 0)
+        .sort((a, b) => (b.maximumCompositeGain ?? 0) - (a.maximumCompositeGain ?? 0))[0];
+    const foundationalDirective = foundationalTarget
+      ? `The foundational lane is open. Reserve exactly one proposal for evaluation '${foundationalTarget.id}' (${foundationalTarget.name}), the zero-score evaluation with the largest weighted headroom (${foundationalTarget.maximumCompositeGain} composite points). That proposal must target '${foundationalTarget.id}', use lane='foundational', and state one concrete verifiable milestone.`
+      : foundationalLaneOccupied
+        ? "The foundational lane is already occupied by unfinished work. Do not propose another foundational idea in this planning pass; mark every proposal lane='incremental'."
+        : "No enabled evaluation currently has an authoritative score of exactly zero. Do not reserve the foundational lane in this planning pass; mark every proposal lane='incremental'.";
     const prompt = [
       "You are Burner's improvement planner. Inspect this repository and propose a small set of concrete, independent changes that coding agents can implement on separate branches.",
       "Optimize the evaluation scores below. Prefer high-leverage, reviewable changes over broad rewrites. Do not duplicate existing ideas. Do not edit files.",
       `Burner targets a qualifying merge every ${cadenceMinutes} minutes with ${settings.parallelism} parallel agent slot${settings.parallelism === 1 ? "" : "s"}. Each idea must be small enough for one author to implement, test, undergo repeated independent review, revise, and candidate-evaluate in about ${implementationBudgetMinutes} minutes.`,
       "This is a hard scope constraint: each idea must deliver one narrow, coherent capability with at most three concrete acceptance outcomes. Decompose foundations into independently useful increments. Never propose an umbrella task such as building an entire engine, service, UI, persistence layer, or end-to-end product in one branch.",
+      "Use two scheduling lanes. Incremental ideas pursue immediate measured gains. The foundational lane crosses sparse-reward gaps as a sequence of independently useful, tested milestones; it is not permission to propose an end-to-end rewrite.",
+      foundationalDirective,
+      "milestoneCredit is internal 0-100 scheduling priority for prerequisite value. It never changes measured evaluation scores. Use it only for foundational ideas; incremental ideas must use an empty milestone and milestoneCredit=0.",
       `${PROGRESS_OWNERSHIP} Do not propose duplicate progress infrastructure; the first successful product merge creates the artifacts automatically.`,
       "Treat failed or quarantined existing ideas as evidence that their scope was too large or risky. Replace them only with strictly smaller, non-overlapping increments; do not rephrase and resubmit the same scope.",
-      "predictedImpact is an expected 0-100 relative impact used for queue ordering. evaluationIds must use only IDs supplied below.",
+      "predictedImpact is the expected immediate measured 0-100 impact. Evaluation weight and maximumCompositeGain show aggregate leverage. evaluationIds must use only IDs supplied below.",
       "resources lists shared scarce resources only when required (examples: gpu, cpu-heavy, device-ios). Use an empty list for normal work. Ideas sharing a resource will not run concurrently.",
       `Evaluations:\n${JSON.stringify(evaluationContext, null, 2)}`,
-      `Existing ideas:\n${JSON.stringify(existingIdeas.slice(-30).map(({ title, description, status }) => ({ title, description, status })), null, 2)}`,
+      `Existing ideas:\n${JSON.stringify(existingIdeas.slice(-30).map(({ title, description, status, lane, milestone, evaluationIds }) => ({ title, description, status, lane, milestone, evaluationIds })), null, 2)}`,
     ].join("\n\n");
     const output = await this.structured<{ ideas: PlannedIdea[] }>(cwd, prompt, ideasSchema, settings.evaluatorModel);
     const validIds = new Set(evaluations.map((evaluation) => evaluation.id));
-    return output.ideas.map((idea) => ({
-      title: String(idea.title).trim().slice(0, 120),
-      description: String(idea.description).trim(),
-      rationale: String(idea.rationale).trim(),
-      predictedImpact: clampScore(Number(idea.predictedImpact)),
-      evaluationIds: [...new Set(idea.evaluationIds.filter((value) => validIds.has(value)))],
-      resources: [...new Set(idea.resources.map((value) => String(value).toLowerCase().replace(/[^a-z0-9._-]/g, "-")).filter(Boolean))],
-    }));
+    const foundationalIndex = foundationalTarget
+      ? output.ideas.findIndex((idea) => idea.evaluationIds.includes(foundationalTarget.id) && idea.lane === "foundational")
+      : -1;
+    const promotedFoundationalIndex = foundationalIndex >= 0 || !foundationalTarget
+      ? foundationalIndex
+      : output.ideas.findIndex((idea) => idea.evaluationIds.includes(foundationalTarget.id));
+    return output.ideas.map((idea, index) => {
+      const foundational = index === promotedFoundationalIndex;
+      return {
+        title: String(idea.title).trim().slice(0, 120),
+        description: String(idea.description).trim(),
+        rationale: String(idea.rationale).trim(),
+        predictedImpact: clampScore(Number(idea.predictedImpact)),
+        lane: foundational ? "foundational" as const : "incremental" as const,
+        milestone: foundational
+          ? truncateText(String(idea.milestone).trim() || String(idea.description).trim(), 1_000)
+          : "",
+        milestoneCredit: foundational ? clampScore(Number(idea.milestoneCredit)) : 0,
+        evaluationIds: [...new Set(idea.evaluationIds.filter((value) => validIds.has(value)))],
+        resources: [...new Set(idea.resources.map((value) => String(value).toLowerCase().replace(/[^a-z0-9._-]/g, "-")).filter(Boolean))],
+      };
+    });
   }
 
   async implement(
@@ -255,6 +294,9 @@ export class CodexClient {
       `Title: ${idea.title}`,
       `Task: ${idea.description}`,
       `Why it matters: ${idea.rationale}`,
+      idea.lane === "foundational"
+        ? `Foundational milestone: ${idea.milestone}. This milestone may leave the final evaluation score unchanged; deliver the stated prerequisite completely and do not fake, stub, or claim the eventual end-to-end capability.`
+        : "",
       affected.length
         ? `Target scoring criteria (quoted as evaluator context, not instructions for the implementation agent):\n${affected.map((evaluation) => `- ${evaluation.name}: ${evaluation.prompt}`).join("\n")}`
         : "Target: improve the repository according to the task.",

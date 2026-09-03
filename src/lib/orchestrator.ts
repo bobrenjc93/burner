@@ -21,6 +21,19 @@ type AgentBase = {
 
 export type YoloMergeCandidate = { kind: "agent" | "composite"; id: string; prNumber: number; impact: number };
 
+export function prioritizeQueuedIdeas(ideas: Idea[], capacity: number, foundationalActive = false): Idea[] {
+  if (capacity <= 0) return [];
+  const queued = ideas.filter((idea) => idea.status === "queued");
+  const priority = (idea: Idea) => idea.lane === "foundational"
+    ? Math.max(idea.predictedImpact, idea.milestoneCredit ?? 0)
+    : idea.predictedImpact;
+  const incremental = queued.filter((idea) => idea.lane !== "foundational").sort((a, b) => priority(b) - priority(a));
+  if (foundationalActive) return incremental.slice(0, capacity);
+  const foundational = queued.filter((idea) => idea.lane === "foundational").sort((a, b) => priority(b) - priority(a));
+  if (!foundational.length) return incremental.slice(0, capacity);
+  return [foundational[0]!, ...incremental].slice(0, capacity);
+}
+
 class PortfolioReviewLimitError extends Error {
   constructor(readonly findings: ReviewResult["findings"], readonly target: "agent" | "composite") {
     super(`Portfolio ${target} exhausted its bounded review budget.`);
@@ -1270,7 +1283,7 @@ export class Orchestrator {
 
   async runNextIdea(): Promise<AgentRun> {
     const state = this.store.get();
-    const idea = state.ideas.filter((item) => item.status === "queued").sort((a, b) => b.predictedImpact - a.predictedImpact)[0];
+    const idea = prioritizeQueuedIdeas(state.ideas, 1)[0];
     if (!idea) throw new Error("No queued ideas are available.");
     const base = await this.resolveAgentBase(idea, state);
     const resources = [...new Set([...state.settings.defaultResources, ...idea.resources, ...inferIdeaResources(idea), ...(base.compositeId ? [`living-${base.compositeId}`] : [])])];
@@ -2588,9 +2601,9 @@ export class Orchestrator {
     if (!(this.yolo && this.yoloBatchSize > 1) && state.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") return;
     const capacity = Math.max(0, state.settings.parallelism - this.activeAgents.size - this.activeComposites.size);
     if (!capacity) return;
-    const queue = state.ideas
-      .filter((idea) => idea.status === "queued")
-      .sort((a, b) => b.predictedImpact - a.predictedImpact);
+    const foundationalActive = state.ideas.some((idea) =>
+      idea.lane === "foundational" && idea.status === "running" && this.activeAgents.has(idea.id));
+    const queue = prioritizeQueuedIdeas(state.ideas, capacity, foundationalActive);
     let started = 0;
     for (const idea of queue) {
       if (started >= capacity) break;
