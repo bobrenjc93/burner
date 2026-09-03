@@ -346,6 +346,20 @@ export function portfolioMergeTailHeadroom(
   return { allowed: remainingMs > requiredMs, remainingMs, requiredMs };
 }
 
+export function shouldAwaitFoundationalDelivery(
+  state: BurnerState,
+  activeIdeaIds: ReadonlySet<string>,
+  currentTimeMs = Date.now(),
+): boolean {
+  const foundationalActive = state.ideas.some((idea) =>
+    idea.lane === "foundational" && idea.status === "running" && activeIdeaIds.has(idea.id));
+  if (!foundationalActive) return false;
+  const headroom = portfolioMergeTailHeadroom(state, currentTimeMs);
+  // Give an in-flight prerequisite the available slack, but retain a small
+  // handoff margin so an overlong milestone cannot consume the merge tail.
+  return headroom.remainingMs > headroom.requiredMs + 2 * 60_000;
+}
+
 export function leafValidationHeadroom(
   mergeWindowStartedAt: string | undefined,
   mergeCadenceMinutes: number,
@@ -1245,6 +1259,7 @@ export class Orchestrator {
     if (this.yoloBatchSize < 2) return false;
     const state = this.store.get();
     if (this.cadenceCompositeTailExhausted(state)) return false;
+    if (shouldAwaitFoundationalDelivery(state, this.activeAgents)) return false;
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const cadenceDue = this.mergeCadenceUrgent(state);
     const cookDue = cadenceDue || this.portfolioCookDue(state, baseCommit);
@@ -1272,6 +1287,10 @@ export class Orchestrator {
       ? eligible.slice(0, this.yoloBatchSize).map((run) => run.id)
       : selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize);
     const ready = selected.length >= (cadenceDue ? 1 : cookDue ? 2 : this.yoloBatchSize);
+    if (ready && shouldAwaitFoundationalDelivery(state, this.activeAgents)) {
+      this.portfolioDraining = false;
+      return false;
+    }
     if (ready && !this.portfolioDraining) {
       this.portfolioDraining = true;
       await this.store.addActivity({

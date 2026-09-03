@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldAwaitFoundationalDelivery, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, TransientMergeGateError } from "../dist/lib/git.js";
@@ -1784,6 +1784,21 @@ test("milestone credit reserves foundational delivery without changing measured 
 
   assert.deepEqual(selectYoloLeafBatch(state, "base", 2), ["foundation-run", "normal-high-run"]);
   assert.deepEqual(selectYoloMergeCandidate(state, "base"), { kind: "agent", id: "foundation-run", prNumber: 11, impact: 0 });
+});
+
+test("portfolio cooking waits for an active foundational leaf only while cadence has slack", () => {
+  const now = Date.now();
+  const state = {
+    settings: { mergeCadenceMinutes: 60 },
+    orchestrator: { mergeWindowStartedAt: new Date(now - 20 * 60_000).toISOString() },
+    evaluations: [],
+    evaluationRuns: [],
+    ideas: [{ id: "foundation", lane: "foundational", status: "running" }],
+  };
+
+  assert.equal(shouldAwaitFoundationalDelivery(state, new Set(["foundation"]), now), true);
+  assert.equal(shouldAwaitFoundationalDelivery(state, new Set(["foundation"]), now + 10 * 60_000), false);
+  assert.equal(shouldAwaitFoundationalDelivery(state, new Set(), now), false);
 });
 
 test("YOLO merge selection prefers reviewed composites, accepts threshold-equal monotonic work, and rejects every regression", () => {
