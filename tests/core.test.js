@@ -3704,7 +3704,7 @@ test("an exactly merged fully validated leaf becomes the next full baseline", as
     const timestamp = new Date().toISOString();
     await store.update((state) => {
       state.evaluations = [
-        { id: "quality", name: "Quality", prompt: "Score", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp },
+        { id: "quality", name: "Quality", prompt: "Score", command: "full", weight: 1, enabled: true, createdAt: timestamp },
         { id: "docs", name: "Docs", prompt: "Score docs", weight: 1, enabled: true, createdAt: timestamp },
       ];
       state.ideas = [{ id: "idea", title: "Improve", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "leaf" }];
@@ -3718,7 +3718,7 @@ test("an exactly merged fully validated leaf becomes the next full baseline", as
       }];
       state.evaluationRuns.push(
         { id: "old-docs", evaluationId: "docs", score: 75, commit: "old-main", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3 },
-        { id: "leaf-quality", evaluationId: "quality", score: 88, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" },
+        { id: "leaf-quality", evaluationId: "quality", score: 88, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "agent", agentRunId: "leaf" },
         { id: "leaf-docs", evaluationId: "docs", score: 78, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" },
       );
     });

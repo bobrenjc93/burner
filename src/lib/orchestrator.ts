@@ -1622,6 +1622,13 @@ export class Orchestrator {
     const agent = state.agentRuns.find((run) => run.id === runId);
     if (!agent || agent.prState !== "merged" || agent.fullMergeValidation?.qualified !== true) return false;
     const runs = this.store.latestAgentFullRuns(runId);
+    // Full leaf validation may reuse a deterministic command result that was
+    // already recorded on the exact candidate head. That reused result is
+    // part of the qualified suite even though its original context remains
+    // `agent`, so include it when promoting the merged leaf to baseline.
+    for (const run of reusableFullAgentCommandRuns(state, runId, agent.fullMergeValidation.candidateCommit)) {
+      if (!runs.has(run.evaluationId)) runs.set(run.evaluationId, run);
+    }
     const previousBaseline = this.store.latestRuns();
     const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
     const deltas = new Map(agent.deltas.map((delta) => [delta.evaluationId, delta]));
