@@ -2125,8 +2125,10 @@ export class Orchestrator {
     if (!run.prNumber || !run.authorThreadId || !run.baseRef || !run.baseCommit) {
       throw new Error("This run does not have a reusable pull request and author checkpoint.");
     }
-    if (!finalReviewApproved(run.reviewApproved, run.reviewRounds)) {
-      throw new Error("Only an independently approved agent run can be refreshed onto the latest base.");
+    const cadenceYieldedCheckpoint = run.status === "failed" &&
+      run.quarantineReason?.startsWith("Review yielded") === true;
+    if (!finalReviewApproved(run.reviewApproved, run.reviewRounds) && !cadenceYieldedCheckpoint) {
+      throw new Error("Only an independently approved or cadence-yielded agent run can be refreshed onto the latest base.");
     }
     if (this.activeAgents.size + this.activeComposites.size >= state.settings.parallelism) {
       throw new Error("All configured agent slots are currently in use.");

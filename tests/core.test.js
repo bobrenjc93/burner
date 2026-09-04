@@ -1318,6 +1318,57 @@ test("latest-base refresh reuses the reviewed run, branch, and pull request", as
   }
 });
 
+test("latest-base refresh resumes a cadence-yielded checkpoint before re-review", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-cadence-base-refresh-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [];
+      state.ideas.push({ id: "idea", title: "Keep the checkpoint", description: "Refresh it", rationale: "No replacements", predictedImpact: 1, evaluationIds: [], resources: [], status: "failed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "run" });
+      state.agentRuns.push({
+        id: "run", ideaId: "idea", status: "failed", branch: "burner/checkpoint", worktree: root,
+        startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1", lastMessage: "fixed before yielding",
+        baseRef: "main", baseCommit: "old-base", prNumber: 42, prUrl: "https://example.test/pull/42", prState: "closed",
+        reviewApproved: false,
+        reviewRounds: [{ id: "review-1", round: 1, commit: "older-head", approved: true, summary: "Approved before the final fix", findings: [], createdAt: timestamp, completedAt: timestamp }],
+        error: "Portfolio agent yielded its slot to preserve the merge cadence reserve.",
+        quarantinedAt: timestamp,
+        quarantineReason: "Review yielded with 5 minutes left so fallback work can use the merge reserve.",
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
+    orchestrator.restoreBurnerProgressFromCommit = async () => false;
+    orchestrator.git = {
+      resolveRef: async () => "new-base",
+      head: async () => "checkpoint-head",
+      hasChanges: async () => false,
+      mergeBranch: async () => ({ merged: true, conflict: false }),
+      push: async () => undefined,
+    };
+    const retried = [];
+    orchestrator.retryAgent = async (runId) => {
+      retried.push(runId);
+      orchestrator.activeAgents.delete("idea");
+      orchestrator.retryingAgentIds.delete(runId);
+      return store.get().agentRuns.find((run) => run.id === runId);
+    };
+
+    await orchestrator.refreshAgentBaseAndRetry("run");
+
+    const run = store.get().agentRuns.find((item) => item.id === "run");
+    assert.deepEqual(retried, ["run"]);
+    assert.equal(run.baseCommit, "new-base");
+    assert.equal(run.prNumber, 42);
+    assert.equal(run.reviewApproved, false, "the refreshed checkpoint must be reviewed again");
+    assert.equal(run.quarantinedAt, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("merge-gate retry recreates a delivered worktree and sends the failure to the author", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-merge-gate-retry-test-"));
   try {
