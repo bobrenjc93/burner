@@ -166,7 +166,7 @@ export type CompositePr = {
   updatedAt: string;
   mergedAt?: string;
   isLiving: boolean;
-  rebuildMode?: "incremental" | "from_base";
+  rebuildMode?: "incremental" | "from_base" | "resume";
   pendingExperimentRunIds?: string[];
   checkpointBranch?: string;
   quarantinedSourceAgentRunId?: string;

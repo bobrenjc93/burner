@@ -3046,6 +3046,7 @@ test("retrying a failed composite preserves its cumulative review history", asyn
     await orchestrator.retryComposite("failed");
     assert.deepEqual(reopened, [10]);
     assert.equal(store.get().composites[0].status, "rebuilding");
+    assert.equal(store.get().composites[0].rebuildMode, "resume");
     assert.equal(store.get().composites[0].reviewRounds.length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });

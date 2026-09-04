@@ -2096,6 +2096,12 @@ export class Orchestrator {
         const composite = state.composites.find((item) => item.id === compositeId);
         if (composite && composite.status === "failed") {
           composite.status = composite.prNumber ? "rebuilding" : "queued";
+          // A manual retry of an already-published composite should continue
+          // from that PR's last checkpoint. Resetting to the base and merging
+          // the leaf heads again discards integration/review fixes that only
+          // exist on the composite branch and needlessly repeats review work.
+          // Explicit stale-base rebuilds retain their stronger from_base mode.
+          if (composite.prNumber && composite.rebuildMode !== "from_base") composite.rebuildMode = "resume";
           composite.error = undefined;
           composite.reviewApproved = false;
           composite.updatedAt = now();
@@ -2978,16 +2984,23 @@ export class Orchestrator {
       const rootStatus = await this.git.status();
       if (!rootStatus.available || rootStatus.dirty) throw new Error("Composite builds require a clean git base checkout.");
       const baseCommit = await this.git.resolveRef(settings.baseBranch);
+      const resume = rebuild && composite.rebuildMode === "resume" && composite.baseCommit === baseCommit;
       const baseline = this.store.latestRuns();
       const enabledEvaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
       const missing = enabledEvaluations.find((evaluation) => baseline.get(evaluation.id)?.commit !== baseCommit);
       if (missing) throw new Error(`Run a clean baseline at ${settings.baseBranch} before building the composite; '${missing.name}' is stale.`);
-      await this.updateComposite(compositeId, { status: rebuild ? "rebuilding" : "building", baseCommit, error: undefined, updatedAt: now() });
+      await this.updateComposite(compositeId, {
+        status: rebuild ? "rebuilding" : "building",
+        baseCommit,
+        ...(rebuild && composite.rebuildMode === "resume" && !resume ? { rebuildMode: "from_base" as const } : {}),
+        error: undefined,
+        updatedAt: now(),
+      });
 
       const gitLock = await this.locks.acquire("git-metadata", `${compositeId}-create`);
       try {
         worktree = rebuild
-          ? incremental
+          ? incremental || resume
             ? await this.git.createExistingWorktree(compositeId, composite.branch)
             : await this.git.createRebuildWorktree(compositeId, composite.branch, settings.baseBranch)
           : await this.git.createWorktree(compositeId, composite.branch, settings.baseBranch);
@@ -3001,7 +3014,8 @@ export class Orchestrator {
         : undefined;
       const sourcesToMerge = incremental
         ? composite.sources.filter((source) => composite!.pendingExperimentRunIds?.includes(source.agentRunId))
-        : checkpointSource ? [checkpointSource] : composite.sources;
+        : resume ? []
+          : checkpointSource ? [checkpointSource] : composite.sources;
       for (const source of sourcesToMerge) {
         const sourceRef = await this.git.fetchBranch(settings.remote, source.branch);
         const merge = await this.git.mergeBranch(worktree, sourceRef);
