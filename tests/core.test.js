@@ -3459,6 +3459,7 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     assert.ok(calls.some(({ input }) => input.includes("Finish this evaluation within 3 minutes")));
     const candidateEvaluatorCall = calls.find(({ input }) => input.includes("This candidate is not merged yet"));
     assert.match(candidateEvaluatorCall.input, /do not reduce its score because it lacks a history point for the current PR/);
+    assert.match(candidateEvaluatorCall.input, /ignore those generated changes entirely when scoring every rubric/);
     assert.match(candidateEvaluatorCall.input, /Authoritative base calibration for this exact rubric: 65\/100/);
     assert.match(candidateEvaluatorCall.input, /Preserve existing category credit unless concrete current-tree or branch-diff evidence proves a regression/);
     assert.ok(calls.some(({ input }) => input.includes("improvement planner")));

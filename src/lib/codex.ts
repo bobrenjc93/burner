@@ -9,7 +9,7 @@ const UNRESTRICTED_FLAG = "--dangerously-bypass-approvals-and-sandbox";
 const META_DISABLE_SANDBOX_FLAG = "--dangerously-disable-osx-sandbox";
 const AUTOMATION_HOOK_ARGS = ["--disable", "hooks"];
 export const DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS = 4 * 60 * 1000;
-const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation progress artifacts: the managed README section, docs/burner-evaluation-history.json, and docs/burner-evaluation-progress.svg. Burner injects them only after final candidate scores are known. Do not create or modify those artifacts, and do not add repository-side progress generators, validators, tests, or workflows.";
+const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation progress artifacts: the managed README section, docs/burner-evaluation-history.json, and docs/burner-evaluation-progress.svg. Burner injects them only after final candidate scores are known. During exact-head validation those Burner-generated artifacts may therefore appear in the candidate diff; ignore those generated changes entirely when scoring every rubric, including Repository polish and Benchmark integrity, and do not treat them as candidate-authored evidence or regressions. Do not create or modify those artifacts, and do not add repository-side progress generators, validators, tests, or workflows.";
 type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
 
 const evaluationSchema = {
