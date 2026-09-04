@@ -2417,6 +2417,7 @@ export class Orchestrator {
         run.prState === "open" &&
         run.prNumber !== undefined &&
         run.baseCommit !== syncedBaseCommit &&
+        !this.retryingAgentIds.has(run.id) &&
         !reserved.has(run.id));
       const reviewedStaleRunsByIdea = new Map(staleLeaves.flatMap((run) => {
         const idea = current.ideas.find((item) => item.id === run.ideaId);

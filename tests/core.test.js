@@ -3606,7 +3606,7 @@ test("merged composites supersede source PRs and queue overlapping composites fo
   }
 });
 
-test("direct merges requeue reviewed stale sibling experiments on the new base", async () => {
+test("direct merges requeue stale siblings without retiring active retries", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-requeue-stale-leaf-test-"));
   try {
     const store = new StateStore(root);
@@ -3632,10 +3632,11 @@ test("direct merges requeue reviewed stale sibling experiments on the new base",
     await store.update((state) => {
       const merged = run("merged", 10);
       Object.assign(merged, { status: "failed", error: "connection reset by peer", quarantinedAt: timestamp, quarantineReason: "Merge gate rejected PR #10: connection reset by peer" });
-      state.agentRuns.push(merged, run("sibling", 11));
+      state.agentRuns.push(merged, run("sibling", 11), run("active-retry", 12));
       state.ideas.push(
         { id: "idea-merged", title: "Merged", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "merged" },
         { id: "idea-sibling", title: "Reviewed sibling", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "sibling" },
+        { id: "idea-active-retry", title: "Active retry", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "running", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "active-retry" },
       );
     });
     const closed = [];
@@ -3645,11 +3646,13 @@ test("direct merges requeue reviewed stale sibling experiments on the new base",
       listPullRequests: async () => [
         { number: 10, state: "MERGED", headRefName: "branch-merged", url: "" },
         { number: 11, state: "OPEN", headRefName: "branch-sibling", url: "" },
+        { number: 12, state: "OPEN", headRefName: "branch-active-retry", url: "" },
       ],
       markPrDisposition: async () => undefined,
       syncBase: async () => "new-base",
       closePr: async (_cwd, number, comment) => { closed.push([number, comment]); },
     };
+    orchestrator.retryingAgentIds.add("active-retry");
 
     await orchestrator.syncPullRequests(true);
 
@@ -3659,6 +3662,7 @@ test("direct merges requeue reviewed stale sibling experiments on the new base",
     assert.equal(state.agentRuns.find((item) => item.id === "merged").error, undefined);
     assert.equal(state.agentRuns.find((item) => item.id === "merged").quarantinedAt, undefined);
     assert.equal(state.agentRuns.find((item) => item.id === "sibling").prState, "closed");
+    assert.equal(state.agentRuns.find((item) => item.id === "active-retry").prState, "open", "active retries must not be retired while rebasing or revising");
     assert.equal(state.ideas.find((item) => item.id === "idea-merged").status, "completed");
     const sibling = state.ideas.find((item) => item.id === "idea-sibling");
     assert.equal(sibling.status, "queued");
