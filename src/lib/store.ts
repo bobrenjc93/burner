@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { isDeepStrictEqual } from "node:util";
 import type { Activity, BurnerState, Evaluation, EvaluationRun } from "../types.js";
 import { id, now, weightedScore, wellFormedText } from "./utils.js";
 
@@ -13,6 +14,15 @@ type EvaluationConfig = {
 };
 
 const DATA_IGNORE = `# Burner runtime data stays local; evaluation definitions are repository configuration.\n*\n!.gitignore\n!evaluations.json\n`;
+
+function sameJsonDocument(left: string | undefined, right: string): boolean {
+  if (left === undefined) return false;
+  try {
+    return isDeepStrictEqual(JSON.parse(left), JSON.parse(right));
+  } catch {
+    return false;
+  }
+}
 
 const isInconclusiveMeasurement = (run: EvaluationRun): boolean =>
   run.score === 0 &&
@@ -288,7 +298,7 @@ export class StateStore {
         typeof value === "string" ? wellFormedText(value) : value, 2);
       this.state = JSON.parse(serialized) as BurnerState;
       const evaluations = this.serializeEvaluations();
-      if (evaluations !== this.persistedEvaluations) {
+      if (!sameJsonDocument(this.persistedEvaluations, evaluations)) {
         await writeFile(evaluationsTemp, evaluations, "utf8");
         await rename(evaluationsTemp, this.evaluationsPath);
         this.persistedEvaluations = evaluations;
@@ -389,7 +399,7 @@ export class StateStore {
         ...(definitionVersion ? { definitionVersion } : {}),
       };
     });
-    this.persistedEvaluations = source === this.serializeEvaluations() ? source : undefined;
+    this.persistedEvaluations = sameJsonDocument(source, this.serializeEvaluations()) ? source : undefined;
   }
 
   private trim(): void {

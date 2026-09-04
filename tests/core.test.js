@@ -3860,6 +3860,42 @@ test("Burner exposes only repository-owned evaluation files to Git", async () =>
   }
 });
 
+test("semantically unchanged evaluation config preserves checked-in formatting and key order", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-evaluation-order-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    await store.update((state) => {
+      state.evaluations[0].command = "true";
+    });
+    const config = JSON.parse(await readFile(store.evaluationsPath, "utf8"));
+    const evaluation = config.evaluations[0];
+    const reordered = {
+      version: config.version,
+      evaluations: [{
+        name: evaluation.name,
+        prompt: evaluation.prompt,
+        weight: evaluation.weight,
+        enabled: evaluation.enabled,
+        id: evaluation.id,
+        createdAt: evaluation.createdAt,
+        definitionVersion: evaluation.definitionVersion,
+        command: evaluation.command,
+      }],
+    };
+    const source = `${JSON.stringify(reordered, null, 4)}\n`;
+    await writeFile(store.evaluationsPath, source);
+
+    const reloaded = new StateStore(root);
+    await reloaded.init();
+    assert.equal(await readFile(reloaded.evaluationsPath, "utf8"), source);
+    await reloaded.update((state) => { state.projectName = "updated"; });
+    assert.equal(await readFile(reloaded.evaluationsPath, "utf8"), source);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("checked-in evaluations override local state and invalidate changed definitions", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-evaluation-config-test-"));
   try {
