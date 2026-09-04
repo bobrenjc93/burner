@@ -12,7 +12,7 @@ import { EventHub } from "../dist/lib/events.js";
 import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldAwaitFoundationalDelivery, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
-import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, TransientMergeGateError } from "../dist/lib/git.js";
+import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, isTransientGitHubFailure, TransientMergeGateError } from "../dist/lib/git.js";
 import { createBurnerServer } from "../dist/server.js";
 import { StateStore, validateEvaluation } from "../dist/lib/store.js";
 import { clampScore, parseJsonObject, slugify, weightedScore } from "../dist/lib/utils.js";
@@ -28,6 +28,12 @@ test("CLI version matches the package version", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const output = await exec(process.cwd(), process.execPath, ["dist/cli.js", "--version"]);
   assert.equal(output.trim(), packageJson.version);
+});
+
+test("GitHub transport classification recognizes gh connection errors", () => {
+  assert.equal(isTransientGitHubFailure("error connecting to api.github.com\ncheck your internet connection"), true);
+  assert.equal(isTransientGitHubFailure(new Error("failed to connect to api.github.com")), true);
+  assert.equal(isTransientGitHubFailure("GraphQL: Pull Request is not mergeable"), false);
 });
 
 test("command timeouts terminate descendant processes and return exit code 124", async () => {

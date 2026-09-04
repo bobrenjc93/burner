@@ -22,7 +22,7 @@ export class TransientMergeGateError extends Error {
   }
 }
 
-const transientGitHubPattern = /connection (?:reset|refused|closed)|network (?:error|failure)|timed? out|timeout|unexpected eof|tls|temporary failure|service unavailable|no route to host|failed to connect|could not resolve host|http (?:429|5\d\d)|stream (?:error|disconnected)|socket (?:not open|hang up)/i;
+const transientGitHubPattern = /connection (?:reset|refused|closed)|error connecting to|network (?:error|failure)|timed? out|timeout|unexpected eof|tls|temporary failure|service unavailable|no route to host|failed to connect|could not resolve host|http (?:429|5\d\d)|stream (?:error|disconnected)|socket (?:not open|hang up)/i;
 
 export function isTransientGitHubFailure(error: unknown): boolean {
   if (error instanceof TransientMergeGateError) return true;
