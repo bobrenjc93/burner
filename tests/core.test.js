@@ -1263,6 +1263,61 @@ test("agent retry preserves review history and applies unresolved feedback befor
   }
 });
 
+test("latest-base refresh reuses the reviewed run, branch, and pull request", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-agent-base-refresh-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [];
+      state.ideas.push({ id: "idea", title: "Keep the PR", description: "Refresh it", rationale: "No replacements", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "replacement" });
+      state.agentRuns.push({
+        id: "original", ideaId: "idea", status: "completed", branch: "burner/keep-pr", worktree: join(root, "removed"),
+        startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1", lastMessage: "done",
+        baseRef: "main", baseCommit: "old-base", prNumber: 42, prUrl: "https://example.test/pull/42", prState: "closed",
+        reviewApproved: true,
+        reviewRounds: [{ id: "review-1", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
+    orchestrator.restoreBurnerProgressFromCommit = async () => false;
+    const merged = [];
+    const pushed = [];
+    orchestrator.git = {
+      resolveRef: async () => "new-base",
+      head: async (cwd) => { if (cwd.endsWith("removed")) throw new Error("missing"); return "refreshed-head"; },
+      createExistingWorktree: async () => root,
+      hasChanges: async () => false,
+      mergeBranch: async (_cwd, branch) => { merged.push(branch); return { merged: true, conflict: false }; },
+      push: async (_cwd, remote, branch) => { pushed.push([remote, branch]); },
+    };
+    const retried = [];
+    orchestrator.retryAgent = async (runId) => {
+      retried.push(runId);
+      orchestrator.activeAgents.delete("idea");
+      orchestrator.retryingAgentIds.delete(runId);
+      return store.get().agentRuns.find((run) => run.id === runId);
+    };
+
+    await orchestrator.refreshAgentBaseAndRetry("original");
+
+    const run = store.get().agentRuns.find((item) => item.id === "original");
+    const idea = store.get().ideas.find((item) => item.id === "idea");
+    assert.deepEqual(merged, ["main"]);
+    assert.deepEqual(pushed, [["origin", "burner/keep-pr"]]);
+    assert.deepEqual(retried, ["original"]);
+    assert.equal(run.baseCommit, "new-base");
+    assert.equal(run.baseRef, "main");
+    assert.equal(run.prNumber, 42);
+    assert.equal(run.branch, "burner/keep-pr");
+    assert.equal(idea.agentRunId, "original");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("merge-gate retry recreates a delivered worktree and sends the failure to the author", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-merge-gate-retry-test-"));
   try {
@@ -3607,7 +3662,7 @@ test("merged composites supersede source PRs and queue overlapping composites fo
   }
 });
 
-test("direct merges requeue stale siblings without retiring active retries", async () => {
+test("direct merges refresh stale reviewed siblings on the same PR without retiring active retries", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-requeue-stale-leaf-test-"));
   try {
     const store = new StateStore(root);
@@ -3641,7 +3696,9 @@ test("direct merges requeue stale siblings without retiring active retries", asy
       );
     });
     const closed = [];
+    const refreshed = [];
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    await store.update((state) => { state.orchestrator.enabled = true; });
     orchestrator.git = {
       remoteExists: async () => true,
       listPullRequests: async () => [
@@ -3653,6 +3710,7 @@ test("direct merges requeue stale siblings without retiring active retries", asy
       syncBase: async () => "new-base",
       closePr: async (_cwd, number, comment) => { closed.push([number, comment]); },
     };
+    orchestrator.refreshAgentBaseAndRetry = async (runId) => { refreshed.push(runId); return store.get().agentRuns.find((run) => run.id === runId); };
     orchestrator.retryingAgentIds.add("active-retry");
 
     await orchestrator.syncPullRequests(true);
@@ -3662,16 +3720,16 @@ test("direct merges requeue stale siblings without retiring active retries", asy
     assert.equal(state.agentRuns.find((item) => item.id === "merged").status, "completed");
     assert.equal(state.agentRuns.find((item) => item.id === "merged").error, undefined);
     assert.equal(state.agentRuns.find((item) => item.id === "merged").quarantinedAt, undefined);
-    assert.equal(state.agentRuns.find((item) => item.id === "sibling").prState, "closed");
+    assert.equal(state.agentRuns.find((item) => item.id === "sibling").prState, "open");
+    assert.equal(state.agentRuns.find((item) => item.id === "sibling").status, "failed");
     assert.equal(state.agentRuns.find((item) => item.id === "active-retry").prState, "open", "active retries must not be retired while rebasing or revising");
     assert.equal(state.ideas.find((item) => item.id === "idea-merged").status, "completed");
     const sibling = state.ideas.find((item) => item.id === "idea-sibling");
-    assert.equal(sibling.status, "queued");
-    assert.equal(sibling.agentRunId, undefined);
-    assert.equal(closed.length, 1);
-    assert.equal(closed[0][0], 11);
-    assert.match(closed[0][1], /reviewed experiment was requeued/);
-    assert.match(state.activity[0].detail, /1 fully reviewed experiment was requeued/);
+    assert.equal(sibling.status, "failed");
+    assert.equal(sibling.agentRunId, "sibling");
+    assert.deepEqual(closed, []);
+    assert.deepEqual(refreshed, ["sibling"]);
+    assert.match(state.activity[0].detail, /existing branch/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

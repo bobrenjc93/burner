@@ -2115,6 +2115,113 @@ export class Orchestrator {
     void this.scheduleComposites(true);
   }
 
+  async refreshAgentBaseAndRetry(runId: string): Promise<AgentRun> {
+    const state = this.store.get();
+    const run = state.agentRuns.find((item) => item.id === runId);
+    const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
+    if (!run || !idea || !["completed", "failed"].includes(run.status)) {
+      throw new Error("Only a completed or failed agent run can be refreshed onto the latest base.");
+    }
+    if (!run.prNumber || !run.authorThreadId || !run.baseRef || !run.baseCommit) {
+      throw new Error("This run does not have a reusable pull request and author checkpoint.");
+    }
+    if (!finalReviewApproved(run.reviewApproved, run.reviewRounds)) {
+      throw new Error("Only an independently approved agent run can be refreshed onto the latest base.");
+    }
+    if (this.activeAgents.size + this.activeComposites.size >= state.settings.parallelism) {
+      throw new Error("All configured agent slots are currently in use.");
+    }
+
+    this.retryingAgentIds.add(run.id);
+    this.activeAgents.add(idea.id);
+    let handedOff = false;
+    let worktree = run.worktree;
+    try {
+      const latestBaseCommit = await this.git.resolveRef(state.settings.baseBranch);
+      try {
+        if (!worktree) throw new Error("Candidate worktree was removed after delivery.");
+        await this.git.head(worktree);
+      } catch {
+        const gitLock = await this.locks.acquire("git-metadata", `${run.id}-base-refresh-worktree`);
+        try { worktree = await this.git.createExistingWorktree(run.id, run.branch); }
+        finally { await gitLock.release(); }
+      }
+      if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, "burner: preserve interrupted base refresh");
+
+      let authorThreadId = run.authorThreadId;
+      let lastMessage = run.lastMessage ?? "";
+      if (run.baseCommit !== latestBaseCommit) {
+        const merge = await this.git.mergeBranch(worktree, state.settings.baseBranch);
+        if (merge.conflict) {
+          const revision = await this.codex.revise(worktree, authorThreadId, {
+            approved: false,
+            summary: `The pull request must be refreshed onto the latest ${state.settings.baseBranch}.`,
+            findings: [{
+              severity: "high",
+              title: "Resolve latest-base merge conflicts",
+              detail: `Preserve this pull request's intended change while resolving every conflict against ${state.settings.baseBranch} at ${latestBaseCommit.slice(0, 8)}.`,
+              file: "",
+            }],
+          }, state.settings);
+          authorThreadId = revision.threadId;
+          lastMessage = revision.message;
+          if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: resolve ${state.settings.baseBranch} refresh conflicts`);
+        }
+        if (await this.restoreBurnerProgressFromCommit(worktree, latestBaseCommit)) {
+          await this.git.commit(worktree, `burner: restore canonical progress after ${state.settings.baseBranch} refresh`);
+        }
+      }
+      await this.assertCandidateDoesNotOwnProgress(worktree, latestBaseCommit);
+      await this.git.push(worktree, state.settings.remote, run.branch);
+      const refreshedAt = now();
+      await this.store.update((draft) => {
+        const currentRun = draft.agentRuns.find((item) => item.id === run.id);
+        const currentIdea = draft.ideas.find((item) => item.id === idea.id);
+        if (currentRun) Object.assign(currentRun, {
+          worktree,
+          status: "failed",
+          baseRef: state.settings.baseBranch,
+          baseCommit: latestBaseCommit,
+          authorThreadId,
+          lastMessage,
+          completedAt: refreshedAt,
+          error: `Candidate refreshed onto ${state.settings.baseBranch} at ${latestBaseCommit.slice(0, 8)}; same-PR reevaluation pending.`,
+          deltas: [],
+          impact: undefined,
+          fullMergeValidation: undefined,
+          quarantinedAt: undefined,
+          quarantineReason: undefined,
+          supersededByCompositeId: undefined,
+        });
+        if (currentIdea) Object.assign(currentIdea, { status: "failed", agentRunId: run.id, updatedAt: refreshedAt });
+      });
+      await this.store.addActivity({
+        type: "pr",
+        message: `PR #${run.prNumber} refreshed onto ${state.settings.baseBranch}`,
+        detail: "Burner preserved the existing branch, pull request, author session, and review history; full review and evaluation will run again.",
+      });
+
+      // Transfer the temporary scheduling reservation to the ordinary retry
+      // path without yielding, so another dispatch cannot take this slot.
+      this.activeAgents.delete(idea.id);
+      handedOff = true;
+      return await this.retryAgent(run.id);
+    } catch (error) {
+      const message = errorMessage(error);
+      await this.updateAgent(run.id, { status: "failed", error: message, completedAt: now() });
+      await this.store.update((draft) => {
+        const currentIdea = draft.ideas.find((item) => item.id === idea.id);
+        if (currentIdea) Object.assign(currentIdea, { status: "failed", agentRunId: run.id, updatedAt: now() });
+      });
+      throw error;
+    } finally {
+      if (!handedOff) {
+        this.retryingAgentIds.delete(run.id);
+        this.activeAgents.delete(idea.id);
+      }
+    }
+  }
+
   async syncPullRequests(force = false): Promise<void> {
     if (!force && Date.now() - this.lastPrSyncAt < 20_000) return;
     this.lastPrSyncAt = Date.now();
@@ -2275,6 +2382,7 @@ export class Orchestrator {
     const newlyMergedCompositeIds: string[] = [];
     const newlyMergedAgentIds: string[] = [];
     const changedRunIds = new Set<string>();
+    const staleBaseRefreshRunIds: string[] = [];
     const dispositionUpdates: Array<{ number: number; disposition: "merged" | "unmerged" }> = [];
     let baseChanged = Boolean(state.orchestrator.baseSyncPending);
     let syncedBaseCommit: string | undefined;
@@ -2436,31 +2544,44 @@ export class Orchestrator {
           : [];
       }));
       for (const run of staleLeaves) {
-        const requeued = reviewedStaleRunsByIdea.has(run.ideaId);
-        await this.git.closePr(this.root, run.prNumber!, requeued
-          ? `Burner closed this unbatched leaf because the YOLO portfolio advanced ${state.settings.baseBranch}. This reviewed experiment was requeued from ${syncedBaseCommit.slice(0, 8)}.`
-          : `Burner closed this unbatched leaf because the YOLO portfolio advanced ${state.settings.baseBranch}; a fresh experiment will be planned from ${syncedBaseCommit.slice(0, 8)}.`);
+        if (reviewedStaleRunsByIdea.has(run.ideaId)) {
+          staleBaseRefreshRunIds.push(run.id);
+          continue;
+        }
+        await this.git.closePr(this.root, run.prNumber!, `Burner closed this unreviewed leaf because the YOLO portfolio advanced ${state.settings.baseBranch}; a fresh experiment will be planned from ${syncedBaseCommit.slice(0, 8)}.`);
       }
       if (staleLeaves.length) {
         const staleIds = new Set(staleLeaves.map((run) => run.id));
+        const refreshIds = new Set(staleBaseRefreshRunIds);
         await this.store.update((draft) => {
-          for (const run of draft.agentRuns) if (staleIds.has(run.id)) run.prState = "closed";
-          const requeuedAt = now();
+          const refreshedAt = now();
+          for (const run of draft.agentRuns) {
+            if (!staleIds.has(run.id)) continue;
+            if (refreshIds.has(run.id)) {
+              run.status = "failed";
+              run.error = `Base advanced to ${syncedBaseCommit!.slice(0, 8)}; same-PR refresh pending.`;
+              run.completedAt = refreshedAt;
+              run.fullMergeValidation = undefined;
+            } else {
+              run.prState = "closed";
+            }
+          }
           for (const idea of draft.ideas) {
             const staleRunId = reviewedStaleRunsByIdea.get(idea.id);
             if (!staleRunId || idea.status !== "completed" || idea.agentRunId !== staleRunId) continue;
-            idea.status = "queued";
-            idea.agentRunId = undefined;
-            idea.updatedAt = requeuedAt;
+            idea.status = "failed";
+            idea.updatedAt = refreshedAt;
           }
         });
-        const requeuedCount = reviewedStaleRunsByIdea.size;
+        const refreshCount = reviewedStaleRunsByIdea.size;
         await this.store.addActivity({
           type: "pr",
-          message: `${staleLeaves.length} stale leaf PR${staleLeaves.length === 1 ? "" : "s"} closed`,
-          detail: requeuedCount
-            ? `${requeuedCount} fully reviewed experiment${requeuedCount === 1 ? " was" : "s were"} requeued on the newly merged base.`
-            : "The next portfolio generation will branch from the newly merged base.",
+          message: refreshCount
+            ? `${refreshCount} stale reviewed leaf PR${refreshCount === 1 ? "" : "s"} retained for same-PR refresh`
+            : `${staleLeaves.length} stale unreviewed leaf PR${staleLeaves.length === 1 ? "" : "s"} closed`,
+          detail: refreshCount
+            ? `Burner will merge ${state.settings.baseBranch} into the existing branch${refreshCount === 1 ? "" : "es"}, reopen the same pull request if needed, and repeat review and evaluation.`
+            : "Fresh experiments may be planned from the newly merged base.",
         });
       }
       if (staleFailedComposites.length) {
@@ -2491,6 +2612,15 @@ export class Orchestrator {
     }
     await this.ensureLivingComposite();
     this.events.emit("state", this.store.get());
+    if (staleBaseRefreshRunIds.length && this.store.get().orchestrator.enabled) {
+      const available = Math.max(0, this.store.get().settings.parallelism - this.activeAgents.size - this.activeComposites.size);
+      for (const runId of staleBaseRefreshRunIds.slice(0, available)) {
+        void this.refreshAgentBaseAndRetry(runId).catch(async (error) => {
+          await this.store.addActivity({ type: "error", message: `Same-PR base refresh failed: ${runId}`, detail: errorMessage(error) });
+          this.events.emit("error", { message: errorMessage(error) });
+        });
+      }
+    }
   }
 
   private async tick(force = false): Promise<void> {

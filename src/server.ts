@@ -212,6 +212,15 @@ export async function createBurnerServer(options: BurnerServerOptions) {
         events.emit("error", { message: errorMessage(error) });
       });
     }),
+    route("POST", "/api/agents/:runId/rebase-retry", (_request, response, params) => {
+      const run = store.get().agentRuns.find((item) => item.id === params.runId);
+      if (!run) return json(response, 404, { error: "Agent run not found." });
+      json(response, 202, { accepted: true });
+      void orchestrator.refreshAgentBaseAndRetry(params.runId).catch(async (error) => {
+        await store.addActivity({ type: "error", message: `Same-PR base refresh failed: ${params.runId}`, detail: errorMessage(error) });
+        events.emit("error", { message: errorMessage(error) });
+      });
+    }),
     route("POST", "/api/composites", async (_request, response, _params, body) => {
       const agentRunIds = Array.isArray(body.agentRunIds) ? body.agentRunIds.map(String) : [];
       const composite = await orchestrator.createComposite(agentRunIds, String(body.title ?? ""), String(body.description ?? ""));
