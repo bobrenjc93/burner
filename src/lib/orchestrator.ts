@@ -1339,9 +1339,9 @@ export class Orchestrator {
     return completed;
   }
 
-  async retryAgent(runId: string): Promise<AgentRun> {
+  async retryAgent(runId: string, heldLease?: { locks: HeldLock[]; release: () => Promise<void> }): Promise<AgentRun> {
     const state = this.store.get();
-    if (this.activeAgents.size + this.activeComposites.size >= state.settings.parallelism) throw new Error("All configured agent slots are currently in use.");
+    if (!heldLease && this.activeAgents.size + this.activeComposites.size >= state.settings.parallelism) throw new Error("All configured agent slots are currently in use.");
     const run = state.agentRuns.find((item) => item.id === runId);
     const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
     if (!run || run.status !== "failed" || !idea) throw new Error("Only a failed agent run can be retried.");
@@ -1364,7 +1364,7 @@ export class Orchestrator {
     const enabledEvaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
     const missingBaseline = enabledEvaluations.find((evaluation) => baseline.get(evaluation.id)?.commit !== run.baseCommit);
     if (missingBaseline) throw new Error(`Refresh '${missingBaseline.name}' at the candidate base before retrying.`);
-    const lease = await this.locks.tryAcquireAll(run.resources, `${run.id}-retry`);
+    const lease = heldLease ?? await this.locks.tryAcquireAll(run.resources, `${run.id}-retry`);
     if (!lease) throw new Error("A required resource is currently locked.");
     const base: AgentBase = { ref: run.baseRef, commit: run.baseCommit, baseline, compositeId: run.parentCompositeId };
     const unresolvedReview = run.reviewRounds.at(-1);
@@ -2135,8 +2135,11 @@ export class Orchestrator {
     this.retryingAgentIds.add(run.id);
     this.activeAgents.add(idea.id);
     let handedOff = false;
+    let lease: { locks: HeldLock[]; release: () => Promise<void> } | undefined;
     let worktree = run.worktree;
     try {
+      lease = await this.locks.tryAcquireAll(run.resources, `${run.id}-base-refresh`);
+      if (!lease) throw new Error("A required resource is currently locked.");
       const latestBaseCommit = await this.git.resolveRef(state.settings.baseBranch);
       try {
         if (!worktree) throw new Error("Candidate worktree was removed after delivery.");
@@ -2203,9 +2206,9 @@ export class Orchestrator {
 
       // Transfer the temporary scheduling reservation to the ordinary retry
       // path without yielding, so another dispatch cannot take this slot.
-      this.activeAgents.delete(idea.id);
+      const retried = await this.retryAgent(run.id, lease);
       handedOff = true;
-      return await this.retryAgent(run.id);
+      return retried;
     } catch (error) {
       const message = errorMessage(error);
       await this.updateAgent(run.id, { status: "failed", error: message, completedAt: now() });
@@ -2215,6 +2218,7 @@ export class Orchestrator {
       });
       throw error;
     } finally {
+      await lease?.release();
       if (!handedOff) {
         this.retryingAgentIds.delete(run.id);
         this.activeAgents.delete(idea.id);
