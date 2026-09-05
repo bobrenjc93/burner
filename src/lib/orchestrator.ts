@@ -3389,7 +3389,7 @@ export class Orchestrator {
       const roundsUsed = currentRun?.reviewRounds.length ?? 0;
       const liveSettings = liveState.settings;
       if (roundsUsed >= this.portfolioReviewLimit(liveSettings)) break;
-      if (this.portfolioMode() && currentRun?.baseCommit) {
+      if (this.portfolioMode() && liveState.orchestrator.enabled && currentRun?.baseCommit) {
         const cadenceBaseCommit = currentRun.parentCompositeId
           ? await this.git.resolveRef(liveSettings.baseBranch)
           : currentRun.baseCommit;
@@ -3416,7 +3416,7 @@ export class Orchestrator {
       if (currentRounds >= this.portfolioReviewLimit(revisionSettings)) break;
       const revisionState = this.store.get();
       const revisionRun = revisionState.agentRuns.find((run) => run.id === runId);
-      if (this.portfolioMode() && revisionRun?.baseCommit) {
+      if (this.portfolioMode() && revisionState.orchestrator.enabled && revisionRun?.baseCommit) {
         const cadenceBaseCommit = revisionRun.parentCompositeId
           ? await this.git.resolveRef(revisionState.settings.baseBranch)
           : revisionRun.baseCommit;

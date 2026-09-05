@@ -648,6 +648,7 @@ test("YOLO yields a long review loop while an approved fallback can still use th
     const approvedRound = { id: "approved-review", round: 1, commit: "fallback-head", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp };
     await store.update((state) => {
       state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.enabled = true;
       state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 41 * 60_000).toISOString();
       state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
       state.agentRuns = [
@@ -679,6 +680,15 @@ test("YOLO yields a long review loop while an approved fallback can still use th
       /yielded its slot to preserve the merge cadence reserve/,
     );
     assert.equal(reviewed, false, "cadence yield must happen before another expensive review starts");
+
+    await store.update((state) => { state.orchestrator.enabled = false; });
+    orchestrator.codex = { review: async () => { reviewed = true; throw new Error("paused review reached"); } };
+    await assert.rejects(
+      () => orchestrator.reviewAgent(root, "current", "Current", "main", "thread", store.get().settings),
+      /paused review reached/,
+    );
+    assert.equal(reviewed, true, "pausing must let an in-flight or explicitly resumed review finish instead of cadence-yielding it");
+    await store.update((state) => { state.orchestrator.enabled = true; });
 
     await store.update((state) => {
       const fallback = state.agentRuns.find((run) => run.id === "fallback");
