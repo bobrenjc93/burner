@@ -3468,7 +3468,7 @@ export class Orchestrator {
         deltas = incomplete.length ? [] : this.calculateDeltas(state, baseline, afterRuns);
         impact = this.calculateImpact(state, deltas);
         const cumulativeRegressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
-        const highWaterRegressions = previousCompositeFloor
+        const highWaterRegressions = !incomplete.length && previousCompositeFloor
           ? this.calculateDeltas(state, previousCompositeFloor, afterRuns)
               .filter((delta) => (delta.delta ?? -Infinity) < 0)
               .map((delta) => ({ ...delta, summary: `Incremental composite high-water regression. ${delta.summary ?? ""}`.trim() }))
