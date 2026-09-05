@@ -2869,6 +2869,37 @@ test("a confirmed baseline median prevents a noisy single sample from inventing 
   }
 });
 
+test("living composite prompt baselines inherit confirmation from an unchanged main score", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-inherited-prompt-confirmation-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [{ id: "integrity", name: "Integrity", prompt: "Score integrity", weight: 1, enabled: true, createdAt: timestamp }];
+      state.evaluationRuns.push({ id: "baseline", evaluationId: "integrity", score: 97, commit: "main", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3 });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    const calls = [];
+    const candidateScores = [97, 97];
+    orchestrator.runEvaluations = async (context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+      calls.push(context);
+      assert.equal(context, "composite", "an unchanged confirmed main score must not be rerun from the wrong checkout");
+      return [{ id: `candidate-${calls.length}`, evaluationId: "integrity", score: candidateScores.shift(), commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" }];
+    };
+    const parentBaseline = new Map([["integrity", { id: "parent", evaluationId: "integrity", score: 97, commit: "composite", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "living" }]]);
+    const initial = [{ id: "candidate-low", evaluationId: "integrity", score: 88, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "agent", agentRunId: "experiment" }];
+
+    const confirmed = await orchestrator.confirmPromptChanges(root, parentBaseline, initial, "experiment", "experiment");
+
+    assert.equal(parentBaseline.get("integrity").promptSampleCount, 3);
+    assert.equal(confirmed.find((run) => run.evaluationId === "integrity").score, 97);
+    assert.deepEqual(calls, ["composite", "composite"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("prompt change confirmation retries only incomplete samples once", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-prompt-confirmation-retry-test-"));
   try {

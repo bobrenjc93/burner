@@ -1221,6 +1221,26 @@ export class Orchestrator {
   ): Promise<EvaluationRun[] | undefined> {
     const state = this.store.get();
     const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
+    // A living composite may carry an unchanged prompt score from the
+    // authoritative main baseline without copying its sample-count marker.
+    // Treat that identical score as confirmed; rerunning the "baseline" in
+    // the root checkout would measure main while the comparison map points at
+    // the composite commit, making confirmation impossible by construction.
+    const authoritativeBaseline = this.store.latestRuns();
+    for (const evaluation of enabled.filter((item) => !item.command)) {
+      const comparison = baseline.get(evaluation.id);
+      const authoritative = authoritativeBaseline.get(evaluation.id);
+      if (
+        comparison &&
+        (comparison.promptSampleCount ?? 0) < 3 &&
+        authoritative &&
+        authoritative.score === comparison.score &&
+        (authoritative.promptSampleCount ?? 0) >= 3 &&
+        authoritative.evaluationDefinitionVersion === comparison.evaluationDefinitionVersion
+      ) {
+        baseline.set(evaluation.id, { ...comparison, promptSampleCount: 3 });
+      }
+    }
     const deltas = this.calculateDeltas(state, baseline, afterRuns);
     const promptChangeIds = deltas
       .filter((delta) => (delta.delta ?? 0) !== 0 && !enabled.find((evaluation) => evaluation.id === delta.evaluationId)?.command)
