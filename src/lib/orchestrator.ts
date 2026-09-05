@@ -1006,6 +1006,16 @@ export class Orchestrator {
       )) return false;
       candidate = { kind: "agent", id: validatedRun.id, prNumber: validatedRun.prNumber, impact: validatedRun.impact };
     }
+    const finalRetryKey = `${candidate.kind}:${candidate.id}`;
+    if (await this.git.isPrDraft?.(this.root, candidate.prNumber)) {
+      this.mergeRetryAfter.set(finalRetryKey, Date.now() + 5 * 60_000);
+      await this.store.addActivity({
+        type: "pr",
+        message: `Draft PR #${candidate.prNumber} awaits owner publication`,
+        detail: "Review and evaluation are complete. Burner will not mark an agent-authored pull request ready or merge it until the owner publishes the draft.",
+      });
+      return false;
+    }
     await this.store.addActivity({
       type: "pr",
       message: `YOLO approved PR #${candidate.prNumber} for merge`,
@@ -3115,7 +3125,7 @@ export class Orchestrator {
       const body = buildPrBody(idea.description, lastMessage, deltas, impact, currentRun?.reviewRounds ?? []);
       if (currentRun?.prNumber && currentRun.prState === "open") {
         await this.git.editPr(worktree, currentRun.prNumber, idea.title, body);
-        await this.git.markPrReady(worktree, currentRun.prNumber);
+        await this.git.markPrDraft(worktree, currentRun.prNumber);
         pr = { url: currentRun.prUrl ?? "", number: currentRun.prNumber };
       } else {
         pr = await this.git.openPr({
@@ -3124,6 +3134,7 @@ export class Orchestrator {
           branch,
           title: idea.title,
           body,
+          draft: true,
         });
       }
     }
@@ -3315,10 +3326,10 @@ export class Orchestrator {
       if (composite.prNumber) {
         await this.git.forcePush(worktree, settings.remote, composite.branch);
         await this.git.editPr(worktree, composite.prNumber, composite.title, body);
-        await this.git.markPrReady(worktree, composite.prNumber);
+        await this.git.markPrDraft(worktree, composite.prNumber);
       } else {
         await this.git.push(worktree, settings.remote, composite.branch);
-        const pr = await this.git.openPr({ cwd: worktree, base: settings.baseBranch, branch: composite.branch, title: composite.title, body });
+        const pr = await this.git.openPr({ cwd: worktree, base: settings.baseBranch, branch: composite.branch, title: composite.title, body, draft: true });
         await this.updateComposite(compositeId, { prUrl: pr.url, prNumber: pr.number, updatedAt: now() });
       }
       const checkpointBranch = composite.checkpointBranch ?? `burner/checkpoint-${composite.id}`;

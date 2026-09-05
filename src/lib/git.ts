@@ -275,6 +275,15 @@ export class GitService {
     }
   }
 
+  async isPrDraft(cwd: string, number: number): Promise<boolean> {
+    const pullRequest = await this.githubJson<{ isDraft: boolean }>(
+      cwd,
+      ["pr", "view", String(number), "--json", "isDraft"],
+      `inspect draft state for PR #${number}`,
+    );
+    return pullRequest.isDraft;
+  }
+
   async changedFiles(cwd: string, base: string, head: string): Promise<string[]> {
     const result = await runCommand("git", ["diff", "--name-only", `${base}...${head}`], { cwd });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Could not compare ${base} and ${head}`);
