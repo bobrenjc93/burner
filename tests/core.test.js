@@ -4171,6 +4171,43 @@ test("successful experiments bind to and incrementally evolve the living composi
   }
 });
 
+test("living-composite experiments confirm prompt score changes before absorption", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-living-prompt-confirmation-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const evaluation = { id: "quality", name: "Quality", prompt: "Score quality", weight: 1, enabled: true, createdAt: timestamp };
+    const idea = { id: "idea", title: "Infrastructure-only change", description: "", rationale: "", predictedImpact: 1, evaluationIds: ["quality"], resources: [], status: "running", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "experiment" };
+    await store.update((state) => {
+      state.evaluations = [evaluation];
+      state.ideas = [idea];
+      state.agentRuns = [{ id: "experiment", ideaId: "idea", status: "reviewing", branch: "burner/experiment", worktree: root, startedAt: timestamp, baseRef: "burner/living", baseCommit: "base", parentCompositeId: "living", deltas: [], resources: [], reviewRounds: [], reviewApproved: false }];
+    });
+    const baseline = new Map([["quality", { id: "baseline", evaluationId: "quality", score: 80, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "living", promptSampleCount: 3 }]]);
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { resolveRef: async () => "base" };
+    orchestrator.reviewAgent = async () => ({ message: "Reviewed", threadId: "thread" });
+    orchestrator.runCandidateEvaluations = async () => [{ id: "sample", evaluationId: "quality", score: 79, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "agent", agentRunId: "experiment" }];
+    let confirmationCalls = 0;
+    orchestrator.confirmPromptChanges = async (_cwd, _baseline, runs) => {
+      confirmationCalls += 1;
+      return runs.map((run) => ({ ...run, score: 80, promptSampleCount: 3 }));
+    };
+    let absorbed = false;
+    orchestrator.absorbExperiment = async () => { absorbed = true; };
+
+    await orchestrator.reviewAndDeliverAgent(idea, { ref: "burner/living", commit: "base", baseline, compositeId: "living" }, "experiment", root, "burner/experiment", store.get().settings, "thread", "Implemented");
+
+    assert.equal(confirmationCalls, 1);
+    assert.equal(absorbed, true, "the confirmed unchanged score should not reject the experiment");
+    assert.equal(store.get().agentRuns[0].impact, 0);
+    assert.equal(store.get().agentRuns[0].deltas[0].delta, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("state persists evaluation configuration and excludes candidate scores from baseline", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-store-test-"));
   try {

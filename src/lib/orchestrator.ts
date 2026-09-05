@@ -3227,11 +3227,17 @@ export class Orchestrator {
     await this.updateAgent(runId, { lastMessage, authorThreadId: reviewed.threadId, reviewApproved: true });
     if (await this.git.resolveRef(base.ref) !== base.commit) throw new Error("The experiment base moved during the review loop. Retry this idea from the latest living line.");
     await this.updateAgent(runId, { status: "evaluating" });
-    const afterRuns = await this.runCandidateEvaluations("agent", worktree, runId);
+    let afterRuns = await this.runCandidateEvaluations("agent", worktree, runId);
     const enabledCount = this.store.get().evaluations.filter((evaluation) => evaluation.enabled).length;
     const failedEvaluation = afterRuns.find((run) => run.status !== "completed" || run.score === undefined);
     if (failedEvaluation || afterRuns.length !== enabledCount) throw new CandidateEvaluationError("Candidate evaluation remained incomplete after targeted retries; Burner preserved the candidate and will retry its existing worktree once instead of publishing unverifiable scores.");
-    const deltas = this.calculateDeltas(this.store.get(), base.baseline, afterRuns);
+    let deltas = this.calculateDeltas(this.store.get(), base.baseline, afterRuns);
+    const confirmed = await this.confirmPromptChanges(worktree, base.baseline, afterRuns, `experiment '${idea.title}'`, runId);
+    if (!confirmed) throw new CandidateEvaluationError("Candidate prompt-score confirmation remained incomplete; Burner preserved the candidate and will retry its existing worktree once instead of publishing an unconfirmed gain or regression.");
+    if (confirmed !== afterRuns) {
+      afterRuns = confirmed;
+      deltas = this.calculateDeltas(this.store.get(), base.baseline, afterRuns);
+    }
     const impact = this.calculateImpact(this.store.get(), deltas);
     await this.updateAgent(runId, { deltas, impact });
     if (base.compositeId) {
