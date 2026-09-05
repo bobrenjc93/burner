@@ -1417,6 +1417,62 @@ test("latest-base refresh resumes a cadence-yielded checkpoint before re-review"
   }
 });
 
+test("latest-base refresh keeps a living-composite candidate on its parent branch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-living-base-refresh-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [];
+      state.ideas.push({ id: "idea", title: "Keep the experiment", description: "Refresh it", rationale: "No replacements", predictedImpact: 1, evaluationIds: [], resources: [], status: "failed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "run", baseCompositeId: "living" });
+      state.agentRuns.push({
+        id: "run", ideaId: "idea", status: "failed", branch: "burner/experiment", worktree: root,
+        startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1",
+        baseRef: "origin/burner/composite", baseCommit: "old-composite", parentCompositeId: "living",
+        prNumber: 42, prUrl: "https://example.test/pull/42", prState: "closed", reviewApproved: false,
+        reviewRounds: [], error: "Portfolio agent yielded its slot to preserve the merge cadence reserve.",
+        quarantinedAt: timestamp, quarantineReason: "Review yielded with 5 minutes left so fallback work can use the merge reserve.",
+      });
+      state.composites.push({
+        id: "living", title: "Living", description: "", status: "open", branch: "burner/composite", worktree: "",
+        sources: [], deltas: [], reviewRounds: [], reviewApproved: true, prNumber: 99, prUrl: "https://example.test/pull/99",
+        createdAt: timestamp, updatedAt: timestamp, isLiving: true,
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
+    orchestrator.restoreBurnerProgressFromCommit = async () => false;
+    const fetched = [];
+    const merged = [];
+    orchestrator.git = {
+      fetchBranch: async (remote, branch) => { fetched.push([remote, branch]); return `${remote}/${branch}`; },
+      resolveRef: async (ref) => ref === "origin/burner/composite" ? "new-composite" : ref,
+      head: async () => "candidate-head",
+      hasChanges: async () => false,
+      mergeBranch: async (_cwd, branch) => { merged.push(branch); return { merged: true, conflict: false }; },
+      push: async () => undefined,
+    };
+    orchestrator.retryAgent = async (runId) => {
+      orchestrator.activeAgents.delete("idea");
+      orchestrator.retryingAgentIds.delete(runId);
+      return store.get().agentRuns.find((run) => run.id === runId);
+    };
+
+    await orchestrator.refreshAgentBaseAndRetry("run");
+
+    const run = store.get().agentRuns.find((item) => item.id === "run");
+    assert.deepEqual(fetched, [["origin", "burner/composite"]]);
+    assert.deepEqual(merged, ["origin/burner/composite"]);
+    assert.equal(run.baseRef, "origin/burner/composite");
+    assert.equal(run.baseCommit, "new-composite");
+    assert.equal(run.parentCompositeId, "living");
+    assert.match(store.get().activity[0].message, /composite PR #99/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("merge-gate retry recreates a delivered worktree and sends the failure to the author", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-merge-gate-retry-test-"));
   try {

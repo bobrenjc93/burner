@@ -2189,6 +2189,12 @@ export class Orchestrator {
     if (!run.prNumber || !run.authorThreadId || !run.baseRef || !run.baseCommit) {
       throw new Error("This run does not have a reusable pull request and author checkpoint.");
     }
+    const parentComposite = run.parentCompositeId
+      ? state.composites.find((item) => item.id === run.parentCompositeId)
+      : undefined;
+    if (run.parentCompositeId && parentComposite?.status !== "open") {
+      throw new Error("The candidate's parent composite is no longer open; it cannot be refreshed without changing its intended base.");
+    }
     const cadenceYieldedCheckpoint = run.status === "failed" &&
       run.quarantineReason?.startsWith("Review yielded") === true;
     if (!finalReviewApproved(run.reviewApproved, run.reviewRounds) && !cadenceYieldedCheckpoint) {
@@ -2206,7 +2212,13 @@ export class Orchestrator {
     try {
       lease = await this.locks.tryAcquireAll(run.resources, `${run.id}-base-refresh`);
       if (!lease) throw new Error("A required resource is currently locked.");
-      const latestBaseCommit = await this.git.resolveRef(state.settings.baseBranch);
+      const latestBaseRef = parentComposite
+        ? await this.git.fetchBranch(state.settings.remote, parentComposite.branch)
+        : state.settings.baseBranch;
+      const latestBaseLabel = parentComposite
+        ? `composite PR #${parentComposite.prNumber ?? parentComposite.id}`
+        : state.settings.baseBranch;
+      const latestBaseCommit = await this.git.resolveRef(latestBaseRef);
       try {
         if (!worktree) throw new Error("Candidate worktree was removed after delivery.");
         await this.git.head(worktree);
@@ -2220,15 +2232,15 @@ export class Orchestrator {
       let authorThreadId = run.authorThreadId;
       let lastMessage = run.lastMessage ?? "";
       if (run.baseCommit !== latestBaseCommit) {
-        const merge = await this.git.mergeBranch(worktree, state.settings.baseBranch);
+        const merge = await this.git.mergeBranch(worktree, latestBaseRef);
         if (merge.conflict) {
           const revision = await this.codex.revise(worktree, authorThreadId, {
             approved: false,
-            summary: `The pull request must be refreshed onto the latest ${state.settings.baseBranch}.`,
+            summary: `The pull request must be refreshed onto the latest ${latestBaseLabel}.`,
             findings: [{
               severity: "high",
               title: "Resolve latest-base merge conflicts",
-              detail: `Preserve this pull request's intended change while resolving every conflict against ${state.settings.baseBranch} at ${latestBaseCommit.slice(0, 8)}.`,
+              detail: `Preserve this pull request's intended change while resolving every conflict against ${latestBaseLabel} at ${latestBaseCommit.slice(0, 8)}.`,
               file: "",
             }],
           }, state.settings);
@@ -2237,7 +2249,7 @@ export class Orchestrator {
           if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: resolve ${state.settings.baseBranch} refresh conflicts`);
         }
         if (await this.restoreBurnerProgressFromCommit(worktree, latestBaseCommit)) {
-          await this.git.commit(worktree, `burner: restore canonical progress after ${state.settings.baseBranch} refresh`);
+          await this.git.commit(worktree, `burner: restore canonical progress after ${latestBaseLabel} refresh`);
         }
       }
       await this.assertCandidateDoesNotOwnProgress(worktree, latestBaseCommit);
@@ -2249,12 +2261,12 @@ export class Orchestrator {
         if (currentRun) Object.assign(currentRun, {
           worktree,
           status: "failed",
-          baseRef: state.settings.baseBranch,
+          baseRef: latestBaseRef,
           baseCommit: latestBaseCommit,
           authorThreadId,
           lastMessage,
           completedAt: refreshedAt,
-          error: `Candidate refreshed onto ${state.settings.baseBranch} at ${latestBaseCommit.slice(0, 8)}; same-PR reevaluation pending.`,
+          error: `Candidate refreshed onto ${latestBaseLabel} at ${latestBaseCommit.slice(0, 8)}; same-PR reevaluation pending.`,
           deltas: [],
           impact: undefined,
           fullMergeValidation: undefined,
@@ -2266,7 +2278,7 @@ export class Orchestrator {
       });
       await this.store.addActivity({
         type: "pr",
-        message: `PR #${run.prNumber} refreshed onto ${state.settings.baseBranch}`,
+        message: `PR #${run.prNumber} refreshed onto ${latestBaseLabel}`,
         detail: "Burner preserved the existing branch, pull request, author session, and review history; full review and evaluation will run again.",
       });
 
