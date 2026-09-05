@@ -2217,8 +2217,9 @@ export class Orchestrator {
     }
     const cadenceYieldedCheckpoint = run.status === "failed" &&
       run.quarantineReason?.startsWith("Review yielded") === true;
-    if (!finalReviewApproved(run.reviewApproved, run.reviewRounds) && !cadenceYieldedCheckpoint) {
-      throw new Error("Only an independently approved or cadence-yielded agent run can be refreshed onto the latest base.");
+    const interruptedUnpublishedCheckpoint = run.status === "failed" && !run.prNumber && Boolean(run.authorThreadId);
+    if (!finalReviewApproved(run.reviewApproved, run.reviewRounds) && !cadenceYieldedCheckpoint && !interruptedUnpublishedCheckpoint) {
+      throw new Error("Only an independently approved, cadence-yielded, or interrupted unpublished agent run can be refreshed onto the latest base.");
     }
     if (this.activeAgents.size + this.activeComposites.size >= state.settings.parallelism) {
       throw new Error("All configured agent slots are currently in use.");

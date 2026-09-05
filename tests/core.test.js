@@ -1473,7 +1473,7 @@ test("latest-base refresh keeps a living-composite candidate on its parent branc
   }
 });
 
-test("latest-base refresh reuses a rejected unpublished experiment", async () => {
+test("latest-base refresh reuses an interrupted unpublished experiment before review", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-unpublished-base-refresh-test-"));
   try {
     const store = new StateStore(root);
@@ -1483,11 +1483,10 @@ test("latest-base refresh reuses a rejected unpublished experiment", async () =>
       state.evaluations = [];
       state.ideas.push({ id: "idea", title: "Keep unpublished work", description: "Refresh it", rationale: "No replacement", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "run" });
       state.agentRuns.push({
-        id: "run", ideaId: "idea", status: "rejected", branch: "burner/unpublished", worktree: root,
+        id: "run", ideaId: "idea", status: "failed", branch: "burner/unpublished", worktree: root,
         startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1",
         baseRef: "origin/burner/composite", baseCommit: "old-composite", parentCompositeId: "living",
-        reviewApproved: true,
-        reviewRounds: [{ id: "review-1", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
+        reviewApproved: false, reviewRounds: [], error: "Burner stopped before this run completed.",
       });
       state.composites.push({
         id: "living", title: "Living", description: "", status: "open", branch: "burner/composite", worktree: "",
