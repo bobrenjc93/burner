@@ -1473,6 +1473,62 @@ test("latest-base refresh keeps a living-composite candidate on its parent branc
   }
 });
 
+test("latest-base refresh reuses a rejected unpublished experiment", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-unpublished-base-refresh-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [];
+      state.ideas.push({ id: "idea", title: "Keep unpublished work", description: "Refresh it", rationale: "No replacement", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "run" });
+      state.agentRuns.push({
+        id: "run", ideaId: "idea", status: "rejected", branch: "burner/unpublished", worktree: root,
+        startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1",
+        baseRef: "origin/burner/composite", baseCommit: "old-composite", parentCompositeId: "living",
+        reviewApproved: true,
+        reviewRounds: [{ id: "review-1", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
+      });
+      state.composites.push({
+        id: "living", title: "Living", description: "", status: "open", branch: "burner/composite", worktree: "",
+        sources: [], deltas: [], reviewRounds: [], reviewApproved: true, prNumber: 99, prUrl: "https://example.test/pull/99",
+        createdAt: timestamp, updatedAt: timestamp, isLiving: true,
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
+    orchestrator.restoreBurnerProgressFromCommit = async () => false;
+    const pushed = [];
+    orchestrator.git = {
+      fetchBranch: async (remote, branch) => `${remote}/${branch}`,
+      resolveRef: async () => "new-composite",
+      head: async () => "candidate-head",
+      hasChanges: async () => false,
+      mergeBranch: async () => ({ merged: true, conflict: false }),
+      push: async (_cwd, remote, branch) => { pushed.push([remote, branch]); },
+    };
+    const retried = [];
+    orchestrator.retryAgent = async (runId) => {
+      retried.push(runId);
+      orchestrator.activeAgents.delete("idea");
+      orchestrator.retryingAgentIds.delete(runId);
+      return store.get().agentRuns.find((run) => run.id === runId);
+    };
+
+    await orchestrator.refreshAgentBaseAndRetry("run");
+
+    const run = store.get().agentRuns.find((item) => item.id === "run");
+    assert.equal(run.prNumber, undefined);
+    assert.equal(run.baseCommit, "new-composite");
+    assert.deepEqual(pushed, [["origin", "burner/unpublished"]]);
+    assert.deepEqual(retried, ["run"]);
+    assert.match(store.get().activity[0].message, /Candidate branch refreshed/);
+    assert.match(store.get().activity[0].detail, /without creating a replacement pull request/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("merge-gate retry recreates a delivered worktree and sends the failure to the author", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-merge-gate-retry-test-"));
   try {

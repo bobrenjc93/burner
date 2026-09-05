@@ -2203,11 +2203,11 @@ export class Orchestrator {
     const state = this.store.get();
     const run = state.agentRuns.find((item) => item.id === runId);
     const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
-    if (!run || !idea || !["completed", "failed"].includes(run.status)) {
-      throw new Error("Only a completed or failed agent run can be refreshed onto the latest base.");
+    if (!run || !idea || !["completed", "failed", "rejected"].includes(run.status)) {
+      throw new Error("Only a completed, failed, or rejected agent run can be refreshed onto the latest base.");
     }
-    if (!run.prNumber || !run.authorThreadId || !run.baseRef || !run.baseCommit) {
-      throw new Error("This run does not have a reusable pull request and author checkpoint.");
+    if (!run.authorThreadId || !run.baseRef || !run.baseCommit) {
+      throw new Error("This run does not have a reusable author checkpoint.");
     }
     const parentComposite = run.parentCompositeId
       ? state.composites.find((item) => item.id === run.parentCompositeId)
@@ -2298,8 +2298,12 @@ export class Orchestrator {
       });
       await this.store.addActivity({
         type: "pr",
-        message: `PR #${run.prNumber} refreshed onto ${latestBaseLabel}`,
-        detail: "Burner preserved the existing branch, pull request, author session, and review history; full review and evaluation will run again.",
+        message: run.prNumber
+          ? `PR #${run.prNumber} refreshed onto ${latestBaseLabel}`
+          : `Candidate branch refreshed onto ${latestBaseLabel}`,
+        detail: run.prNumber
+          ? "Burner preserved the existing branch, pull request, author session, and review history; full review and evaluation will run again."
+          : "Burner preserved the existing unpublished branch, author session, and review history; full review and evaluation will run again without creating a replacement pull request.",
       });
 
       // Transfer the temporary scheduling reservation to the ordinary retry
