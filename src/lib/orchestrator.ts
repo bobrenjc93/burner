@@ -735,8 +735,21 @@ export class Orchestrator {
     return remainingMs <= leadMs + estimatedLeafMs;
   }
 
-  private assertCompositeEvaluationHeadroom(state = this.store.get()): void {
-    if (!this.portfolioMode()) return;
+  private async compositeCadenceApplies(state: BurnerState, compositeId: string): Promise<boolean> {
+    if (!this.portfolioMode() || !state.orchestrator.enabled) return false;
+    const composite = state.composites.find((item) => item.id === compositeId);
+    if (!composite?.prNumber) return true;
+    try {
+      return (await this.git.isPrDraft?.(this.root, composite.prNumber)) !== true;
+    } catch {
+      // Preserve the conservative cadence guard when GitHub cannot confirm
+      // that the composite is owner-gated.
+      return true;
+    }
+  }
+
+  private async assertCompositeEvaluationHeadroom(compositeId: string, state = this.store.get()): Promise<void> {
+    if (!(await this.compositeCadenceApplies(state, compositeId))) return;
     const headroom = portfolioMergeTailHeadroom(state, Date.now(), "evaluation");
     if (headroom.allowed) return;
     throw new Error(
@@ -3331,7 +3344,7 @@ export class Orchestrator {
       let impact = 0;
       let compositeScore = 0;
       for (let evaluationRevision = 1; evaluationRevision <= 3; evaluationRevision += 1) {
-        this.assertCompositeEvaluationHeadroom(this.store.get());
+        await this.assertCompositeEvaluationHeadroom(compositeId, this.store.get());
         afterRuns = await this.runCandidateEvaluations("composite", worktree, undefined, compositeId);
         state = this.store.get();
         const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
@@ -3363,7 +3376,7 @@ export class Orchestrator {
           throw new Error(`Composite did not become monotonic after 3 evaluation-guided integration revisions: ${reason}.`);
         }
         const headroom = compositeRevisionHeadroom(state.orchestrator.mergeWindowStartedAt, settings.mergeCadenceMinutes);
-        if (!headroom.allowed) {
+        if (!headroom.allowed && await this.compositeCadenceApplies(state, compositeId)) {
           throw new Error(`Composite stopped before evaluation revision ${evaluationRevision}: only ${Math.max(0, headroom.remainingMs / 60_000).toFixed(1)} minutes remain in the merge window, below the ${Math.ceil(headroom.reserveMs / 60_000)}-minute revision reserve. Burner will release the source leaves for a fully validated cadence fallback.`);
         }
         const findings: ReviewResult["findings"] = [

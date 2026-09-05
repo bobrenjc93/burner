@@ -449,6 +449,7 @@ test("composite admission uses the observed full validation tail", async () => {
     const timestamp = new Date(currentTime).toISOString();
     await store.update((state) => {
       state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.enabled = true;
       state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 35 * 60_000).toISOString();
       state.evaluations = [
         { id: "benchmark", name: "Benchmark", prompt: "Measure", command: "./full", weight: 1, enabled: true, createdAt: timestamp, definitionVersion: "v1" },
@@ -473,9 +474,26 @@ test("composite admission uses the observed full validation tail", async () => {
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
     assert.equal(orchestrator.cadenceCompositeTailExhausted(store.get()), true,
       "Burner must not begin a composite whose observed validation tail cannot meet cadence");
-    assert.throws(() => orchestrator.assertCompositeEvaluationHeadroom(store.get()),
+    await assert.rejects(() => orchestrator.assertCompositeEvaluationHeadroom("candidate", store.get()),
       /stopped before full evaluation.*25\.0 minutes remain.*33 minutes/i,
       "headroom must be rechecked against only the still-unrun tail after integration and review");
+
+    await store.update((state) => state.composites.push({
+      id: "candidate", title: "Draft candidate", description: "", status: "evaluating", branch: "burner/candidate", worktree: root,
+      sources: [], deltas: [], reviewRounds: [], prNumber: 10, createdAt: timestamp, updatedAt: timestamp, isLiving: false,
+    }));
+    orchestrator.git = { isPrDraft: async () => true };
+    await assert.doesNotReject(
+      () => orchestrator.assertCompositeEvaluationHeadroom("candidate", store.get()),
+      "an owner-gated draft must finish validation even after the automatic merge window expires",
+    );
+
+    await store.update((state) => { state.orchestrator.enabled = false; });
+    orchestrator.git = { isPrDraft: async () => false };
+    await assert.doesNotReject(
+      () => orchestrator.assertCompositeEvaluationHeadroom("candidate", store.get()),
+      "a paused orchestrator must let an in-flight composite finish validation",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
