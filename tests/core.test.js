@@ -3929,6 +3929,33 @@ test("merged composites supersede source PRs and queue overlapping composites fo
   }
 });
 
+test("pull request reconciliation uses a slower polling cadence while paused", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-pr-sync-cadence-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    let listCalls = 0;
+    orchestrator.git = {
+      remoteExists: async () => true,
+      listPullRequests: async () => { listCalls += 1; return []; },
+    };
+
+    orchestrator.lastPrSyncAt = Date.now() - 61_000;
+    await orchestrator.syncPullRequests();
+    assert.equal(listCalls, 0, "paused reconciliation should wait five minutes");
+
+    await store.update((state) => { state.orchestrator.enabled = true; });
+    await orchestrator.syncPullRequests();
+    assert.equal(listCalls, 1, "active reconciliation should run after one minute");
+
+    await orchestrator.syncPullRequests(true);
+    assert.equal(listCalls, 2, "explicit synchronization must bypass the cadence");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("direct merges refresh stale reviewed siblings on the same PR without retiring active retries", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-requeue-stale-leaf-test-"));
   try {

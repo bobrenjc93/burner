@@ -2305,7 +2305,11 @@ export class Orchestrator {
   }
 
   async syncPullRequests(force = false): Promise<void> {
-    if (!force && Date.now() - this.lastPrSyncAt < 20_000) return;
+    // A reconciliation currently costs two GitHub GraphQL queries. Poll often
+    // enough to notice externally merged/closed PRs during an active run, but
+    // do not spend an entire hourly quota while Burner is paused in a tab.
+    const syncIntervalMs = this.store.get().orchestrator.enabled ? 60_000 : 5 * 60_000;
+    if (!force && Date.now() - this.lastPrSyncAt < syncIntervalMs) return;
     this.lastPrSyncAt = Date.now();
     let state = this.store.get();
     if (!(await this.git.remoteExists(state.settings.remote)) || !(await commandExists("gh", this.root))) return;
