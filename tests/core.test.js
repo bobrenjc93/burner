@@ -3941,13 +3941,13 @@ test("pull request reconciliation uses a slower polling cadence while paused", a
       listPullRequests: async () => { listCalls += 1; return []; },
     };
 
-    orchestrator.lastPrSyncAt = Date.now() - 61_000;
+    orchestrator.lastPrSyncAt = Date.now() - 11 * 60_000;
     await orchestrator.syncPullRequests();
-    assert.equal(listCalls, 0, "paused reconciliation should wait five minutes");
+    assert.equal(listCalls, 0, "paused reconciliation should wait thirty minutes");
 
     await store.update((state) => { state.orchestrator.enabled = true; });
     await orchestrator.syncPullRequests();
-    assert.equal(listCalls, 1, "active reconciliation should run after one minute");
+    assert.equal(listCalls, 1, "active reconciliation should run after ten minutes");
 
     await orchestrator.syncPullRequests(true);
     assert.equal(listCalls, 2, "explicit synchronization must bypass the cadence");

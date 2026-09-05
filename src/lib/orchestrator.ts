@@ -2308,7 +2308,7 @@ export class Orchestrator {
     // A reconciliation currently costs two GitHub GraphQL queries. Poll often
     // enough to notice externally merged/closed PRs during an active run, but
     // do not spend an entire hourly quota while Burner is paused in a tab.
-    const syncIntervalMs = this.store.get().orchestrator.enabled ? 60_000 : 5 * 60_000;
+    const syncIntervalMs = this.store.get().orchestrator.enabled ? 10 * 60_000 : 30 * 60_000;
     if (!force && Date.now() - this.lastPrSyncAt < syncIntervalMs) return;
     this.lastPrSyncAt = Date.now();
     let state = this.store.get();
