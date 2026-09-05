@@ -681,6 +681,15 @@ test("YOLO yields a long review loop while an approved fallback can still use th
     );
     assert.equal(reviewed, false, "cadence yield must happen before another expensive review starts");
 
+    orchestrator.git = { isPrDraft: async () => true };
+    orchestrator.codex = { review: async () => { reviewed = true; throw new Error("draft-gated review reached"); } };
+    await assert.rejects(
+      () => orchestrator.reviewAgent(root, "current", "Current", "main", "thread", store.get().settings),
+      /draft-gated review reached/,
+    );
+    assert.equal(reviewed, true, "an owner-gated draft fallback cannot justify cadence-yielding new work");
+
+    reviewed = false;
     await store.update((state) => { state.orchestrator.enabled = false; });
     orchestrator.codex = { review: async () => { reviewed = true; throw new Error("paused review reached"); } };
     await assert.rejects(
@@ -829,9 +838,20 @@ test("living-composite experiments reserve cadence against the mergeable main-ba
     assert.equal(dispatched, false, "the open living composite must keep the remaining merge reserve");
     assert.match(store.get().activity[0].message, /dispatch held for merge cadence/i);
 
+    orchestrator.git = {
+      fetchBranch: async () => "origin/burner/living",
+      resolveRef: async (ref) => ref === "main" ? "main-base" : "living-head",
+      isPrDraft: async () => true,
+    };
+    dispatched = false;
+    await orchestrator.schedule();
+    assert.equal(dispatched, true, "an owner-gated draft fallback must not hold new author work for an impossible automatic merge");
+    orchestrator.activeAgents.clear();
+
     await store.update((state) => {
       state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 28 * 60_000).toISOString();
     });
+    orchestrator.git.isPrDraft = async () => false;
     let reviewed = false;
     orchestrator.codex = { review: async () => { reviewed = true; throw new Error("review should not start"); } };
     await assert.rejects(

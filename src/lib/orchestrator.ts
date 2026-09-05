@@ -1335,6 +1335,22 @@ export class Orchestrator {
     return ready;
   }
 
+  private async cadenceFallbackAwaitsOwnerPublication(
+    state: BurnerState,
+    baseCommit: string,
+    currentRunId?: string,
+  ): Promise<boolean> {
+    const fallback = selectYoloMergeCandidate(state, baseCommit, true);
+    if (!fallback || (fallback.kind === "agent" && fallback.id === currentRunId)) return false;
+    try {
+      return (await this.git.isPrDraft?.(this.root, fallback.prNumber)) === true;
+    } catch {
+      // Preserve the conservative cadence guard when GitHub cannot confirm
+      // that the fallback is owner-gated.
+      return false;
+    }
+  }
+
   async runCycle(): Promise<void> {
     await this.tick(true);
   }
@@ -2897,7 +2913,9 @@ export class Orchestrator {
           ? await this.git.resolveRef(state.settings.baseBranch)
           : base.commit;
         const cadence = agentDispatchCadenceHeadroom(state, cadenceBaseCommit);
-        if (!cadence.allowed) {
+        const ownerGatedFallback = !cadence.allowed &&
+          await this.cadenceFallbackAwaitsOwnerPublication(state, cadenceBaseCommit);
+        if (!cadence.allowed && !ownerGatedFallback) {
           const window = state.orchestrator.mergeWindowStartedAt;
           if (window && this.agentDispatchHoldWindow !== window) {
             this.agentDispatchHoldWindow = window;
@@ -3451,7 +3469,9 @@ export class Orchestrator {
           ? await this.git.resolveRef(liveSettings.baseBranch)
           : currentRun.baseCommit;
         const cadence = agentReviewCadenceHeadroom(liveState, cadenceBaseCommit, runId);
-        if (!cadence.allowed) throw new PortfolioCadenceYieldError(lastFindings, cadence.remainingMs, cadence.requiredMs);
+        if (!cadence.allowed && !(await this.cadenceFallbackAwaitsOwnerPublication(liveState, cadenceBaseCommit, runId))) {
+          throw new PortfolioCadenceYieldError(lastFindings, cadence.remainingMs, cadence.requiredMs);
+        }
       }
       const roundNumber = roundsUsed + 1;
       await this.updateAgent(runId, { status: "reviewing" });
@@ -3478,7 +3498,9 @@ export class Orchestrator {
           ? await this.git.resolveRef(revisionState.settings.baseBranch)
           : revisionRun.baseCommit;
         const cadence = agentReviewCadenceHeadroom(revisionState, cadenceBaseCommit, runId);
-        if (!cadence.allowed) throw new PortfolioCadenceYieldError(lastFindings, cadence.remainingMs, cadence.requiredMs);
+        if (!cadence.allowed && !(await this.cadenceFallbackAwaitsOwnerPublication(revisionState, cadenceBaseCommit, runId))) {
+          throw new PortfolioCadenceYieldError(lastFindings, cadence.remainingMs, cadence.requiredMs);
+        }
       }
       await this.updateAgent(runId, { status: "revising" });
       const revisionStartCommit = await this.git.head(cwd);
