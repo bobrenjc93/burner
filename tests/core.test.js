@@ -3219,7 +3219,22 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
         qualified: false,
         completedAt: timestamp,
       };
-      state.agentRuns.push(run("a", 1), run("b", 2), failedLeaf, yieldedLeaf, run("ci-failed", 5), fullValidationRejectedLeaf);
+      const reservedRejectedLeaf = run("reserved-rejected", 7);
+      reservedRejectedLeaf.impact = 0.1;
+      reservedRejectedLeaf.deltas = [{ evaluationId: "benchmark", name: "Benchmark integrity", before: 97, after: 89, delta: -8 }];
+      reservedRejectedLeaf.fullMergeValidation = {
+        baseCommit: "base",
+        candidateCommit: "reserved-rejected-head",
+        evaluationFingerprint: "fingerprint",
+        qualified: false,
+        completedAt: timestamp,
+      };
+      const reservedFailedLeaf = run("reserved-failed", 8);
+      reservedFailedLeaf.status = "failed";
+      reservedFailedLeaf.error = "Exact-head full validation regressed";
+      reservedFailedLeaf.quarantinedAt = timestamp;
+      reservedFailedLeaf.quarantineReason = "Merge gate rejected PR #8: Exact-head full validation regressed";
+      state.agentRuns.push(run("a", 1), run("b", 2), failedLeaf, yieldedLeaf, run("ci-failed", 5), fullValidationRejectedLeaf, reservedRejectedLeaf, reservedFailedLeaf);
       state.composites.push({
         id: "failed", title: "Interrupted composite", description: "Combined", status: "failed", branch: "burner/composite-failed", worktree: "",
         sources: [
@@ -3228,6 +3243,15 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
         ],
         deltas: [], reviewRounds: [],
         error: "Burner stopped before this composite run completed.", createdAt: timestamp, updatedAt: timestamp, isLiving: false,
+      });
+      state.composites.push({
+        id: "validated", title: "Validated composite", description: "Combined", status: "open", branch: "burner/composite-validated", worktree: "",
+        sources: [
+          { agentRunId: "reserved-rejected", prNumber: 7, title: "Reserved rejected", branch: "burner/reserved-rejected", kind: "pull_request" },
+          { agentRunId: "reserved-failed", prNumber: 8, title: "Reserved failed", branch: "burner/reserved-failed", kind: "pull_request" },
+        ],
+        deltas: [], reviewRounds: [], reviewApproved: true, impact: 1, prNumber: 101, prUrl: "https://example.test/pull/101",
+        createdAt: timestamp, updatedAt: timestamp, isLiving: false,
       });
     });
     const closed = [];
@@ -3241,7 +3265,10 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
         { number: 4, state: "OPEN", headRefName: "burner/yielded", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 5, state: "OPEN", headRefName: "burner/ci-failed", headRefOid: "failed-head", url: "", labels: [{ name: "burner-unmerged" }], statusCheckRollup: [{ __typename: "CheckRun", name: "Python 3.14 compatibility", status: "COMPLETED", conclusion: "FAILURE" }] },
         { number: 6, state: "OPEN", headRefName: "burner/full-validation-rejected", headRefOid: "rejected-head", url: "", labels: [{ name: "burner-unmerged" }] },
+        { number: 7, state: "OPEN", headRefName: "burner/reserved-rejected", headRefOid: "reserved-rejected-head", url: "", labels: [{ name: "burner-unmerged" }] },
+        { number: 8, state: "OPEN", headRefName: "burner/reserved-failed", url: "", labels: [{ name: "burner-unmerged" }] },
         { number: 100, state: "OPEN", headRefName: "burner/composite-failed", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
+        { number: 101, state: "OPEN", headRefName: "burner/composite-validated", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 200, state: "OPEN", headRefName: "burner/composite-orphan", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 201, state: "OPEN", headRefName: "burner/orphan-leaf", url: "", labels: [{ name: "burner-unmerged" }] },
         { number: 202, state: "OPEN", headRefName: "feature/manual", url: "", labels: [{ name: "burner-unmerged" }] },
@@ -3269,6 +3296,11 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
     assert.equal(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").prState, "closed", "fully evaluated rejected leaves are retired instead of orphaned open");
     assert.match(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").error, /Benchmark integrity -8\.0/);
     assert.match(closed.find(([number]) => number === 6)[1], /retry the failed run to repair the same PR/i);
+    assert.equal(store.get().agentRuns.find((item) => item.id === "reserved-rejected").status, "completed", "an active composite protects a source from leaf-only full-validation retirement");
+    assert.equal(store.get().agentRuns.find((item) => item.id === "reserved-rejected").prState, "open");
+    assert.equal(store.get().agentRuns.find((item) => item.id === "reserved-failed").prState, "open", "an active composite protects an already-failed source until the composite resolves");
+    assert.equal(store.get().composites.find((item) => item.id === "validated").status, "open");
+    assert.equal(store.get().composites.find((item) => item.id === "validated").sources.length, 2);
     assert.match(closed.find(([number]) => number === 4)[1], /explicit retry will reopen this same PR/i);
   } finally {
     await rm(root, { recursive: true, force: true });

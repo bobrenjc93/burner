@@ -2309,12 +2309,14 @@ export class Orchestrator {
       await this.store.addActivity({ type: "error", message: "Orphaned PR cleanup incomplete", detail: orphanCleanupErrors.join("; ").slice(0, 2_000) });
     }
     const byNumber = new Map(pullRequests.map((pr) => [pr.number, pr]));
+    const reservedSourceIds = reservedCompositeSourceIds(state);
     const newlyRejectedOpenLeaves = state.agentRuns.flatMap((run) => {
       if (
         run.status !== "completed" ||
         run.prNumber === undefined ||
         run.prState !== "open" ||
         run.fullMergeValidation?.qualified !== false ||
+        reservedSourceIds.has(run.id) ||
         this.retryingAgentIds.has(run.id)
       ) return [];
       const remote = byNumber.get(run.prNumber);
@@ -2396,6 +2398,7 @@ export class Orchestrator {
       run.prNumber !== undefined &&
       run.prState === "open" &&
       (run.quarantineReason?.startsWith("Merge gate rejected") || run.quarantineReason?.startsWith("Review yielded")) &&
+      !reservedSourceIds.has(run.id) &&
       byNumber.get(run.prNumber)?.state === "OPEN" &&
       !this.retryingAgentIds.has(run.id));
     const failedCleanupErrors: string[] = [];
