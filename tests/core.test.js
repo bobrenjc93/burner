@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldAwaitFoundationalDelivery, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeEvaluationFloor, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldAwaitFoundationalDelivery, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, isTransientGitHubFailure, TransientMergeGateError } from "../dist/lib/git.js";
@@ -178,6 +178,40 @@ test("baseline authority is bound to the exact evaluation definition", () => {
   assert.equal(isAuthoritativeFullBaseline(evaluation, run, "base"), true);
   assert.equal(isAuthoritativeFullBaseline(evaluation, { ...run, evaluationDefinitionVersion: "definition-v1" }, "base"), false);
   assert.equal(isAuthoritativeFullBaseline({ ...evaluation, definitionVersion: undefined }, { ...run, evaluationDefinitionVersion: undefined }, "base"), true, "legacy definitions remain compatible until edited");
+});
+
+test("incremental composite floors preserve confirmed per-evaluation high water", () => {
+  const timestamp = "2026-01-01T00:00:00.000Z";
+  const later = "2026-01-02T00:00:00.000Z";
+  const evaluations = [
+    { id: "quality", name: "Quality", prompt: "Score quality", weight: 1, enabled: true, createdAt: timestamp, definitionVersion: "quality-v2" },
+    { id: "inherited", name: "Inherited", prompt: "Score inherited", weight: 1, enabled: true, createdAt: timestamp, definitionVersion: "inherited-v1" },
+    { id: "coverage", name: "Coverage", prompt: "Measure coverage", command: "./coverage", weight: 1, enabled: true, createdAt: timestamp, definitionVersion: "coverage-v1" },
+  ];
+  const run = (id, evaluationId, score, commit, createdAt, context, extra = {}) => ({
+    id, evaluationId, score, commit, createdAt, durationMs: 1, status: "completed", context, ...extra,
+  });
+  const state = {
+    evaluations,
+    evaluationRuns: [
+      run("main-quality", "quality", 50, "main", timestamp, "baseline", { promptSampleCount: 3, evaluationDefinitionVersion: "quality-v2" }),
+      run("main-inherited", "inherited", 40, "main", timestamp, "baseline", { promptSampleCount: 3, evaluationDefinitionVersion: "inherited-v1" }),
+      run("confirmed-quality", "quality", 60, "old-head", timestamp, "composite", { compositeId: "living", promptSampleCount: 3, evaluationDefinitionVersion: "quality-v2" }),
+      run("noisy-quality", "quality", 50, "new-head", later, "composite", { compositeId: "living", evaluationDefinitionVersion: "quality-v2" }),
+      run("unconfirmed-high", "quality", 75, "new-head", later, "composite", { compositeId: "living", evaluationDefinitionVersion: "quality-v2" }),
+      run("stale-definition", "quality", 99, "old-head", timestamp, "composite", { compositeId: "living", promptSampleCount: 3, evaluationDefinitionVersion: "quality-v1" }),
+      run("inherited-main", "inherited", 40, "new-head", later, "composite", { compositeId: "living", evaluationDefinitionVersion: "inherited-v1" }),
+      run("coverage-high", "coverage", 80, "old-head", timestamp, "composite", { compositeId: "living", evaluationDefinitionVersion: "coverage-v1" }),
+      run("coverage-regression", "coverage", 70, "new-head", later, "composite", { compositeId: "living", evaluationDefinitionVersion: "coverage-v1" }),
+    ],
+  };
+
+  const floor = compositeEvaluationFloor(state, "living");
+  assert.equal(floor.get("quality").score, 60, "a newer unconfirmed prompt sample must not erase a confirmed gain");
+  assert.equal(floor.get("quality").promptSampleCount, 3);
+  assert.equal(floor.get("inherited").score, 40, "a score inherited from a confirmed main baseline is authoritative");
+  assert.equal(floor.get("inherited").promptSampleCount, 3);
+  assert.equal(floor.get("coverage").score, 80, "deterministic command metrics retain their high-water mark");
 });
 
 test("score helpers clamp and weight enabled evaluations", () => {

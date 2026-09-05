@@ -112,6 +112,42 @@ export function isAuthoritativeFullBaseline(evaluation: Evaluation, run: Evaluat
     (Boolean(evaluation.command) || (run!.promptSampleCount ?? 0) >= 3);
 }
 
+export function compositeEvaluationFloor(state: BurnerState, compositeId: string): Map<string, EvaluationRun> {
+  const latestConfirmedBaselines = new Map<string, EvaluationRun>();
+  for (const run of state.evaluationRuns) {
+    if (
+      (run.context !== "baseline" && run.context !== "manual") ||
+      run.status !== "completed" ||
+      run.score === undefined ||
+      (run.promptSampleCount ?? 0) < 3
+    ) continue;
+    const current = latestConfirmedBaselines.get(run.evaluationId);
+    if (!current || run.createdAt > current.createdAt) latestConfirmedBaselines.set(run.evaluationId, run);
+  }
+
+  const floor = new Map<string, EvaluationRun>();
+  for (const evaluation of state.evaluations.filter((item) => item.enabled)) {
+    const authoritative = latestConfirmedBaselines.get(evaluation.id);
+    const candidates = state.evaluationRuns.filter((run) =>
+      run.context === "composite" &&
+      run.compositeId === compositeId &&
+      run.status === "completed" &&
+      run.score !== undefined &&
+      run.evaluationDefinitionVersion === evaluation.definitionVersion &&
+      (Boolean(evaluation.command) ||
+        (run.promptSampleCount ?? 0) >= 3 ||
+        (authoritative &&
+          authoritative.evaluationDefinitionVersion === evaluation.definitionVersion &&
+          authoritative.score === run.score)),
+    );
+    const best = candidates.sort((left, right) =>
+      right.score! - left.score! || right.createdAt.localeCompare(left.createdAt),
+    )[0];
+    if (best) floor.set(evaluation.id, evaluation.command ? best : { ...best, promptSampleCount: 3 });
+  }
+  return floor;
+}
+
 function isAuthoritativeScreeningBaseline(evaluation: Evaluation, run: EvaluationRun | undefined, commit: string): boolean {
   return isCurrentEvaluationRun(evaluation, run, commit);
 }
@@ -3338,6 +3374,10 @@ export class Orchestrator {
       if (composite.sources.length < 2) throw new Error("A composite requires at least two constituent changes.");
       const settings = state.settings;
       const incremental = rebuild && composite.rebuildMode === "incremental" && Boolean(composite.pendingExperimentRunIds?.length);
+      const preserveCompositeHighWater = rebuild && Boolean(composite.pendingExperimentRunIds?.length);
+      const previousCompositeFloor = preserveCompositeHighWater
+        ? compositeEvaluationFloor(state, compositeId)
+        : undefined;
       const rootStatus = await this.git.status();
       if (!rootStatus.available || rootStatus.dirty) throw new Error("Composite builds require a clean git base checkout.");
       const baseCommit = await this.git.resolveRef(settings.baseBranch);
@@ -3346,6 +3386,8 @@ export class Orchestrator {
       const enabledEvaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
       const missing = enabledEvaluations.find((evaluation) => baseline.get(evaluation.id)?.commit !== baseCommit);
       if (missing) throw new Error(`Run a clean baseline at ${settings.baseBranch} before building the composite; '${missing.name}' is stale.`);
+      const missingFloor = previousCompositeFloor && enabledEvaluations.find((evaluation) => !previousCompositeFloor.has(evaluation.id));
+      if (missingFloor) throw new Error(`The previous composite has no confirmed high-water score for '${missingFloor.name}'; reevaluate it before absorbing more work.`);
       await this.updateComposite(compositeId, {
         status: rebuild ? "rebuilding" : "building",
         baseCommit,
@@ -3418,14 +3460,22 @@ export class Orchestrator {
           return !run || run.status !== "completed" || run.score === undefined;
         });
         if (!incomplete.length) {
-          const confirmed = await this.confirmPromptChanges(worktree, baseline, afterRuns, `composite PR #${composite.prNumber ?? composite.id}`, undefined, compositeId);
+          const confirmed = await this.confirmPromptChanges(worktree, previousCompositeFloor ?? baseline, afterRuns, `composite PR #${composite.prNumber ?? composite.id}`, undefined, compositeId);
           if (!confirmed) throw new Error("Composite prompt-change confirmation remained incomplete; the generation was preserved without publishing unverified scores.");
           afterRuns = confirmed;
           state = this.store.get();
         }
         deltas = incomplete.length ? [] : this.calculateDeltas(state, baseline, afterRuns);
         impact = this.calculateImpact(state, deltas);
-        const regressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
+        const cumulativeRegressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
+        const highWaterRegressions = previousCompositeFloor
+          ? this.calculateDeltas(state, previousCompositeFloor, afterRuns)
+              .filter((delta) => (delta.delta ?? -Infinity) < 0)
+              .map((delta) => ({ ...delta, summary: `Incremental composite high-water regression. ${delta.summary ?? ""}`.trim() }))
+          : [];
+        const regressions = [...new Map(
+          [...cumulativeRegressions, ...highWaterRegressions].map((delta) => [delta.evaluationId, delta]),
+        ).values()];
         const qualifies = !incomplete.length && !regressions.length && impact >= settings.compositeAbsorbThreshold;
         if (qualifies) {
           const scoreMap = new Map(afterRuns.filter((run) => run.score !== undefined).map((run) => [run.evaluationId, run.score!]));
