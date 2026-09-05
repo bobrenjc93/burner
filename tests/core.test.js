@@ -3259,7 +3259,13 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
       reservedFailedLeaf.error = "Exact-head full validation regressed";
       reservedFailedLeaf.quarantinedAt = timestamp;
       reservedFailedLeaf.quarantineReason = "Merge gate rejected PR #8: Exact-head full validation regressed";
-      state.agentRuns.push(run("a", 1), run("b", 2), failedLeaf, yieldedLeaf, run("ci-failed", 5), fullValidationRejectedLeaf, reservedRejectedLeaf, reservedFailedLeaf);
+      const absorbedExperiment = run("absorbed-experiment", 9);
+      absorbedExperiment.status = "absorbed";
+      absorbedExperiment.parentCompositeId = "validated";
+      const rejectedExperiment = run("rejected-experiment", 10);
+      rejectedExperiment.status = "rejected";
+      rejectedExperiment.parentCompositeId = "validated";
+      state.agentRuns.push(run("a", 1), run("b", 2), failedLeaf, yieldedLeaf, run("ci-failed", 5), fullValidationRejectedLeaf, reservedRejectedLeaf, reservedFailedLeaf, absorbedExperiment, rejectedExperiment);
       state.composites.push({
         id: "failed", title: "Interrupted composite", description: "Combined", status: "failed", branch: "burner/composite-failed", worktree: "",
         sources: [
@@ -3292,6 +3298,8 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
         { number: 6, state: "OPEN", headRefName: "burner/full-validation-rejected", headRefOid: "rejected-head", url: "", labels: [{ name: "burner-unmerged" }] },
         { number: 7, state: "OPEN", headRefName: "burner/reserved-rejected", headRefOid: "reserved-rejected-head", url: "", labels: [{ name: "burner-unmerged" }] },
         { number: 8, state: "OPEN", headRefName: "burner/reserved-failed", url: "", labels: [{ name: "burner-unmerged" }] },
+        { number: 9, state: "OPEN", headRefName: "burner/absorbed-experiment", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
+        { number: 10, state: "OPEN", headRefName: "burner/rejected-experiment", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 100, state: "OPEN", headRefName: "burner/composite-failed", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 101, state: "OPEN", headRefName: "burner/composite-validated", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 200, state: "OPEN", headRefName: "burner/composite-orphan", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
@@ -3305,7 +3313,7 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
 
     await orchestrator.syncPullRequests(true);
 
-    assert.deepEqual(closed.map(([number]) => number), [200, 201, 100, 3, 4, 5, 6]);
+    assert.deepEqual(closed.map(([number]) => number), [200, 201, 9, 10, 100, 3, 4, 5, 6]);
     assert.match(closed.find(([number]) => number === 200)[1], /no longer represented/);
     assert.match(closed.find(([number]) => number === 100)[1], /failed composite/);
     assert.equal(store.get().composites[0].prNumber, 100, "an interrupted publication must be recovered by its exact branch before cleanup");
@@ -3319,6 +3327,8 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
     assert.match(store.get().agentRuns.find((item) => item.id === "ci-failed").quarantineReason, /Merge gate rejected PR #5/);
     assert.equal(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").status, "failed", "completed leaves rejected by exact-head full validation are failed during reconciliation");
     assert.equal(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").prState, "closed", "fully evaluated rejected leaves are retired instead of orphaned open");
+    assert.equal(store.get().agentRuns.find((item) => item.id === "absorbed-experiment").prState, "closed", "absorbed experiment checkpoints are retired after their change moves into the composite");
+    assert.equal(store.get().agentRuns.find((item) => item.id === "rejected-experiment").prState, "closed", "rejected experiment checkpoints are retired instead of orphaned open");
     assert.match(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").error, /Benchmark integrity -8\.0/);
     assert.match(closed.find(([number]) => number === 6)[1], /retry the failed run to repair the same PR/i);
     assert.equal(store.get().agentRuns.find((item) => item.id === "reserved-rejected").status, "completed", "an active composite protects a source from leaf-only full-validation retirement");
@@ -4002,11 +4012,12 @@ test("successful experiments bind to and incrementally evolve the living composi
       state.orchestrator.livingCompositeId = "living";
       state.composites.push({ id: "living", title: "Year-long line", description: "", status: "open", branch: "burner/living", worktree: "", sources: [{ agentRunId: "seed-a", prNumber: 1, title: "A", branch: "a", kind: "pull_request" }, { agentRunId: "seed-b", prNumber: 2, title: "B", branch: "b", kind: "pull_request" }], deltas: [{ evaluationId: evaluation.id, name: evaluation.name, before: 75, after: 80, delta: 5 }], impact: 5, compositeScore: 80, reviewRounds: [], reviewApproved: true, prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: true, pendingExperimentRunIds: [] });
       state.evaluationRuns.push({ id: "composite-eval", evaluationId: evaluation.id, score: 80, commit: "living-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "living" });
-      state.agentRuns.push({ id: "experiment", ideaId: "idea", status: "evaluating", branch: "burner/experiment", worktree: "/tmp/worktree", startedAt: timestamp, deltas: [], impact: 4, resources: [], reviewRounds: [], reviewApproved: true, baseRef: "burner/living", baseCommit: "living-head", parentCompositeId: "living" });
+      state.agentRuns.push({ id: "experiment", ideaId: "idea", status: "evaluating", branch: "burner/experiment", worktree: "/tmp/worktree", startedAt: timestamp, deltas: [], impact: 4, resources: [], reviewRounds: [], reviewApproved: true, baseRef: "burner/living", baseCommit: "living-head", parentCompositeId: "living", prNumber: 11, prUrl: "https://example.test/pull/11", prState: "open" });
     });
     const pushed = [];
+    const closed = [];
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
-    orchestrator.git = { fetchBranch: async () => "origin/burner/living", resolveRef: async () => "living-head", push: async (_cwd, _remote, branch) => pushed.push(branch) };
+    orchestrator.git = { fetchBranch: async () => "origin/burner/living", resolveRef: async () => "living-head", push: async (_cwd, _remote, branch) => pushed.push(branch), closePr: async (_cwd, number, comment) => closed.push([number, comment]) };
     const base = await orchestrator.resolveAgentBase({ id: "idea", title: "Experiment", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "manual", baseCompositeId: "living" }, store.get());
     assert.equal(base.compositeId, "living");
     assert.equal(base.baseline.get(evaluation.id).score, 80);
@@ -4014,11 +4025,15 @@ test("successful experiments bind to and incrementally evolve the living composi
     const state = store.get();
     const living = state.composites.find((item) => item.id === "living");
     assert.equal(state.agentRuns.find((item) => item.id === "experiment").status, "absorbed");
+    assert.equal(state.agentRuns.find((item) => item.id === "experiment").prState, "closed");
     assert.equal(living.status, "rebuilding");
     assert.equal(living.rebuildMode, "incremental");
     assert.deepEqual(living.pendingExperimentRunIds, ["experiment"]);
     assert.equal(living.sources.at(-1).kind, "experiment");
     assert.deepEqual(pushed, ["burner/experiment"]);
+    assert.equal(closed.length, 1);
+    assert.equal(closed[0][0], 11);
+    assert.match(closed[0][1], /absorbed.*draft composite PR #10/i);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

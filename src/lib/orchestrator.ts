@@ -2395,6 +2395,22 @@ export class Orchestrator {
         detail: newlyFailedOpenLeaves.map((failure) => `#${failure.prNumber}: ${failure.failures.join(", ")}`).join("; ").slice(0, 2_000),
       });
     }
+    const terminalExperimentOpenLeaves = state.agentRuns.filter((run) =>
+      run.parentCompositeId !== undefined &&
+      ["absorbed", "rejected"].includes(run.status) &&
+      run.prNumber !== undefined &&
+      run.prState === "open" &&
+      byNumber.get(run.prNumber)?.state === "OPEN" &&
+      !this.retryingAgentIds.has(run.id));
+    for (const run of terminalExperimentOpenLeaves) {
+      await this.retireTerminalExperimentPr(run.id);
+      const current = this.store.get().agentRuns.find((item) => item.id === run.id);
+      if (current?.prState === "closed") {
+        const remote = byNumber.get(run.prNumber!);
+        if (remote) remote.state = "CLOSED";
+      }
+    }
+    if (terminalExperimentOpenLeaves.length) state = this.store.get();
     const failedOpenComposites = state.composites.filter((composite) =>
       composite.status === "failed" &&
       composite.prNumber !== undefined &&
@@ -2850,6 +2866,7 @@ export class Orchestrator {
       currentRun.completedAt = absorbedAt;
       draft.orchestrator.lastPlanningAt = undefined;
     });
+    await this.retireTerminalExperimentPr(runId);
     await this.store.addActivity({ type: "pr", message: `Experiment absorbed: ${idea.title}`, detail: `Impact +${impact.toFixed(1)}. ${composite.title} will now be rebuilt, reviewed, and fully reevaluated.` });
     this.events.emit("state", this.store.get());
   }
@@ -2973,6 +2990,45 @@ export class Orchestrator {
       await this.store.addActivity({
         type: "error",
         message: `Could not retire cadence-yielded leaf PR #${run.prNumber}`,
+        detail: errorMessage(error),
+      });
+    }
+  }
+
+  private async retireTerminalExperimentPr(runId: string): Promise<void> {
+    const state = this.store.get();
+    const run = state.agentRuns.find((item) => item.id === runId);
+    if (
+      !run?.parentCompositeId ||
+      !["absorbed", "rejected"].includes(run.status) ||
+      !run.prNumber ||
+      run.prState !== "open"
+    ) return;
+    const composite = state.composites.find((item) => item.id === run.parentCompositeId);
+    const absorbed = run.status === "absorbed";
+    const destination = composite?.prNumber
+      ? ` into draft composite PR #${composite.prNumber}`
+      : " into its living composite";
+    const explanation = absorbed
+      ? `Burner absorbed this validated experiment${destination}. Closing the checkpoint PR so the same change is not left open or merged twice.`
+      : "Burner closed this evaluated experiment checkpoint because it regressed an evaluation or did not meet the absorption threshold; the living composite was left unchanged.";
+    try {
+      await this.git.closePr(this.root, run.prNumber, explanation);
+      await this.store.update((draft) => {
+        const current = draft.agentRuns.find((item) => item.id === runId);
+        if (current && current.prNumber === run.prNumber && current.prState !== "merged") current.prState = "closed";
+      });
+      await this.store.addActivity({
+        type: "pr",
+        message: `${absorbed ? "Absorbed" : "Rejected"} experiment PR #${run.prNumber} retired`,
+        detail: absorbed
+          ? "The validated change now advances only through the living composite."
+          : "The evaluated checkpoint remains closed and the living composite is unchanged.",
+      });
+    } catch (error) {
+      await this.store.addActivity({
+        type: "error",
+        message: `Could not retire terminal experiment PR #${run.prNumber}`,
         detail: errorMessage(error),
       });
     }
@@ -3117,6 +3173,7 @@ export class Orchestrator {
       const regressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
       if (impact < settings.compositeAbsorbThreshold || regressions.length) {
         await this.updateAgent(runId, { status: "rejected", completedAt: now() });
+        await this.retireTerminalExperimentPr(runId);
         await this.finishIdea(idea.id, "completed");
         await this.store.addActivity({ type: "agent", message: `Experiment rejected: ${idea.title}`, detail: regressions.length ? `${regressions.length} evaluation regression${regressions.length === 1 ? "" : "s"}; living line unchanged.` : `Impact ${impact.toFixed(1)} did not reach the ${settings.compositeAbsorbThreshold.toFixed(1)} absorption threshold.` });
         return;
