@@ -2299,6 +2299,53 @@ export class Orchestrator {
       await this.store.addActivity({ type: "error", message: "Orphaned PR cleanup incomplete", detail: orphanCleanupErrors.join("; ").slice(0, 2_000) });
     }
     const byNumber = new Map(pullRequests.map((pr) => [pr.number, pr]));
+    const newlyRejectedOpenLeaves = state.agentRuns.flatMap((run) => {
+      if (
+        run.status !== "completed" ||
+        run.prNumber === undefined ||
+        run.prState !== "open" ||
+        run.fullMergeValidation?.qualified !== false ||
+        this.retryingAgentIds.has(run.id)
+      ) return [];
+      const remote = byNumber.get(run.prNumber);
+      if (remote?.state !== "OPEN") return [];
+      if (
+        remote.headRefOid &&
+        run.fullMergeValidation.candidateCommit &&
+        remote.headRefOid !== run.fullMergeValidation.candidateCommit
+      ) return [];
+      const regressions = run.deltas
+        .filter((delta) => (delta.delta ?? -Infinity) < 0)
+        .map((delta) => `${delta.name} ${delta.delta?.toFixed(1)}`);
+      const reason = regressions.length
+        ? `full evaluation regressions: ${regressions.join(", ")}`
+        : `weighted impact ${run.impact?.toFixed(1) ?? "unknown"} did not clear the merge threshold`;
+      return [{ runId: run.id, ideaId: run.ideaId, prNumber: run.prNumber, message: `PR #${run.prNumber} exact-head full validation rejected the candidate: ${reason}.` }];
+    });
+    if (newlyRejectedOpenLeaves.length) {
+      const failedAt = now();
+      await this.store.update((draft) => {
+        for (const failure of newlyRejectedOpenLeaves) {
+          const run = draft.agentRuns.find((item) => item.id === failure.runId);
+          const idea = draft.ideas.find((item) => item.id === failure.ideaId);
+          if (!run || run.status !== "completed" || run.prState !== "open") continue;
+          Object.assign(run, {
+            status: "failed",
+            error: failure.message,
+            completedAt: failedAt,
+            quarantinedAt: failedAt,
+            quarantineReason: `Merge gate rejected PR #${failure.prNumber}: ${failure.message}`,
+          });
+          if (idea) Object.assign(idea, { status: "failed", updatedAt: failedAt });
+        }
+      });
+      state = this.store.get();
+      await this.store.addActivity({
+        type: "error",
+        message: `${newlyRejectedOpenLeaves.length} fully evaluated leaf PR${newlyRejectedOpenLeaves.length === 1 ? "" : "s"} rejected`,
+        detail: `${newlyRejectedOpenLeaves.map((failure) => failure.message).join(" ")} Burner will retire ${newlyRejectedOpenLeaves.length === 1 ? "the PR" : "these PRs"}; an explicit retry reopens and repairs the same pull request.`,
+      });
+    }
     const newlyFailedOpenLeaves = state.agentRuns.flatMap((run) => {
       if (run.status !== "completed" || run.prNumber === undefined || run.prState !== "open" || this.retryingAgentIds.has(run.id)) return [];
       const remote = byNumber.get(run.prNumber);

@@ -3180,7 +3180,17 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
       yieldedLeaf.error = "Portfolio agent yielded its slot to preserve the merge cadence reserve.";
       yieldedLeaf.quarantinedAt = timestamp;
       yieldedLeaf.quarantineReason = "Review yielded with 10 minutes left so fallback work can use the merge reserve.";
-      state.agentRuns.push(run("a", 1), run("b", 2), failedLeaf, yieldedLeaf, run("ci-failed", 5));
+      const fullValidationRejectedLeaf = run("full-validation-rejected", 6);
+      fullValidationRejectedLeaf.impact = 0.1;
+      fullValidationRejectedLeaf.deltas = [{ evaluationId: "benchmark", name: "Benchmark integrity", before: 97, after: 89, delta: -8 }];
+      fullValidationRejectedLeaf.fullMergeValidation = {
+        baseCommit: "base",
+        candidateCommit: "rejected-head",
+        evaluationFingerprint: "fingerprint",
+        qualified: false,
+        completedAt: timestamp,
+      };
+      state.agentRuns.push(run("a", 1), run("b", 2), failedLeaf, yieldedLeaf, run("ci-failed", 5), fullValidationRejectedLeaf);
       state.composites.push({
         id: "failed", title: "Interrupted composite", description: "Combined", status: "failed", branch: "burner/composite-failed", worktree: "",
         sources: [
@@ -3201,6 +3211,7 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
         { number: 3, state: "OPEN", headRefName: "burner/gate", url: "", labels: [{ name: "burner-unmerged" }] },
         { number: 4, state: "OPEN", headRefName: "burner/yielded", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 5, state: "OPEN", headRefName: "burner/ci-failed", headRefOid: "failed-head", url: "", labels: [{ name: "burner-unmerged" }], statusCheckRollup: [{ __typename: "CheckRun", name: "Python 3.14 compatibility", status: "COMPLETED", conclusion: "FAILURE" }] },
+        { number: 6, state: "OPEN", headRefName: "burner/full-validation-rejected", headRefOid: "rejected-head", url: "", labels: [{ name: "burner-unmerged" }] },
         { number: 100, state: "OPEN", headRefName: "burner/composite-failed", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 200, state: "OPEN", headRefName: "burner/composite-orphan", url: "", isDraft: true, labels: [{ name: "burner-unmerged" }] },
         { number: 201, state: "OPEN", headRefName: "burner/orphan-leaf", url: "", labels: [{ name: "burner-unmerged" }] },
@@ -3213,7 +3224,7 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
 
     await orchestrator.syncPullRequests(true);
 
-    assert.deepEqual(closed.map(([number]) => number), [200, 201, 100, 3, 4, 5]);
+    assert.deepEqual(closed.map(([number]) => number), [200, 201, 100, 3, 4, 5, 6]);
     assert.match(closed.find(([number]) => number === 200)[1], /no longer represented/);
     assert.match(closed.find(([number]) => number === 100)[1], /failed composite/);
     assert.equal(store.get().composites[0].prNumber, 100, "an interrupted publication must be recovered by its exact branch before cleanup");
@@ -3225,6 +3236,10 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
     assert.equal(store.get().agentRuns.find((item) => item.id === "ci-failed").status, "failed", "completed leaves with terminal CI failures are failed during reconciliation");
     assert.equal(store.get().agentRuns.find((item) => item.id === "ci-failed").prState, "closed", "completed leaves with terminal CI failures are retired during reconciliation");
     assert.match(store.get().agentRuns.find((item) => item.id === "ci-failed").quarantineReason, /Merge gate rejected PR #5/);
+    assert.equal(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").status, "failed", "completed leaves rejected by exact-head full validation are failed during reconciliation");
+    assert.equal(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").prState, "closed", "fully evaluated rejected leaves are retired instead of orphaned open");
+    assert.match(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").error, /Benchmark integrity -8\.0/);
+    assert.match(closed.find(([number]) => number === 6)[1], /retry the failed run to repair the same PR/i);
     assert.match(closed.find(([number]) => number === 4)[1], /explicit retry will reopen this same PR/i);
   } finally {
     await rm(root, { recursive: true, force: true });
