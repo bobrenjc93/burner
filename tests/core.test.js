@@ -3917,6 +3917,7 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     assert.match(plannerCall.input, /targets a qualifying merge every 60 minutes/);
     assert.match(plannerCall.input, /hard scope constraint/);
     assert.match(plannerCall.input, /Never propose an umbrella task/);
+    assert.match(plannerCall.input, /Never combine evaluator\/corpus changes and the implementation they score/);
     assert.match(plannerCall.input, /"weight": 4/);
     assert.match(plannerCall.input, /"maximumCompositeGain": 80/);
     assert.match(plannerCall.input, /Reserve exactly one proposal for evaluation 'quality'/);
@@ -3929,6 +3930,7 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     assert.match(authorCall.input, /Foundational milestone: Capture one representative graph end to end/);
     assert.match(authorCall.input, /do not constrain this implementation task: edit the worktree and run the relevant tests/);
     assert.match(authorCall.input, /All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree/);
+    assert.match(authorCall.input, /Implementation changes must be scored against the pre-existing denominator/);
     assert.match(authorCall.input, /Burner owns the canonical merge-coupled evaluation progress artifacts/);
     const integratorCall = calls.find(({ input }) => input.includes("author/integrator"));
     assert.match(integratorCall.input, /Never modify parent or sibling repositories/);
