@@ -221,6 +221,78 @@ test("incremental composite floors preserve confirmed per-evaluation high water"
   assert.equal(experimentBaseline.get("coverage").commit, "new-head");
 });
 
+test("candidate evaluation plumbing preserves living-composite calibration", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-candidate-calibration-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const evaluation = {
+      id: "quality",
+      name: "Quality",
+      prompt: "Score quality",
+      weight: 1,
+      enabled: true,
+      createdAt: timestamp,
+      definitionVersion: "quality-v2",
+    };
+    const livingBaseline = {
+      id: "living-quality",
+      evaluationId: evaluation.id,
+      score: 60,
+      summary: "Confirmed living-line quality",
+      evidence: ["Composite evidence"],
+      commit: "living-head",
+      createdAt: timestamp,
+      durationMs: 1,
+      status: "completed",
+      context: "composite",
+      compositeId: "living",
+      promptSampleCount: 3,
+      evaluationDefinitionVersion: evaluation.definitionVersion,
+    };
+    await store.update((state) => {
+      state.evaluations = [evaluation];
+      state.evaluationRuns.push({
+        ...livingBaseline,
+        id: "main-quality",
+        score: 50,
+        summary: "Older main quality",
+        evidence: ["Main evidence"],
+        commit: "main-head",
+        context: "baseline",
+        compositeId: undefined,
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { head: async () => "candidate-head" };
+    let observedBaseline;
+    orchestrator.codex = {
+      preflight: async () => undefined,
+      evaluate: async (_cwd, _evaluation, _settings, context, baseline) => {
+        assert.equal(context, "agent");
+        observedBaseline = baseline;
+        return { score: 60, summary: "Preserved", evidence: [], suggestions: [] };
+      },
+    };
+
+    const calibration = new Map([[evaluation.id, livingBaseline]]);
+    const runs = await orchestrator.runCandidateEvaluations(
+      "agent",
+      root,
+      "child",
+      "living",
+      [],
+      calibration,
+    );
+
+    assert.equal(observedBaseline, livingBaseline);
+    assert.equal(runs[0].score, 60);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("score helpers clamp and weight enabled evaluations", () => {
   assert.equal(clampScore(105), 100);
   assert.equal(clampScore(-4), 0);
@@ -645,7 +717,7 @@ test("cached leaf merge validation bypasses the full evaluation suite", async ()
       state.agentRuns = [{
         id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp,
         prNumber: 1, prState: "open", baseCommit: "base", deltas: [], resources: [], reviewRounds: [],
-        fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v1", threshold: 0, evaluations: [] }), qualified: false, completedAt: timestamp },
+        fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v2", threshold: 0, evaluations: [] }), qualified: false, completedAt: timestamp },
       }];
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
@@ -3077,7 +3149,7 @@ test("cadence fallback skips an unchanged rejected leaf and validates the next c
     await store.init();
     const timestamp = new Date().toISOString();
     const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
-    const fingerprint = JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v1", threshold: 0, evaluations: [{ id: "quality", name: "Quality", prompt: "Score", weight: 1 }] });
+    const fingerprint = JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v2", threshold: 0, evaluations: [{ id: "quality", name: "Quality", prompt: "Score", weight: 1 }] });
     const leaf = (id, number, commit, impact) => ({
       id, ideaId: `idea-${id}`, status: "completed", branch: `burner/${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp,
       prNumber: number, prUrl: `https://example.test/pull/${number}`, prState: "open", baseCommit: "base",

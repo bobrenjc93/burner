@@ -59,7 +59,7 @@ class CandidateEvaluationError extends Error {
   }
 }
 
-const CANDIDATE_EVALUATION_PROTOCOL = "baseline-anchored-v1";
+const CANDIDATE_EVALUATION_PROTOCOL = "baseline-anchored-v2";
 
 function nextEvaluationTimestamp(runs: readonly Pick<EvaluationRun, "createdAt">[]): string {
   const latest = runs.reduce((maximum, run) => Math.max(maximum, Date.parse(run.createdAt) || 0), 0);
@@ -1171,14 +1171,21 @@ export class Orchestrator {
           detail: "The deterministic full command already completed on this exact candidate commit and evaluation definition; prompt and screened evaluations still run through the full merge gate.",
         });
       }
-      let afterRuns = await this.runCandidateEvaluations("composite", worktree, run.id, undefined, reusableCommandRuns);
+      const baseline = this.store.latestRuns();
+      let afterRuns = await this.runCandidateEvaluations(
+        "composite",
+        worktree,
+        run.id,
+        undefined,
+        reusableCommandRuns,
+        baseline,
+      );
       const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
       if (afterRuns.length !== enabled.length || afterRuns.some((item) => item.status !== "completed" || item.score === undefined)) {
         await this.store.addActivity({ type: "error", message: `Full merge validation failed for PR #${run.prNumber}`, detail: "The leaf remains open and will not be merged from screening scores." });
         return false;
       }
       if (await this.git.resolveRef(state.settings.baseBranch) !== baseCommit) return false;
-      const baseline = this.store.latestRuns();
       let deltas = this.calculateDeltas(this.store.get(), baseline, afterRuns);
       const confirmed = await this.confirmPromptChanges(worktree, baseline, afterRuns, `PR #${run.prNumber}`, run.id);
       if (!confirmed) {
@@ -1215,10 +1222,11 @@ export class Orchestrator {
     retryLabel: string,
     agentRunId?: string,
     compositeId?: string,
+    candidateBaseline?: ReadonlyMap<string, EvaluationRun>,
   ): Promise<Map<string, EvaluationRun> | undefined> {
     if (!evaluationIds.length) return new Map();
     const initialConfirmationBatches = await Promise.all([0, 1].map(() =>
-      this.runEvaluations(context, cwd, agentRunId, compositeId, evaluationIds),
+      this.runEvaluations(context, cwd, agentRunId, compositeId, evaluationIds, candidateBaseline),
     ));
     const incompleteBatchIds = initialConfirmationBatches.map((confirmationRuns) =>
       evaluationIds.filter((evaluationId) => {
@@ -1237,7 +1245,14 @@ export class Orchestrator {
     const confirmationBatches = await Promise.all(initialConfirmationBatches.map(async (confirmationRuns, index) => {
       const incompleteIds = incompleteBatchIds[index]!;
       if (!incompleteIds.length) return confirmationRuns;
-      const retries = await this.runEvaluations(context, cwd, agentRunId, compositeId, incompleteIds);
+      const retries = await this.runEvaluations(
+        context,
+        cwd,
+        agentRunId,
+        compositeId,
+        incompleteIds,
+        candidateBaseline,
+      );
       const completed = new Map(confirmationRuns
         .filter((item) => item.status === "completed" && item.score !== undefined)
         .map((item) => [item.evaluationId, item]));
@@ -1312,7 +1327,16 @@ export class Orchestrator {
     ]));
     const baselineSeeds = new Map(baselineConfirmationIds.map((evaluationId) => [evaluationId, baseline.get(evaluationId)!]));
     const [candidateMedians, baselineMedians] = await Promise.all([
-      this.collectPromptMedians("composite", cwd, promptChangeIds, candidateSeeds, candidateLabel, agentRunId, compositeId),
+      this.collectPromptMedians(
+        "composite",
+        cwd,
+        promptChangeIds,
+        candidateSeeds,
+        candidateLabel,
+        agentRunId,
+        compositeId,
+        baseline,
+      ),
       this.collectPromptMedians("baseline", this.root, baselineConfirmationIds, baselineSeeds, `${candidateLabel} baseline`),
     ]);
     if (!candidateMedians || !baselineMedians) return undefined;
@@ -1587,10 +1611,19 @@ export class Orchestrator {
     agentRunId?: string,
     compositeId?: string,
     evaluationIds?: readonly string[],
+    candidateBaseline?: ReadonlyMap<string, EvaluationRun>,
   ): Promise<EvaluationRun[]> {
     const callerRun = agentRunId ? this.store.get().agentRuns.find((run) => run.id === agentRunId) : undefined;
     const callerOwnsCpuLock = Boolean(callerRun?.resources.includes("cpu-heavy") && this.activeAgents.has(callerRun.ideaId));
-    return this.runEvaluationSuite(context, cwd, agentRunId, compositeId, evaluationIds, callerOwnsCpuLock);
+    return this.runEvaluationSuite(
+      context,
+      cwd,
+      agentRunId,
+      compositeId,
+      evaluationIds,
+      callerOwnsCpuLock,
+      candidateBaseline,
+    );
   }
 
   private async confirmBaselinePromptScores(commit: string): Promise<EvaluationRun[] | undefined> {
@@ -1794,9 +1827,12 @@ export class Orchestrator {
     compositeId?: string,
     evaluationIds?: readonly string[],
     callerOwnsCpuLock = false,
+    candidateBaseline?: ReadonlyMap<string, EvaluationRun>,
   ): Promise<EvaluationRun[]> {
     const state = this.store.get();
-    const candidateBaselines = context === "agent" || context === "composite" ? this.store.latestRuns() : undefined;
+    const candidateBaselines = context === "agent" || context === "composite"
+      ? candidateBaseline ?? this.store.latestRuns()
+      : undefined;
     const selectedIds = evaluationIds ? new Set(evaluationIds) : undefined;
     const evaluations = state.evaluations.filter((evaluation) =>
       evaluation.enabled &&
@@ -1889,6 +1925,7 @@ export class Orchestrator {
     agentRunId?: string,
     compositeId?: string,
     initialRuns: readonly EvaluationRun[] = [],
+    candidateBaseline?: ReadonlyMap<string, EvaluationRun>,
   ): Promise<EvaluationRun[]> {
     const enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
     const enabledIds = enabled.map((evaluation) => evaluation.id);
@@ -1904,7 +1941,14 @@ export class Orchestrator {
       });
       for (let pass = 1; pass <= 2; pass += 1) {
         if (!pending.length) break;
-        const runs = await this.runEvaluations(context, cwd, agentRunId, compositeId, pending);
+        const runs = await this.runEvaluations(
+          context,
+          cwd,
+          agentRunId,
+          compositeId,
+          pending,
+          candidateBaseline,
+        );
         for (const run of runs) latest.set(run.evaluationId, run);
         pending = laneIds.filter((evaluationId) => {
           const run = latest.get(evaluationId);
@@ -3302,7 +3346,14 @@ export class Orchestrator {
     await this.updateAgent(runId, { lastMessage, authorThreadId: reviewed.threadId, reviewApproved: true });
     if (await this.git.resolveRef(base.ref) !== base.commit) throw new Error("The experiment base moved during the review loop. Retry this idea from the latest living line.");
     await this.updateAgent(runId, { status: "evaluating" });
-    let afterRuns = await this.runCandidateEvaluations("agent", worktree, runId);
+    let afterRuns = await this.runCandidateEvaluations(
+      "agent",
+      worktree,
+      runId,
+      undefined,
+      [],
+      base.baseline,
+    );
     const enabledCount = this.store.get().evaluations.filter((evaluation) => evaluation.enabled).length;
     const failedEvaluation = afterRuns.find((run) => run.status !== "completed" || run.score === undefined);
     if (failedEvaluation || afterRuns.length !== enabledCount) throw new CandidateEvaluationError("Candidate evaluation remained incomplete after targeted retries; Burner preserved the candidate and will retry its existing worktree once instead of publishing unverifiable scores.");
@@ -3466,7 +3517,15 @@ export class Orchestrator {
       let compositeScore = 0;
       for (let evaluationRevision = 1; evaluationRevision <= 3; evaluationRevision += 1) {
         await this.assertCompositeEvaluationHeadroom(compositeId, this.store.get());
-        afterRuns = await this.runCandidateEvaluations("composite", worktree, undefined, compositeId);
+        const comparisonBaseline = previousCompositeFloor ?? baseline;
+        afterRuns = await this.runCandidateEvaluations(
+          "composite",
+          worktree,
+          undefined,
+          compositeId,
+          [],
+          comparisonBaseline,
+        );
         state = this.store.get();
         const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
         const incomplete = enabled.filter((evaluation) => {
@@ -3474,7 +3533,7 @@ export class Orchestrator {
           return !run || run.status !== "completed" || run.score === undefined;
         });
         if (!incomplete.length) {
-          const confirmed = await this.confirmPromptChanges(worktree, previousCompositeFloor ?? baseline, afterRuns, `composite PR #${composite.prNumber ?? composite.id}`, undefined, compositeId);
+          const confirmed = await this.confirmPromptChanges(worktree, comparisonBaseline, afterRuns, `composite PR #${composite.prNumber ?? composite.id}`, undefined, compositeId);
           if (!confirmed) throw new Error("Composite prompt-change confirmation remained incomplete; the generation was preserved without publishing unverified scores.");
           afterRuns = confirmed;
           state = this.store.get();
