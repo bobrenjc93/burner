@@ -2228,6 +2228,21 @@ test("YOLO drains active agents when an urgent composite is ready to merge", asy
     assert.equal(await orchestrator.shouldDrainForPortfolio(), true);
     assert.match(store.get().activity[0].message, /merge candidate ready/i);
     assert.match(store.get().activity[0].detail, /PR #20/);
+
+    orchestrator.portfolioDraining = false;
+    orchestrator.git = { resolveRef: async () => "base", isPrDraft: async () => true };
+    assert.equal(await orchestrator.shouldDrainForPortfolio(), false, "a draft composite must not drain authors while awaiting owner publication");
+
+    await store.update((state) => {
+      state.composites = [];
+      state.agentRuns = [{
+        id: "leaf", ideaId: "idea", status: "completed", branch: "draft-leaf", worktree: "", startedAt: timestamp, completedAt: timestamp,
+        prUrl: "https://example.test/pull/21", prNumber: 21, prState: "open", baseCommit: "base",
+        deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 81, delta: 1 }], impact: 1,
+        resources: [], reviewRounds: [approvedRound], reviewApproved: true,
+      }];
+    });
+    assert.equal(await orchestrator.shouldDrainForPortfolio(), false, "a single draft fallback leaf must not drain authors when it cannot be merged");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

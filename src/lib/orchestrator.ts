@@ -1294,7 +1294,10 @@ export class Orchestrator {
     const readyComposite = cadenceDue
       ? selectYoloMergeCandidate(state, baseCommit, false)
       : undefined;
-    if (readyComposite) {
+    const readyCompositeIsDraft = readyComposite
+      ? await this.git.isPrDraft?.(this.root, readyComposite.prNumber)
+      : false;
+    if (readyComposite && !readyCompositeIsDraft) {
       if (!this.portfolioDraining) {
         this.portfolioDraining = true;
         await this.store.addActivity({
@@ -1310,7 +1313,11 @@ export class Orchestrator {
     const selected = cookDue
       ? eligible.slice(0, this.yoloBatchSize).map((run) => run.id)
       : selectYoloLeafBatch(state, baseCommit, this.yoloBatchSize);
-    const ready = selected.length >= (cadenceDue ? 1 : cookDue ? 2 : this.yoloBatchSize);
+    let ready = selected.length >= (cadenceDue ? 1 : cookDue ? 2 : this.yoloBatchSize);
+    if (ready && selected.length === 1) {
+      const selectedLeaf = state.agentRuns.find((run) => run.id === selected[0]);
+      if (selectedLeaf?.prNumber && await this.git.isPrDraft?.(this.root, selectedLeaf.prNumber)) ready = false;
+    }
     if (ready && shouldAwaitFoundationalDelivery(state, this.activeAgents)) {
       this.portfolioDraining = false;
       return false;
