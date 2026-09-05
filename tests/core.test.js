@@ -3232,20 +3232,31 @@ test("retrying a failed composite preserves its cumulative review history", asyn
     const store = new StateStore(root);
     await store.init();
     const timestamp = new Date().toISOString();
-    await store.update((state) => state.composites.push({
-      id: "failed", title: "Failed", description: "Combined", status: "failed", branch: "composite", worktree: root, sources: [], deltas: [],
-      reviewRounds: [{ id: "review-1", round: 1, commit: "head", approved: false, summary: "Blocked", findings: [], createdAt: timestamp }],
-      prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: false,
-    }));
+    await store.update((state) => {
+      state.agentRuns.push({
+        id: "closed-source", ideaId: "idea", status: "failed", branch: "source", worktree: "", startedAt: timestamp,
+        completedAt: timestamp, prNumber: 9, prState: "closed", deltas: [], resources: [], reviewRounds: [],
+      });
+      state.composites.push({
+        id: "failed", title: "Failed", description: "Combined", status: "failed", branch: "composite", worktree: root,
+        sources: [
+          { agentRunId: "closed-source", prNumber: 9, title: "Closed source", branch: "source", kind: "pull_request" },
+          { agentRunId: "experiment", title: "Absorbed experiment", branch: "experiment", kind: "experiment" },
+        ],
+        deltas: [], reviewRounds: [{ id: "review-1", round: 1, commit: "head", approved: false, summary: "Blocked", findings: [], createdAt: timestamp }],
+        prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: false,
+      });
+    });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     const reopened = [];
     orchestrator.git = { reopenPr: async (_cwd, number) => reopened.push(number) };
     orchestrator.scheduleComposites = async () => undefined;
     await orchestrator.retryComposite("failed");
-    assert.deepEqual(reopened, [10]);
+    assert.deepEqual(reopened, [9, 10]);
     assert.equal(store.get().composites[0].status, "rebuilding");
     assert.equal(store.get().composites[0].rebuildMode, "resume");
     assert.equal(store.get().composites[0].reviewRounds.length, 1);
+    assert.equal(store.get().agentRuns[0].prState, "open", "retrying the composite restores its tracked source draft before reconciliation");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

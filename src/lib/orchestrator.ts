@@ -2132,11 +2132,24 @@ export class Orchestrator {
   }
 
   async retryComposite(compositeId: string): Promise<void> {
-    const candidate = this.store.get().composites.find((item) => item.id === compositeId);
+    const retryState = this.store.get();
+    const candidate = retryState.composites.find((item) => item.id === compositeId);
     if (!candidate || candidate.status !== "failed") throw new Error("Only a failed composite can be retried.");
+    const retryableSources = candidate.sources.flatMap((source) => {
+      if (source.kind !== "pull_request") return [];
+      const run = retryState.agentRuns.find((item) => item.id === source.agentRunId);
+      if (!run?.prNumber || run.prState === "merged" || run.prState === "superseded") return [];
+      return [{ runId: run.id, prNumber: run.prNumber }];
+    });
     this.retryingCompositeIds.add(compositeId);
+    for (const source of retryableSources) this.retryingAgentIds.add(source.runId);
     let found = false;
     try {
+      // Failed composites and their rejected source leaves are retired together.
+      // Reopen both halves of that tracked relationship on an explicit retry so
+      // the next PR reconciliation cannot prune a validated source merely
+      // because its leaf draft was closed while the composite was inactive.
+      for (const source of retryableSources) await this.git.reopenPr(this.root, source.prNumber);
       if (candidate.prNumber) await this.git.reopenPr(this.root, candidate.prNumber);
       await this.store.update((state) => {
         const composite = state.composites.find((item) => item.id === compositeId);
@@ -2151,11 +2164,16 @@ export class Orchestrator {
           composite.error = undefined;
           composite.reviewApproved = false;
           composite.updatedAt = now();
+          for (const source of retryableSources) {
+            const run = state.agentRuns.find((item) => item.id === source.runId);
+            if (run && run.prState !== "merged" && run.prState !== "superseded") run.prState = "open";
+          }
           found = true;
         }
       });
     } finally {
       this.retryingCompositeIds.delete(compositeId);
+      for (const source of retryableSources) this.retryingAgentIds.delete(source.runId);
     }
     if (!found) throw new Error("Only a failed composite can be retried.");
     void this.scheduleComposites(true);
