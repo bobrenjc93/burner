@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeEvaluationFloor, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldAwaitFoundationalDelivery, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeEvaluationFloor, compositeExperimentBaseline, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldAwaitFoundationalDelivery, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, isTransientGitHubFailure, TransientMergeGateError } from "../dist/lib/git.js";
@@ -212,6 +212,13 @@ test("incremental composite floors preserve confirmed per-evaluation high water"
   assert.equal(floor.get("inherited").score, 40, "a score inherited from a confirmed main baseline is authoritative");
   assert.equal(floor.get("inherited").promptSampleCount, 3);
   assert.equal(floor.get("coverage").score, 80, "deterministic command metrics retain their high-water mark");
+
+  const experimentBaseline = compositeExperimentBaseline(state, "living", "new-head");
+  assert.equal(experimentBaseline.get("quality").score, 60);
+  assert.equal(experimentBaseline.get("quality").promptSampleCount, 3);
+  assert.equal(experimentBaseline.get("quality").commit, "new-head", "confirmed high-water values must be projected onto the exact experiment base");
+  assert.equal(experimentBaseline.get("coverage").score, 80);
+  assert.equal(experimentBaseline.get("coverage").commit, "new-head");
 });
 
 test("score helpers clamp and weight enabled evaluations", () => {
@@ -4265,7 +4272,7 @@ test("successful experiments bind to and incrementally evolve the living composi
     await store.update((state) => {
       state.orchestrator.livingCompositeId = "living";
       state.composites.push({ id: "living", title: "Year-long line", description: "", status: "open", branch: "burner/living", worktree: "", sources: [{ agentRunId: "seed-a", prNumber: 1, title: "A", branch: "a", kind: "pull_request" }, { agentRunId: "seed-b", prNumber: 2, title: "B", branch: "b", kind: "pull_request" }], deltas: [{ evaluationId: evaluation.id, name: evaluation.name, before: 75, after: 80, delta: 5 }], impact: 5, compositeScore: 80, reviewRounds: [], reviewApproved: true, prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: true, pendingExperimentRunIds: [] });
-      state.evaluationRuns.push({ id: "composite-eval", evaluationId: evaluation.id, score: 80, commit: "living-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "living" });
+      state.evaluationRuns.push({ id: "composite-eval", evaluationId: evaluation.id, score: 80, commit: "living-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "living", promptSampleCount: 3, evaluationDefinitionVersion: evaluation.definitionVersion });
       state.agentRuns.push({ id: "experiment", ideaId: "idea", status: "evaluating", branch: "burner/experiment", worktree: "/tmp/worktree", startedAt: timestamp, deltas: [], impact: 4, resources: [], reviewRounds: [], reviewApproved: true, baseRef: "burner/living", baseCommit: "living-head", parentCompositeId: "living", prNumber: 11, prUrl: "https://example.test/pull/11", prState: "open" });
     });
     const pushed = [];
@@ -4275,6 +4282,8 @@ test("successful experiments bind to and incrementally evolve the living composi
     const base = await orchestrator.resolveAgentBase({ id: "idea", title: "Experiment", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "manual", baseCompositeId: "living" }, store.get());
     assert.equal(base.compositeId, "living");
     assert.equal(base.baseline.get(evaluation.id).score, 80);
+    assert.equal(base.baseline.get(evaluation.id).commit, "living-head");
+    assert.equal(base.baseline.get(evaluation.id).promptSampleCount, 3);
     await orchestrator.absorbExperiment("living", "experiment", { id: "idea", title: "Experiment", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "running", createdAt: timestamp, updatedAt: timestamp, source: "manual" }, "/tmp/worktree", "burner/experiment", 4, store.get().settings);
     const state = store.get();
     const living = state.composites.find((item) => item.id === "living");

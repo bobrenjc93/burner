@@ -148,6 +148,20 @@ export function compositeEvaluationFloor(state: BurnerState, compositeId: string
   return floor;
 }
 
+export function compositeExperimentBaseline(
+  state: BurnerState,
+  compositeId: string,
+  baseCommit: string,
+): Map<string, EvaluationRun> {
+  // The floor is durable policy state for this living line. Project it onto
+  // the exact current head so an experiment neither forgets a confirmed high
+  // water mark nor tries to remeasure that non-main baseline in the root tree.
+  return new Map([...compositeEvaluationFloor(state, compositeId)].map(([evaluationId, run]) => [
+    evaluationId,
+    { ...run, commit: baseCommit },
+  ]));
+}
+
 function isAuthoritativeScreeningBaseline(evaluation: Evaluation, run: EvaluationRun | undefined, commit: string): boolean {
   return isCurrentEvaluationRun(evaluation, run, commit);
 }
@@ -1461,7 +1475,7 @@ export class Orchestrator {
     }
     if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, "burner: preserve interrupted revision");
     const baseline = run.parentCompositeId
-      ? this.store.latestCompositeRuns(run.parentCompositeId)
+      ? compositeExperimentBaseline(this.store.get(), run.parentCompositeId, run.baseCommit)
       : this.portfolioMode() ? this.store.latestAgentBaselines() : this.store.latestRuns();
     const enabledEvaluations = state.evaluations.filter((evaluation) => evaluation.enabled);
     const missingBaseline = enabledEvaluations.find((evaluation) => baseline.get(evaluation.id)?.commit !== run.baseCommit);
@@ -2947,7 +2961,7 @@ export class Orchestrator {
     if (composite && (portfolioMode || state.settings.preferLivingComposite)) {
       const ref = await this.git.fetchBranch(state.settings.remote, composite.branch);
       const commit = await this.git.resolveRef(ref);
-      const baseline = this.store.latestCompositeRuns(composite.id);
+      const baseline = compositeExperimentBaseline(state, composite.id, commit);
       return { ref, commit, baseline, compositeId: composite.id };
     }
     const commit = await this.git.resolveRef(state.settings.baseBranch);
