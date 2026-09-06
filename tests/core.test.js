@@ -3989,6 +3989,7 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     const candidateEvaluatorCall = calls.find(({ input }) => input.includes("This candidate is not merged yet"));
     assert.match(candidateEvaluatorCall.input, /package or executable under test resolves from the current worktree/);
     assert.match(candidateEvaluatorCall.input, /do not score that contaminated result/);
+    assert.match(candidateEvaluatorCall.input, /preserve the applicable baseline calibration rather than inventing a candidate regression/);
     assert.match(candidateEvaluatorCall.input, /do not reduce its score because it lacks a history point for the current PR/);
     assert.match(candidateEvaluatorCall.input, /ignore those generated changes entirely when scoring every rubric/);
     assert.match(candidateEvaluatorCall.input, /Authoritative base calibration for this exact rubric: 65\/100/);
