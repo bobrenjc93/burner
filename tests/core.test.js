@@ -4017,6 +4017,8 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     const integratorCall = calls.find(({ input }) => input.includes("author/integrator"));
     assert.match(integratorCall.input, /Never modify parent or sibling repositories/);
     assert.match(integratorCall.input, /Burner owns the canonical merge-coupled evaluation progress artifacts/);
+    assert.match(integratorCall.input, /Never retain a leaf, sibling, parent, or stale-worktree path in a composite artifact/);
+    assert.match(integratorCall.input, /never hand-edit provenance or fabricate measurements/);
     const revisionCall = calls.find(({ input }) => input.includes("independent reviewer requested changes"));
     assert.match(revisionCall.input, /Never modify parent or sibling repositories/);
     assert.match(revisionCall.input, /do not implement that invalid request/);
@@ -4024,6 +4026,7 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     assert.equal(reviewerCalls.length, 2);
     assert.match(reviewerCalls[0].input, /comprehensive blocker pass now/);
     assert.match(reviewerCalls[0].input, /Treat candidate-authored duplicate progress infrastructure or mutations to these artifacts as a merge blocker/);
+    assert.match(reviewerCalls[0].input, /Treat stale or contaminated measured-artifact provenance as a merge blocker/);
     assert.ok(reviewerCalls[0].args.includes("--output-schema"));
     assert.ok(!reviewerCalls[1].args.includes("--output-schema"));
     assert.ok(calls.some(({ args }) => args.includes("resume") && args.includes("thread-test")));

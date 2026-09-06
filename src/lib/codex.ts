@@ -10,6 +10,7 @@ const META_DISABLE_SANDBOX_FLAG = "--dangerously-disable-osx-sandbox";
 const AUTOMATION_HOOK_ARGS = ["--disable", "hooks"];
 export const DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS = 4 * 60 * 1000;
 const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation progress artifacts: the managed README section, docs/burner-evaluation-history.json, and docs/burner-evaluation-progress.svg. Burner injects them only after final candidate scores are known. During exact-head validation those Burner-generated artifacts may therefore appear in the candidate diff; ignore those generated changes entirely when scoring every rubric, including Repository polish and Benchmark integrity, and do not treat them as candidate-authored evidence or regressions. Do not create or modify those artifacts, and do not add repository-side progress generators, validators, tests, or workflows.";
+const MEASURED_ARTIFACT_PROVENANCE = "Treat checked-in benchmark and evaluation artifacts as measured evidence, not ordinary merge blobs. If an artifact records a git commit, dirty status, or worktree/import/executable/build path, verify that provenance after integration. Never retain a leaf, sibling, parent, or stale-worktree path in a composite artifact. Regenerate stale evidence with repository-supported tooling from a clean checkout rooted inside the current composite worktree; never hand-edit provenance or fabricate measurements. The measured code commit may precede the artifact-only commit at HEAD only when the intervening diff contains reports/evidence and no implementation or benchmark-harness changes.";
 type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
 
 const evaluationSchema = {
@@ -317,6 +318,7 @@ export class CodexClient {
       "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree. External contracts may be inspected read-only only.",
       "Do not create branches, commit, push, open pull requests, or modify anything under .burner; Burner owns delivery.",
       PROGRESS_OWNERSHIP,
+      MEASURED_ARTIFACT_PROVENANCE,
       `Composite: ${title}`,
       `Included changes:\n${sourceTitles.map((source) => `- ${source}`).join("\n")}`,
       "In the final response, summarize integration changes and checks.",
@@ -345,6 +347,7 @@ export class CodexClient {
       "Findings must be merge blockers caused by or exposed by this change, not optional hardening or unrelated feature requests. On later rounds, verify prior fixes and the complete current diff without inventing new scope.",
       "Do not edit files. Keep findings concrete and actionable. Approval must be false whenever any finding requires an author change.",
       `${PROGRESS_OWNERSHIP} Treat candidate-authored duplicate progress infrastructure or mutations to these artifacts as a merge blocker. Do not require a history point for the current unmerged PR.`,
+      `${MEASURED_ARTIFACT_PROVENANCE} Treat stale or contaminated measured-artifact provenance as a merge blocker.`,
       `Change under review: ${title}`,
       `Base branch: ${baseBranch}. Inspect the complete diff from this base to HEAD before deciding.`,
     ].join("\n\n");
