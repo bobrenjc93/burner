@@ -149,6 +149,7 @@ export class CodexClient {
     const prompt = [
       "You are a rigorous repository evaluator. Inspect the current repository state and answer the evaluation below.",
       "Base the score on concrete evidence from code, tests, configuration, and user-facing behavior. Do not edit any files.",
+      "Before relying on live execution, verify that the package or executable under test resolves from the current worktree. If an editable install, virtual environment, PATH entry, import path, or build artifact points at a parent, sibling, or stale worktree, do not score that contaminated result; switch to the repository-supported current-tree invocation and record the resolved path in evidence.",
       "Finish this evaluation within 3 minutes. Inspect targeted, representative evidence for every rubric category; do not exhaustively read every file or narrate intermediate progress.",
       "Use no more than 12 shell commands. Reserve enough time to return the required structured result; concise evidence is preferred over exhaustive evidence.",
       "A score of 100 means genuinely exceptional and production-ready. Be calibrated, concise, and actionable.",
