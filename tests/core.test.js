@@ -3952,7 +3952,7 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     const evaluation = { id: "quality", name: "Quality", prompt: "Score quality", weight: 4, enabled: true, createdAt: new Date().toISOString() };
     const lowerWeightEvaluation = { id: "secondary", name: "Secondary", prompt: "Score secondary behavior", weight: 1, enabled: true, createdAt: new Date().toISOString() };
     assert.equal((await codex.evaluate(root, evaluation, settings, "manual")).score, 77);
-    assert.equal((await codex.evaluate(root, evaluation, settings, "composite", { score: 65, summary: "Baseline category allocation", evidence: ["Docs: 6/10"] })).score, 77);
+    assert.equal((await codex.evaluate(root, evaluation, settings, "composite", { score: 65, summary: "Baseline category allocation", evidence: ["Docs: 6/10"], commit: "base-commit" })).score, 77);
     const baselineRun = { id: "baseline", evaluationId: "quality", score: 0, commit: "base", createdAt: new Date().toISOString(), durationMs: 1, status: "completed", context: "baseline" };
     const lowerWeightRun = { ...baselineRun, id: "secondary-baseline", evaluationId: "secondary" };
     const baselines = new Map([[evaluation.id, baselineRun], [lowerWeightEvaluation.id, lowerWeightRun]]);
@@ -3994,6 +3994,10 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     assert.match(candidateEvaluatorCall.input, /ignore those generated changes entirely when scoring every rubric/);
     assert.match(candidateEvaluatorCall.input, /Authoritative base calibration for this exact rubric: 65\/100/);
     assert.match(candidateEvaluatorCall.input, /Preserve existing category credit unless concrete current-tree or branch-diff evidence proves a regression/);
+    assert.match(candidateEvaluatorCall.input, /Exact candidate base commit: base-commit/);
+    assert.match(candidateEvaluatorCall.input, /git diff base-commit\.\.HEAD plus any current working-tree changes/);
+    assert.match(candidateEvaluatorCall.input, /Do not use origin\/main, another branch, merge-base with main, commit timestamps, or only HEAD\^/);
+    assert.match(candidateEvaluatorCall.input, /multiple implementation, review-fix, and evidence-only commits/);
     assert.ok(calls.some(({ input }) => input.includes("improvement planner")));
     const plannerCall = calls.find(({ input }) => input.includes("improvement planner"));
     assert.match(plannerCall.input, /targets a qualifying merge every 60 minutes/);
