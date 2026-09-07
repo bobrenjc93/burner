@@ -3517,6 +3517,40 @@ test("retrying a failed composite preserves its cumulative review history", asyn
   }
 });
 
+test("retrying an interrupted incremental composite preserves its pending experiment", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-incremental-composite-retry-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.composites.push({
+        id: "failed-incremental", title: "Interrupted incremental rebuild", description: "Combined",
+        status: "failed", branch: "composite", worktree: root, rebuildMode: "incremental",
+        pendingExperimentRunIds: ["pending-experiment"],
+        sources: [
+          { agentRunId: "existing-experiment", title: "Existing", branch: "existing", kind: "experiment" },
+          { agentRunId: "pending-experiment", title: "Pending", branch: "pending", kind: "experiment" },
+        ],
+        deltas: [], reviewRounds: [], prNumber: 10, prUrl: "https://example.test/pull/10",
+        createdAt: timestamp, updatedAt: timestamp, isLiving: false,
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.git = { reopenPr: async () => undefined };
+    orchestrator.scheduleComposites = async () => undefined;
+
+    await orchestrator.retryComposite("failed-incremental");
+
+    const composite = store.get().composites[0];
+    assert.equal(composite.status, "rebuilding");
+    assert.equal(composite.rebuildMode, "incremental");
+    assert.deepEqual(composite.pendingExperimentRunIds, ["pending-experiment"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("PR synchronization retires untracked Burner PRs and failed composites", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-orphan-pr-test-"));
   try {

@@ -2273,8 +2273,15 @@ export class Orchestrator {
           // from that PR's last checkpoint. Resetting to the base and merging
           // the leaf heads again discards integration/review fixes that only
           // exist on the composite branch and needlessly repeats review work.
-          // Explicit stale-base rebuilds retain their stronger from_base mode.
-          if (composite.prNumber && composite.rebuildMode !== "from_base") composite.rebuildMode = "resume";
+          // Explicit stale-base and interrupted incremental rebuilds retain
+          // their stronger modes. In particular, replacing `incremental` with
+          // `resume` would skip pending experiment branches that have not yet
+          // reached the published composite head.
+          if (
+            composite.prNumber &&
+            composite.rebuildMode !== "from_base" &&
+            composite.rebuildMode !== "incremental"
+          ) composite.rebuildMode = "resume";
           composite.error = undefined;
           composite.reviewApproved = false;
           composite.updatedAt = now();
