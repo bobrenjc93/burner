@@ -404,7 +404,26 @@ export class StateStore {
 
   private trim(): void {
     this.state.activity = this.state.activity.slice(0, 250);
-    this.state.evaluationRuns = this.state.evaluationRuns.slice(-1000);
+    const evaluationRuns = this.state.evaluationRuns;
+    const retainedEvaluationRunIds = new Set(evaluationRuns.slice(-1000).map((run) => run.id));
+    const retainLatestUsableByEvaluation = (matches: (run: EvaluationRun) => boolean): void => {
+      const latest = new Map<string, EvaluationRun>();
+      for (const run of evaluationRuns) {
+        if (!matches(run) || !isUsableRun(run)) continue;
+        const current = latest.get(run.evaluationId);
+        if (!current || run.createdAt > current.createdAt) latest.set(run.evaluationId, run);
+      }
+      for (const run of latest.values()) retainedEvaluationRunIds.add(run.id);
+    };
+    // Candidate-heavy campaigns can produce more than the rolling history
+    // limit without advancing main. Keep the authoritative full and screening
+    // baselines that scheduling/retry decisions still depend on.
+    retainLatestUsableByEvaluation((run) => run.context === "baseline" || run.context === "manual");
+    retainLatestUsableByEvaluation((run) => run.context === "screening_baseline");
+    for (const run of evaluationRuns) {
+      if (run.status === "running") retainedEvaluationRunIds.add(run.id);
+    }
+    this.state.evaluationRuns = evaluationRuns.filter((run) => retainedEvaluationRunIds.has(run.id));
     this.state.ideas = this.state.ideas.slice(-500);
     const retainedComposites = new Set(this.state.composites.slice(-250).map((item) => item.id));
     for (const composite of this.state.composites) {

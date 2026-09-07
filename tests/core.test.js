@@ -4466,6 +4466,43 @@ test("state persists evaluation configuration and excludes candidate scores from
   }
 });
 
+test("state retention preserves authoritative baselines outside the rolling run history", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-baseline-retention-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const evaluation = store.get().evaluations[0];
+    await store.update((state) => {
+      state.evaluationRuns = [
+        { id: "full-baseline", evaluationId: evaluation.id, score: 61, commit: "base", createdAt: "2026-01-01T00:00:00.000Z", durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3 },
+        { id: "screening-baseline", evaluationId: evaluation.id, score: 59, commit: "base", createdAt: "2026-01-01T00:00:01.000Z", durationMs: 1, status: "completed", context: "screening_baseline" },
+        ...Array.from({ length: 1000 }, (_, index) => ({
+          id: `candidate-${index}`,
+          evaluationId: evaluation.id,
+          score: 70,
+          commit: `candidate-${index}`,
+          createdAt: new Date(Date.UTC(2026, 0, 2, 0, 0, index)).toISOString(),
+          durationMs: 1,
+          status: "completed",
+          context: "composite",
+          compositeId: "long-running-composite",
+        })),
+      ];
+    });
+
+    assert.equal(store.get().evaluationRuns.length, 1002);
+    assert.equal(store.latestRuns().get(evaluation.id)?.id, "full-baseline");
+    assert.equal(store.latestScreeningRuns().get(evaluation.id)?.id, "screening-baseline");
+
+    const reloaded = new StateStore(root);
+    await reloaded.init();
+    assert.equal(reloaded.latestRuns().get(evaluation.id)?.id, "full-baseline");
+    assert.equal(reloaded.latestScreeningRuns().get(evaluation.id)?.id, "screening-baseline");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Burner exposes only repository-owned evaluation files to Git", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-evaluation-ignore-test-"));
   try {
