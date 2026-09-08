@@ -4368,13 +4368,49 @@ test("a pending same-PR base refresh claims the next available agent slot", asyn
 
     orchestrator.activeAgents.add("busy-1");
     orchestrator.activeAgents.add("busy-2");
-    assert.equal(orchestrator.schedulePendingBaseRefreshes(), 0);
+    orchestrator.missingBaselineEvaluations = () => [];
+    assert.equal(orchestrator.schedulePendingBaseRefreshes("new-base"), 0);
     assert.deepEqual(refreshed, []);
 
     orchestrator.activeAgents.delete("busy-2");
-    assert.equal(orchestrator.schedulePendingBaseRefreshes(), 1);
+    assert.equal(orchestrator.schedulePendingBaseRefreshes("new-base"), 1);
     assert.deepEqual(refreshed, ["run-pending"]);
-    assert.equal(orchestrator.schedulePendingBaseRefreshes(), 0, "an active refresh must not be scheduled twice");
+    assert.equal(orchestrator.schedulePendingBaseRefreshes("new-base"), 0, "an active refresh must not be scheduled twice");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("pending same-PR base refreshes wait for a complete current-base baseline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-pending-refresh-baseline-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.ideas.push({
+        id: "idea-pending", title: "Keep the PR", description: "Refresh it", rationale: "No orphan PRs",
+        predictedImpact: 1, evaluationIds: [], resources: [], status: "failed", source: "manual",
+        createdAt: timestamp, updatedAt: timestamp, agentRunId: "run-pending",
+      });
+      state.agentRuns.push({
+        id: "run-pending", ideaId: "idea-pending", status: "failed", branch: "burner/keep-pr", worktree: root,
+        startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1",
+        baseRef: "main", baseCommit: "old-base", prNumber: 42, prUrl: "https://example.test/pull/42", prState: "open",
+        error: "Base advanced to new-base; same-PR refresh pending.", reviewApproved: true,
+        reviewRounds: [{ id: "review-1", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    const refreshed = [];
+    orchestrator.refreshAgentBaseAndRetry = async (runId) => {
+      refreshed.push(runId);
+      return store.get().agentRuns.find((run) => run.id === runId);
+    };
+    orchestrator.missingBaselineEvaluations = () => [{ id: "missing" }];
+
+    assert.equal(orchestrator.schedulePendingBaseRefreshes("new-base"), 0);
+    assert.deepEqual(refreshed, []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

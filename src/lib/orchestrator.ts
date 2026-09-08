@@ -2447,11 +2447,8 @@ export class Orchestrator {
     }
   }
 
-  private schedulePendingBaseRefreshes(): number {
-    const state = this.store.get();
-    const capacity = Math.max(0, state.settings.parallelism - this.activeAgents.size - this.activeComposites.size);
-    if (!capacity) return 0;
-    const pending = state.agentRuns.filter((run) => {
+  private pendingBaseRefreshes(state: BurnerState): AgentRun[] {
+    return state.agentRuns.filter((run) => {
       const idea = state.ideas.find((item) => item.id === run.ideaId);
       return run.status === "failed" &&
         run.prNumber !== undefined &&
@@ -2461,7 +2458,15 @@ export class Orchestrator {
         idea?.status === "failed" &&
         idea.agentRunId === run.id &&
         !this.retryingAgentIds.has(run.id);
-    }).slice(0, capacity);
+    });
+  }
+
+  private schedulePendingBaseRefreshes(baseCommit: string): number {
+    const state = this.store.get();
+    if (this.missingBaselineEvaluations(baseCommit, state).length) return 0;
+    const capacity = Math.max(0, state.settings.parallelism - this.activeAgents.size - this.activeComposites.size);
+    if (!capacity) return 0;
+    const pending = this.pendingBaseRefreshes(state).slice(0, capacity);
     for (const run of pending) {
       void this.refreshAgentBaseAndRetry(run.id).catch(async (error) => {
         await this.store.addActivity({ type: "error", message: `Same-PR base refresh failed: ${run.id}`, detail: errorMessage(error) });
@@ -2954,15 +2959,15 @@ export class Orchestrator {
       if (this.portfolioMode()) await this.recordCadenceBreach();
       if (this.yolo && this.runningEvaluations === 0 && this.activeComposites.size === 0) {
         if (this.activeAgents.size === 0 && await this.autoMergeNext()) return;
-        // A reviewed PR retained across a base merge must reclaim the next
-        // available slot. Otherwise fresh work can continuously consume every
-        // slot and leave the existing PR orphaned in a permanently stale state.
-        if (this.schedulePendingBaseRefreshes()) return;
         // Once a full leaf batch is ready, use a free parallelism slot to
         // integrate it while an unrelated author drains. Waiting for every
         // author to finish can consume the entire composite-validation tail
         // and force a direct-leaf fallback even though capacity was idle.
-        if (this.activeAgents.size < initial.settings.parallelism && await this.autoCookNext()) return;
+        // A retained same-PR refresh has priority over cooking once its current
+        // base has a complete baseline, so do not fill its future slot here.
+        if (!this.pendingBaseRefreshes(initial).length &&
+          this.activeAgents.size < initial.settings.parallelism &&
+          await this.autoCookNext()) return;
       }
       if (await this.shouldDrainForPortfolio()) return;
       const settings = initial.settings;
@@ -2984,6 +2989,10 @@ export class Orchestrator {
         });
         return;
       }
+      // A reviewed PR retained across a base merge reclaims the next available
+      // slot only after the exact current base has a complete evaluation set.
+      // Otherwise the retry cannot compute a comparable impact.
+      if (this.schedulePendingBaseRefreshes(dispatchBaseCommit)) return;
       if (!refreshed.orchestrator.enabled && !force) return;
       const configuredLiving = refreshed.orchestrator.livingCompositeId ? refreshed.composites.find((item) => item.id === refreshed.orchestrator.livingCompositeId) : undefined;
       if (!(this.yolo && this.yoloBatchSize > 1) && refreshed.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") {
