@@ -2054,6 +2054,30 @@ test("GitHub PR disposition labels are mutually exclusive and initialized once",
   }
 });
 
+test("closing a source PR that GitHub already marked merged is idempotent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-already-merged-pr-test-"));
+  const bin = join(root, "bin");
+  const argsLog = join(root, "gh-args.jsonl");
+  await import("node:fs/promises").then((fs) => fs.mkdir(bin));
+  const executable = join(bin, "gh");
+  await writeFile(executable, `#!/usr/bin/env node\nconst fs=require("fs");const args=process.argv.slice(2);fs.appendFileSync(process.env.BURNER_TEST_GH_ARGS,JSON.stringify(args)+"\\n");if(args[0]==="pr"&&args[1]==="close"){console.error("X Pull request #42 can't be closed because it was already merged");process.exit(1);}\n`);
+  await chmod(executable, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath}`;
+  process.env.BURNER_TEST_GH_ARGS = argsLog;
+  try {
+    const git = new GitService(root, join(root, ".burner"));
+    await git.closePr(root, 42, "Superseded by a composite", "merged");
+    const calls = (await readFile(argsLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(calls[0].slice(0, 3), ["pr", "close", "42"]);
+    assert.deepEqual(calls.at(-1), ["pr", "edit", "42", "--add-label", "burner-merged", "--remove-label", "burner-unmerged", "--remove-label", "burner-quarantined"]);
+  } finally {
+    process.env.PATH = previousPath;
+    delete process.env.BURNER_TEST_GH_ARGS;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("GitHub merge waits for the pushed head and retries transient not-mergeable responses", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-mergeability-test-"));
   const bin = join(root, "bin");

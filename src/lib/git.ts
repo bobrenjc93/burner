@@ -292,8 +292,15 @@ export class GitService {
 
   async closePr(cwd: string, number: number, comment: string, disposition: PullRequestDisposition = "unmerged"): Promise<void> {
     const result = await runCommand("gh", ["pr", "close", String(number), "--comment", comment], { cwd, timeoutMs: 5 * 60 * 1000 });
-    if (result.exitCode !== 0 && !result.stderr.includes("already closed")) throw new Error(result.stderr.trim() || `Could not close PR #${number}`);
-    await this.markPrDisposition(cwd, number, disposition).catch(() => undefined);
+    const output = `${result.stdout}\n${result.stderr}`.toLowerCase();
+    const alreadyClosed = output.includes("already closed");
+    const alreadyMerged = output.includes("already merged");
+    if (result.exitCode !== 0 && !alreadyClosed && !alreadyMerged) throw new Error(result.stderr.trim() || result.stdout.trim() || `Could not close PR #${number}`);
+    // GitHub can automatically mark a source PR merged when a composite that
+    // contains its exact commits lands. Treat that race as an idempotent close
+    // and retain the authoritative merged disposition instead of aborting the
+    // remaining source reconciliation.
+    await this.markPrDisposition(cwd, number, alreadyMerged ? "merged" : disposition).catch(() => undefined);
   }
 
   async reopenPr(cwd: string, number: number): Promise<void> {
