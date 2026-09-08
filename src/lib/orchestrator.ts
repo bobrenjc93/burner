@@ -2375,7 +2375,13 @@ export class Orchestrator {
         }
       }
       await this.assertCandidateDoesNotOwnProgress(worktree, latestBaseCommit);
-      await this.git.push(worktree, state.settings.remote, run.branch);
+      // Refreshing an already-published candidate may rewrite its branch when
+      // the worktree is recreated from the new base. Preserve the same PR by
+      // replacing that Burner-owned branch with a remote-head lease; an
+      // ordinary push cannot publish the rewritten history. Unpublished
+      // checkpoints retain the stricter fast-forward-only push.
+      if (run.prNumber) await this.git.forcePush(worktree, state.settings.remote, run.branch);
+      else await this.git.push(worktree, state.settings.remote, run.branch);
       const refreshedAt = now();
       await this.store.update((draft) => {
         const currentRun = draft.agentRuns.find((item) => item.id === run.id);

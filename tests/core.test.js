@@ -1452,7 +1452,8 @@ test("latest-base refresh reuses the reviewed run, branch, and pull request", as
       createExistingWorktree: async () => root,
       hasChanges: async () => false,
       mergeBranch: async (_cwd, branch) => { merged.push(branch); return { merged: true, conflict: false }; },
-      push: async (_cwd, remote, branch) => { pushed.push([remote, branch]); },
+      push: async (_cwd, remote, branch) => { pushed.push(["plain", remote, branch]); },
+      forcePush: async (_cwd, remote, branch) => { pushed.push(["force", remote, branch]); },
     };
     const retried = [];
     orchestrator.retryAgent = async (runId) => {
@@ -1467,7 +1468,7 @@ test("latest-base refresh reuses the reviewed run, branch, and pull request", as
     const run = store.get().agentRuns.find((item) => item.id === "original");
     const idea = store.get().ideas.find((item) => item.id === "idea");
     assert.deepEqual(merged, ["main"]);
-    assert.deepEqual(pushed, [["origin", "burner/keep-pr"]]);
+    assert.deepEqual(pushed, [["force", "origin", "burner/keep-pr"]]);
     assert.deepEqual(retried, ["original"]);
     assert.equal(run.baseCommit, "new-base");
     assert.equal(run.baseRef, "main");
@@ -1508,6 +1509,7 @@ test("latest-base refresh resumes a cadence-yielded checkpoint before re-review"
       hasChanges: async () => false,
       mergeBranch: async () => ({ merged: true, conflict: false }),
       push: async () => undefined,
+      forcePush: async () => undefined,
     };
     const retried = [];
     orchestrator.retryAgent = async (runId) => {
@@ -1565,6 +1567,7 @@ test("latest-base refresh keeps a living-composite candidate on its parent branc
       hasChanges: async () => false,
       mergeBranch: async (_cwd, branch) => { merged.push(branch); return { merged: true, conflict: false }; },
       push: async () => undefined,
+      forcePush: async () => undefined,
     };
     orchestrator.retryAgent = async (runId) => {
       orchestrator.activeAgents.delete("idea");
