@@ -899,6 +899,66 @@ test("YOLO yields a long review loop while an approved fallback can still use th
   }
 });
 
+test("YOLO yields a cpu-heavy review when an approved leaf only awaits command evaluation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-command-fallback-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const currentTime = Date.now();
+    const timestamp = new Date(currentTime).toISOString();
+    await store.update((state) => {
+      state.settings.mergeCadenceMinutes = 60;
+      state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 41 * 60_000).toISOString();
+      state.evaluations = [
+        { id: "prompt", name: "Prompt", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp, definitionVersion: "prompt-v1" },
+        { id: "command", name: "Command", prompt: "Run", command: "true", weight: 1, enabled: true, createdAt: timestamp, definitionVersion: "command-v1" },
+      ];
+      state.agentRuns = [
+        {
+          id: "current", ideaId: "current-idea", status: "reviewing", branch: "burner/current", worktree: root,
+          startedAt: timestamp, baseCommit: "base", deltas: [], resources: ["cpu-heavy"], reviewRounds: [], reviewApproved: false,
+        },
+        {
+          id: "fallback", ideaId: "fallback-idea", status: "evaluating", branch: "burner/fallback", worktree: root,
+          startedAt: timestamp, baseCommit: "base", deltas: [], resources: [], reviewApproved: true,
+          reviewRounds: [{ id: "fallback-review", round: 1, commit: "fallback-head", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
+        },
+      ];
+      state.evaluationRuns = [
+        { id: "prompt-run", evaluationId: "prompt", score: 80, commit: "fallback-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "agent", agentRunId: "fallback", evaluationDefinitionVersion: "prompt-v1" },
+        { id: "command-run", evaluationId: "command", commit: "fallback-head", createdAt: timestamp, durationMs: 0, status: "running", context: "agent", agentRunId: "fallback", evaluationDefinitionVersion: "command-v1" },
+      ];
+    });
+
+    assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
+      allowed: false,
+      remainingMs: 19 * 60_000,
+      requiredMs: 20 * 60_000,
+    });
+
+    await store.update((state) => {
+      state.agentRuns.find((run) => run.id === "current").resources = [];
+    });
+    assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
+      allowed: true,
+      remainingMs: 19 * 60_000,
+      requiredMs: 0,
+    }, "yielding an unrelated review would not release the command lane");
+
+    await store.update((state) => {
+      state.agentRuns.find((run) => run.id === "current").resources = ["cpu-heavy"];
+      state.evaluationRuns.find((run) => run.id === "command-run").status = "failed";
+    });
+    assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
+      allowed: true,
+      remainingMs: 19 * 60_000,
+      requiredMs: 0,
+    }, "a failed command is not a near-ready fallback");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("YOLO keeps authoring when idling cannot preserve the merge cadence", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-dispatch-cadence-test-"));
   try {

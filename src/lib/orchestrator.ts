@@ -518,15 +518,47 @@ export function agentReviewCadenceHeadroom(
     composite.baseCommit === baseCommit &&
     ["building", "reviewing", "revising", "evaluating", "rebuilding"].includes(composite.status) &&
     !composite.sources.some((source) => source.agentRunId === currentRunId));
-  const fallbackReady = Boolean(fallback && (fallback.kind !== "agent" || fallback.id !== currentRunId)) || validatingCompositeReady;
+  const currentHoldsCommandLane = state.agentRuns
+    .find((run) => run.id === currentRunId)
+    ?.resources.includes("cpu-heavy") === true;
+  const commandQueuedAgentReady = currentHoldsCommandLane && state.agentRuns.some((run) => {
+    if (
+      run.id === currentRunId ||
+      run.status !== "evaluating" ||
+      run.baseCommit !== baseCommit ||
+      run.quarantinedAt ||
+      !finalReviewApproved(run.reviewApproved, run.reviewRounds)
+    ) return false;
+    const candidateCommit = run.reviewRounds.at(-1)?.commit;
+    if (!candidateCommit) return false;
+    let pendingCommand = false;
+    for (const evaluation of state.evaluations.filter((item) => item.enabled)) {
+      const latest = state.evaluationRuns.filter((evaluationRun) =>
+        evaluationRun.context === "agent" &&
+        evaluationRun.agentRunId === run.id &&
+        evaluationRun.evaluationId === evaluation.id &&
+        evaluationRun.commit === candidateCommit &&
+        evaluationRun.evaluationDefinitionVersion === evaluation.definitionVersion,
+      ).at(-1);
+      if (!latest) return false;
+      if (evaluation.command) {
+        if (latest.status === "running") pendingCommand = true;
+        else if (latest.status !== "completed" || !Number.isFinite(latest.score)) return false;
+      } else if (latest.status !== "completed" || !Number.isFinite(latest.score)) return false;
+    }
+    return pendingCommand;
+  });
+  const fallbackReady = Boolean(fallback && (fallback.kind !== "agent" || fallback.id !== currentRunId)) ||
+    validatingCompositeReady || commandQueuedAgentReady;
   // Do not discard completed author work merely because another idea is
   // queued. Dispatch headroom already prevents starting work too late, and a
   // queued replacement is not safer than the candidate that reached review.
-  // Only an independently approved fallback or an already-cooked composite
-  // can justify yielding this loop. The latter matters even while its PR is a
-  // draft: command evaluations may be waiting on a resource held by this
-  // agent, so letting the review continue can deadlock the merge tail behind
-  // the very candidate the cadence guard is supposed to preserve.
+  // Only an independently approved fallback, an approved leaf waiting solely
+  // on command evaluations, or an already-cooked composite can justify
+  // yielding this loop. The latter two matter even before a final PR is ready:
+  // their command evaluations may be waiting on cpu-heavy held by this agent,
+  // so letting the review continue can deadlock the merge tail behind the very
+  // candidate the cadence guard is supposed to preserve.
   if (!fallbackReady) return { allowed: true, remainingMs: headroom.remainingMs, requiredMs: 0 };
   const cadenceMs = state.settings.mergeCadenceMinutes * 60_000;
   const reviewCycleReserveMs = Math.min(10 * 60_000, Math.max(5 * 60_000, cadenceMs / 6));
