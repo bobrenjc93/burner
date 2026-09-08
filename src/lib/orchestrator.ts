@@ -2447,6 +2447,30 @@ export class Orchestrator {
     }
   }
 
+  private schedulePendingBaseRefreshes(): number {
+    const state = this.store.get();
+    const capacity = Math.max(0, state.settings.parallelism - this.activeAgents.size - this.activeComposites.size);
+    if (!capacity) return 0;
+    const pending = state.agentRuns.filter((run) => {
+      const idea = state.ideas.find((item) => item.id === run.ideaId);
+      return run.status === "failed" &&
+        run.prNumber !== undefined &&
+        run.prState === "open" &&
+        run.error?.includes("same-PR refresh pending") === true &&
+        finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
+        idea?.status === "failed" &&
+        idea.agentRunId === run.id &&
+        !this.retryingAgentIds.has(run.id);
+    }).slice(0, capacity);
+    for (const run of pending) {
+      void this.refreshAgentBaseAndRetry(run.id).catch(async (error) => {
+        await this.store.addActivity({ type: "error", message: `Same-PR base refresh failed: ${run.id}`, detail: errorMessage(error) });
+        this.events.emit("error", { message: errorMessage(error) });
+      });
+    }
+    return pending.length;
+  }
+
   async syncPullRequests(force = false): Promise<void> {
     // A reconciliation currently costs two GitHub GraphQL queries. Poll often
     // enough to notice externally merged/closed PRs during an active run, but
@@ -2930,6 +2954,10 @@ export class Orchestrator {
       if (this.portfolioMode()) await this.recordCadenceBreach();
       if (this.yolo && this.runningEvaluations === 0 && this.activeComposites.size === 0) {
         if (this.activeAgents.size === 0 && await this.autoMergeNext()) return;
+        // A reviewed PR retained across a base merge must reclaim the next
+        // available slot. Otherwise fresh work can continuously consume every
+        // slot and leave the existing PR orphaned in a permanently stale state.
+        if (this.schedulePendingBaseRefreshes()) return;
         // Once a full leaf batch is ready, use a free parallelism slot to
         // integrate it while an unrelated author drains. Waiting for every
         // author to finish can consume the entire composite-validation tail
