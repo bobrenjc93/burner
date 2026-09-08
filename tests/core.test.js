@@ -857,6 +857,25 @@ test("YOLO yields a long review loop while an approved fallback can still use th
     }, "without a mergeable fallback, idling would only make the cadence miss worse");
 
     await store.update((state) => {
+      state.composites.push({
+        id: "validating", title: "Validating fallback", description: "Already cooked",
+        status: "evaluating", branch: "burner/validating", worktree: root, baseCommit: "base",
+        sources: [
+          { agentRunId: "fallback", prNumber: 10, title: "Fallback", branch: "burner/fallback", kind: "pull_request" },
+          { agentRunId: "other", prNumber: 11, title: "Other", branch: "burner/other", kind: "pull_request" },
+        ],
+        deltas: [], reviewRounds: [], reviewApproved: true, prNumber: 12,
+        prUrl: "https://example.test/pull/12", createdAt: timestamp, updatedAt: timestamp, isLiving: false,
+      });
+    });
+    assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
+      allowed: false,
+      remainingMs: 19 * 60_000,
+      requiredMs: 20 * 60_000,
+    }, "a cooked composite must make a lock-holding review yield before it starves composite validation");
+    await store.update((state) => { state.composites = []; });
+
+    await store.update((state) => {
       state.orchestrator.mergeWindowStartedAt = new Date(currentTime - 9 * 60_000).toISOString();
     });
     assert.deepEqual(agentReviewCadenceHeadroom(store.get(), "base", "current", currentTime), {
