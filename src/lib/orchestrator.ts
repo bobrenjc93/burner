@@ -2310,10 +2310,12 @@ export class Orchestrator {
     if (!run.authorThreadId || !run.baseRef || !run.baseCommit) {
       throw new Error("This run does not have a reusable author checkpoint.");
     }
-    const parentComposite = run.parentCompositeId
+    const recordedParentComposite = run.parentCompositeId
       ? state.composites.find((item) => item.id === run.parentCompositeId)
       : undefined;
-    if (run.parentCompositeId && parentComposite?.status !== "open") {
+    const parentComposite = recordedParentComposite?.status === "open" ? recordedParentComposite : undefined;
+    const mergedParentComposite = recordedParentComposite?.status === "merged" ? recordedParentComposite : undefined;
+    if (run.parentCompositeId && !parentComposite && !mergedParentComposite) {
       throw new Error("The candidate's parent composite is no longer open; it cannot be refreshed without changing its intended base.");
     }
     const cadenceYieldedCheckpoint = run.status === "failed" &&
@@ -2391,6 +2393,10 @@ export class Orchestrator {
           status: "failed",
           baseRef: latestBaseRef,
           baseCommit: latestBaseCommit,
+          parentCompositeId: parentComposite?.id,
+          resources: mergedParentComposite
+            ? currentRun.resources.filter((resource) => resource !== `living-${mergedParentComposite.id}`)
+            : currentRun.resources,
           authorThreadId,
           lastMessage,
           completedAt: refreshedAt,
@@ -2402,7 +2408,12 @@ export class Orchestrator {
           quarantineReason: undefined,
           supersededByCompositeId: undefined,
         });
-        if (currentIdea) Object.assign(currentIdea, { status: "failed", agentRunId: run.id, updatedAt: refreshedAt });
+        if (currentIdea) Object.assign(currentIdea, {
+          status: "failed",
+          agentRunId: run.id,
+          baseCompositeId: parentComposite?.id,
+          updatedAt: refreshedAt,
+        });
       });
       await this.store.addActivity({
         type: "pr",

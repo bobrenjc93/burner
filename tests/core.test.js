@@ -1589,6 +1589,66 @@ test("latest-base refresh keeps a living-composite candidate on its parent branc
   }
 });
 
+test("latest-base refresh promotes an unpublished candidate after its parent composite merges", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-merged-parent-refresh-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.evaluations = [];
+      state.ideas.push({
+        id: "idea", title: "Keep the experiment", description: "Promote it", rationale: "No replacements",
+        predictedImpact: 1, evaluationIds: [], resources: [], status: "failed", source: "manual",
+        createdAt: timestamp, updatedAt: timestamp, agentRunId: "run", baseCompositeId: "merged",
+      });
+      state.agentRuns.push({
+        id: "run", ideaId: "idea", status: "failed", branch: "burner/experiment", worktree: root,
+        startedAt: timestamp, completedAt: timestamp, deltas: [], resources: ["living-merged"],
+        authorThreadId: "thread-1", baseRef: "origin/burner/composite", baseCommit: "old-composite",
+        parentCompositeId: "merged", reviewApproved: true,
+        reviewRounds: [{ id: "review-1", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
+      });
+      state.composites.push({
+        id: "merged", title: "Merged", description: "", status: "merged", branch: "burner/composite", worktree: "",
+        sources: [], deltas: [], reviewRounds: [], reviewApproved: true, prNumber: 99, prUrl: "https://example.test/pull/99",
+        createdAt: timestamp, updatedAt: timestamp, isLiving: false,
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
+    orchestrator.restoreBurnerProgressFromCommit = async () => false;
+    const merged = [];
+    const pushed = [];
+    orchestrator.git = {
+      resolveRef: async (ref) => ref === "main" ? "new-main" : ref,
+      head: async () => "candidate-head",
+      hasChanges: async () => false,
+      mergeBranch: async (_cwd, branch) => { merged.push(branch); return { merged: true, conflict: false }; },
+      push: async (_cwd, remote, branch) => { pushed.push([remote, branch]); },
+    };
+    orchestrator.retryAgent = async (runId) => {
+      orchestrator.activeAgents.delete("idea");
+      orchestrator.retryingAgentIds.delete(runId);
+      return store.get().agentRuns.find((run) => run.id === runId);
+    };
+
+    await orchestrator.refreshAgentBaseAndRetry("run");
+
+    const run = store.get().agentRuns.find((item) => item.id === "run");
+    const idea = store.get().ideas.find((item) => item.id === "idea");
+    assert.deepEqual(merged, ["main"]);
+    assert.deepEqual(pushed, [["origin", "burner/experiment"]]);
+    assert.equal(run.baseRef, "main");
+    assert.equal(run.baseCommit, "new-main");
+    assert.equal(run.parentCompositeId, undefined);
+    assert.deepEqual(run.resources, []);
+    assert.equal(idea.baseCompositeId, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("latest-base refresh reuses an interrupted unpublished experiment before review", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-unpublished-base-refresh-test-"));
   try {
