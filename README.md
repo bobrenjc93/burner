@@ -113,6 +113,8 @@ The cadence also constrains planning. Burner gives the planner an explicit per-l
 
 YOLO reviews are bounded independently from manual work. The default portfolio checkpoint is twelve total author/reviewer rounds. The limit is cumulative across resumed loops and read live before every round, so lowering it also constrains work already in flight. A leaf that cannot clear that window is preserved as a visible draft PR with its unresolved findings and `burner-quarantined` label, so substantial work and its author session are not lost. If a composite exhausts the window, Burner maps reviewer file findings back to source branches, labels the strongest-overlap leaf `burner-quarantined`, retires the blocked draft, and repartitions the remaining healthy leaves into balanced recovery composites no larger than half the failed generation.
 
+Manual `POST /api/ideas` requests can use the same reserved lane with `lane: "foundational"`, a nonempty `milestone` (at most 1,000 characters), and optional numeric `milestoneCredit` from 0 to 100. The default remains incremental with no milestone credit. Invalid lane or milestone fields are rejected before queueing. At most one foundational slot is reserved, whether ideas came from the planner or the API; credit never alters evaluation scores or merge gates.
+
 Each leaf selected for a portfolio generation:
 
 - was approved by the final independent review round;

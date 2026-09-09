@@ -2159,6 +2159,74 @@ test("paused server startup retains auto-run settings and supports API resume", 
   }
 });
 
+test("manual ideas preserve foundational scheduling and legacy incremental defaults", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-manual-lanes-"));
+  const burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0, startPaused: true });
+  try {
+    const endpoint = `http://127.0.0.1:${burner.server.address().port}/api/ideas`;
+    const create = async (fields) => {
+      const response = await fetch(endpoint, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "Narrow prerequisite", description: "One tested capability", predictedImpact: 0, evaluationIds: ["quality"], resources: ["gpu"], ...fields }),
+      });
+      assert.equal(response.status, 201);
+      return response.json();
+    };
+    const incremental = await create({ title: "Incremental", predictedImpact: 99 });
+    assert.equal(incremental.lane, "incremental");
+    assert.equal(incremental.milestone, "");
+    assert.equal(incremental.milestoneCredit, 0);
+    const foundation = await create({ lane: "foundational", milestone: "  Capture a native CUDA add graph  ", milestoneCredit: 90 });
+    assert.equal(foundation.lane, "foundational");
+    assert.equal(foundation.milestone, "Capture a native CUDA add graph");
+    assert.equal(foundation.milestoneCredit, 90);
+    assert.equal(foundation.predictedImpact, 0, "scheduling credit must not inflate predicted impact");
+    assert.equal(foundation.source, "manual");
+    assert.deepEqual(foundation.resources, ["gpu"]);
+    const secondFoundation = await create({ lane: "foundational", milestone: "A separate prerequisite" });
+    assert.equal(secondFoundation.milestoneCredit, 0);
+    const persisted = new StateStore(root);
+    await persisted.init();
+    const ideas = persisted.get().ideas;
+    assert.deepEqual(ideas.find(({ id }) => id === foundation.id), foundation);
+    assert.deepEqual(prioritizeQueuedIdeas(ideas, 3).map(({ id }) => id), [foundation.id, incremental.id]);
+    assert.deepEqual(prioritizeQueuedIdeas(ideas, 3, true).map(({ id }) => id), [incremental.id]);
+    assert.equal(burner.store.get().orchestrator.enabled, false);
+  } finally {
+    await burner.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("manual idea scheduling rejects malformed lanes and milestone credit without writes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-invalid-manual-lanes-"));
+  const burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0, startPaused: true });
+  try {
+    const endpoint = `http://127.0.0.1:${burner.server.address().port}/api/ideas`;
+    const initialActivity = burner.store.get().activity.length;
+    for (const fields of [
+      { lane: "urgent" }, { lane: null },
+      { lane: "foundational" }, { lane: "foundational", milestone: "  " },
+      { lane: "foundational", milestone: 42 },
+      { lane: "foundational", milestone: "x".repeat(1_001) },
+      ...[-1, 101, "90", null, {}, []].map((milestoneCredit) => ({ lane: "foundational", milestone: "Tested step", milestoneCredit })),
+      { milestone: "Implicit foundational work" }, { milestoneCredit: 20 },
+    ]) {
+      const response = await fetch(endpoint, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "Invalid", description: "Must not enter the queue", ...fields }),
+      });
+      assert.equal(response.status, 400, JSON.stringify(fields));
+      assert.ok((await response.json()).error);
+    }
+    assert.equal(burner.store.get().ideas.length, 0);
+    assert.equal(burner.store.get().activity.length, initialActivity);
+  } finally {
+    await burner.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a second Burner takes the next free port instead of failing", async () => {
   const first = await mkdtemp(join(tmpdir(), "burner-port-a-"));
   const second = await mkdtemp(join(tmpdir(), "burner-port-b-"));

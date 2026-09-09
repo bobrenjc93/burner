@@ -82,6 +82,22 @@ function validateSettings(input: Record<string, unknown>): BurnerSettings {
   };
 }
 
+function validateIdeaScheduling(input: Record<string, unknown>): Required<Pick<Idea, "lane" | "milestone" | "milestoneCredit">> {
+  const lane = input.lane === undefined ? "incremental" : input.lane;
+  if (lane !== "incremental" && lane !== "foundational") throw new Error("lane must be incremental or foundational.");
+  const milestone = input.milestone === undefined ? "" : input.milestone;
+  if (typeof milestone !== "string" || milestone.trim().length > 1_000) throw new Error("milestone must be a string of at most 1000 characters.");
+  const milestoneCredit = input.milestoneCredit === undefined ? 0 : input.milestoneCredit;
+  if (typeof milestoneCredit !== "number" || !Number.isFinite(milestoneCredit) || milestoneCredit < 0 || milestoneCredit > 100) {
+    throw new Error("milestoneCredit must be a finite number between 0 and 100.");
+  }
+  if (lane === "foundational" && !milestone.trim()) throw new Error("A foundational idea requires a concrete milestone.");
+  if (lane === "incremental" && (milestone.trim() || milestoneCredit !== 0)) {
+    throw new Error("Incremental ideas must have an empty milestone and milestoneCredit=0.");
+  }
+  return { lane, milestone: milestone.trim(), milestoneCredit };
+}
+
 export async function createBurnerServer(options: BurnerServerOptions) {
   const root = resolve(options.root);
   const store = new StateStore(root);
@@ -174,12 +190,14 @@ export async function createBurnerServer(options: BurnerServerOptions) {
       const title = String(body.title ?? "").trim();
       const description = String(body.description ?? "").trim();
       if (!title || !description) throw new Error("Idea title and description are required.");
+      const scheduling = validateIdeaScheduling(body);
       const timestamp = now();
       const currentState = store.get();
       const idea: Idea = {
         id: id("idea"), title: title.slice(0, 120), description,
         rationale: String(body.rationale ?? "Manually queued improvement").trim(),
         predictedImpact: Math.max(0, Math.min(100, Number(body.predictedImpact ?? 50))),
+        ...scheduling,
         evaluationIds: Array.isArray(body.evaluationIds) ? body.evaluationIds.map(String) : [],
         resources: Array.isArray(body.resources) ? body.resources.map(String) : [],
         status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "manual",
