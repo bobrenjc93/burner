@@ -3,6 +3,7 @@ import { basename, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import type { Activity, BurnerState, Evaluation, EvaluationRun } from "../types.js";
+import { DEFAULT_CODEX_MODEL } from "./codex-config.js";
 import { id, now, weightedScore, wellFormedText } from "./utils.js";
 
 type Listener = (state: BurnerState) => void;
@@ -43,8 +44,8 @@ function initialState(root: string): BurnerState {
       orchestratorIntervalMinutes: 15,
       autoRun: false,
       autoCreatePrs: true,
-      evaluatorModel: "",
-      agentModel: "",
+      evaluatorModel: DEFAULT_CODEX_MODEL,
+      agentModel: DEFAULT_CODEX_MODEL,
       baseBranch: "main",
       remote: "origin",
       defaultResources: [],
@@ -445,6 +446,8 @@ export class StateStore {
     legacy.version = 3;
     legacy.evaluations ??= [];
     legacy.composites ??= [];
+    legacy.settings.evaluatorModel = legacy.settings.evaluatorModel?.trim() || DEFAULT_CODEX_MODEL;
+    legacy.settings.agentModel = legacy.settings.agentModel?.trim() || DEFAULT_CODEX_MODEL;
     legacy.settings.maxReviewRounds ??= 12;
     legacy.settings.portfolioReviewRounds ??= 12;
     legacy.settings.mergeCadenceMinutes ??= 60;

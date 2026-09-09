@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BurnerSettings, Evaluation, EvaluationRun, Idea, ReviewFinding } from "../types.js";
+import { CODEX_REASONING_EFFORT, DEFAULT_CODEX_MODEL } from "./codex-config.js";
 import { runCommand, type CommandResult } from "./process.js";
 import { clampScore, errorMessage, parseJsonObject, truncateText } from "./utils.js";
 
@@ -12,6 +13,10 @@ export const DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS = 4 * 60 * 1000;
 const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation progress artifacts: the managed README section, docs/burner-evaluation-history.json, and docs/burner-evaluation-progress.svg. Burner injects them only after final candidate scores are known. During exact-head validation those Burner-generated artifacts may therefore appear in the candidate diff; ignore those generated changes entirely when scoring every rubric, including Repository polish and Benchmark integrity, and do not treat them as candidate-authored evidence or regressions. Do not create or modify those artifacts, and do not add repository-side progress generators, validators, tests, or workflows.";
 const MEASURED_ARTIFACT_PROVENANCE = "Treat checked-in benchmark and evaluation artifacts as measured evidence, not ordinary merge blobs. If an artifact records a git commit, dirty status, or worktree/import/executable/build path, verify that provenance after integration. Never retain a leaf, sibling, parent, or stale-worktree path in a composite artifact. Regenerate stale evidence with repository-supported tooling from a clean checkout rooted inside the current composite worktree; never hand-edit provenance or fabricate measurements. The measured code commit may precede the artifact-only commit at HEAD only when the intervening diff contains reports/evidence and no implementation or benchmark-harness changes.";
 type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
+
+function modelArgs(model: string): string[] {
+  return ["--model", model.trim() || DEFAULT_CODEX_MODEL, "-c", `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`];
+}
 
 const evaluationSchema = {
   type: "object",
@@ -453,7 +458,7 @@ export class CodexClient {
       const args = resumeThreadId
         ? ["exec", "resume", "--json"]
         : ["exec", "--json", "--color", "never", "-C", cwd];
-      if (model.trim()) args.push("--model", model.trim());
+      args.push(...modelArgs(model));
       args.push("--output-last-message", outputPath);
       if (resumeThreadId) args.push(resumeThreadId);
       args.push("-");
@@ -484,7 +489,7 @@ export class CodexClient {
       "-C",
       cwd,
     ];
-    if (model.trim()) args.push("--model", model.trim());
+    args.push(...modelArgs(model));
     return args;
   }
 

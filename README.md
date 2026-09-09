@@ -41,6 +41,8 @@ burner --yolo
 
 Burner never sends repository data through its own service. It invokes the locally installed Codex and GitHub CLIs using your existing authentication.
 
+Burner defaults to `gpt-6-astra` with `medium` reasoning effort. Every automated Codex role, including resumed author sessions and structured-output fallbacks, receives an explicit model and `-c 'model_reasoning_effort="medium"'`. The evaluator and implementation model fields in Settings can override the model; existing non-empty overrides are preserved, while empty fields use Burner's default rather than your local Codex configuration.
+
 > [!WARNING]
 > Burner deliberately launches every Codex agent with `--dangerously-bypass-approvals-and-sandbox`. Authors, revisions, reviewers, planners, prompt evaluators, and composite integrators have unrestricted filesystem and command access as your user—not just access to the target worktree. Use Burner only on repositories and machines where you accept that risk. Burner preflights this capability and fails clearly if the installed Codex CLI does not support it; it never silently falls back to restricted mode.
 

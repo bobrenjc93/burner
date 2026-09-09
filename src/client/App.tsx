@@ -42,6 +42,7 @@ import type {
   Idea,
 } from "../types";
 import { api } from "./lib/api";
+import { CODEX_REASONING_EFFORT, DEFAULT_CODEX_MODEL } from "../lib/codex-config";
 
 type Tab = "overview" | "evaluations" | "queue" | "composites" | "settings";
 
@@ -393,8 +394,8 @@ function Settings({ dashboard, onSaved, setError }: { dashboard: DashboardPayloa
           <Toggle checked={form.autoRun} onChange={(value) => change("autoRun", value)} label="Ignite automatically on launch" body="Resume the continuous loop whenever Burner starts." />
           <p className="settings-hint">Start with <code>burner --yolo</code> for 10-leaf portfolio generations, or set <code>--yolo-batch-size</code>. A value of 1 restores direct leaf merging.</p>
         </SettingsSection>
-        <SettingsSection icon={<Sparkles size={19} />} title="Codex" body="Leave model fields empty to inherit your local Codex configuration.">
-          <div className="form-grid"><Field label="Evaluator model"><input value={form.evaluatorModel} placeholder="Use Codex default" onChange={(event) => change("evaluatorModel", event.target.value)} /></Field><Field label="Implementation model"><input value={form.agentModel} placeholder="Use Codex default" onChange={(event) => change("agentModel", event.target.value)} /></Field></div>
+        <SettingsSection icon={<Sparkles size={19} />} title="Codex" body={`Defaults to ${DEFAULT_CODEX_MODEL} with ${CODEX_REASONING_EFFORT} reasoning effort. Empty model fields use Burner's default, not your local Codex model.`}>
+          <div className="form-grid"><Field label="Evaluator model"><input value={form.evaluatorModel} placeholder={DEFAULT_CODEX_MODEL} onChange={(event) => change("evaluatorModel", event.target.value)} /></Field><Field label="Implementation model"><input value={form.agentModel} placeholder={DEFAULT_CODEX_MODEL} onChange={(event) => change("agentModel", event.target.value)} /></Field></div>
           <div className="security-note"><ShieldCheck size={17} /><span><strong>Unrestricted agent access</strong> Every Codex role bypasses approvals and sandboxing. Agents can access the filesystem and run commands with your user permissions.</span></div>
         </SettingsSection>
         <SettingsSection icon={<Github size={19} />} title="GitHub delivery" body="Burner creates a branch, pushes it, and stamps measured impact into the PR.">

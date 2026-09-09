@@ -4135,7 +4135,7 @@ test("candidate prompt retries do not wait for the long command lane", async () 
   }
 });
 
-test("every Codex role and structured fallback uses unrestricted mode without automation hooks", async () => {
+test("every Codex role and structured fallback uses Astra medium without automation hooks", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-codex-test-"));
   const bin = join(root, "bin");
   await import("node:fs/promises").then((fs) => fs.mkdir(bin));
@@ -4177,7 +4177,12 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     for (const { args } of calls) {
       assert.equal(args[0], "--dangerously-bypass-approvals-and-sandbox");
       assert.equal(args[1], "exec");
-      if (!args.includes("--help")) assert.deepEqual(args.slice(2, 4), ["--disable", "hooks"]);
+      if (!args.includes("--help")) {
+        assert.deepEqual(args.slice(2, 4), ["--disable", "hooks"]);
+        assert.equal(args[args.indexOf("--model") + 1], "gpt-6-astra");
+        assert.equal(args[args.indexOf("-c") + 1], 'model_reasoning_effort="medium"');
+        assert.equal(args.filter((arg) => arg === "--model").length, 1);
+      }
       assert.ok(!args.includes("--sandbox"));
       assert.ok(!args.includes("-s"));
       assert.ok(!args.includes("--ask-for-approval"));
@@ -4236,9 +4241,51 @@ test("every Codex role and structured fallback uses unrestricted mode without au
     assert.ok(calls.some(({ args }) => args.includes("resume") && args.includes("thread-test")));
     const resumeCall = calls.find(({ args }) => args.includes("resume") && args.includes("thread-test"));
     assert.deepEqual(resumeCall.args.slice(1, 5), ["exec", "--disable", "hooks", "resume"]);
+
+    const overrides = { ...settings, evaluatorModel: " pinned-evaluator ", agentModel: " pinned-author " };
+    await codex.evaluate(root, evaluation, overrides, "manual");
+    await codex.review(root, "main", "Improve", overrides);
+    await codex.revise(root, author.threadId, { approved: true, summary: "Continue", findings: [] }, overrides);
+    const overrideCalls = (await readFile(argsLog, "utf8")).trim().split("\n").map(JSON.parse).slice(calls.length);
+    assert.equal(overrideCalls.length, 5, "structured fallbacks and resumed authors retain explicit model overrides");
+    for (const { args, input } of overrideCalls) {
+      assert.equal(args[args.indexOf("--model") + 1], input.includes("rigorous repository evaluator") ? "pinned-evaluator" : "pinned-author");
+      assert.equal(args[args.indexOf("-c") + 1], 'model_reasoning_effort="medium"');
+      assert.deepEqual(args.slice(2, 4), ["--disable", "hooks"]);
+    }
   } finally {
     process.env.PATH = previousPath;
     delete process.env.BURNER_TEST_ARGS;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("new and legacy unconfigured projects use Astra without replacing pinned models", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-model-defaults-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    assert.equal(store.get().settings.evaluatorModel, "gpt-6-astra");
+    assert.equal(store.get().settings.agentModel, "gpt-6-astra");
+
+    const legacy = store.get();
+    legacy.settings.evaluatorModel = "   ";
+    delete legacy.settings.agentModel;
+    await writeFile(store.statePath, JSON.stringify(legacy));
+    const migrated = new StateStore(root);
+    await migrated.init({ recoverInterrupted: false });
+    assert.equal(migrated.get().settings.evaluatorModel, "gpt-6-astra");
+    assert.equal(migrated.get().settings.agentModel, "gpt-6-astra");
+
+    await migrated.update((state) => {
+      state.settings.evaluatorModel = "pinned-evaluator";
+      state.settings.agentModel = "pinned-author";
+    });
+    const reloaded = new StateStore(root);
+    await reloaded.init({ recoverInterrupted: false });
+    assert.equal(reloaded.get().settings.evaluatorModel, "pinned-evaluator");
+    assert.equal(reloaded.get().settings.agentModel, "pinned-author");
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
