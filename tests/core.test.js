@@ -542,6 +542,62 @@ test("fresh and resumed composite builds forward scope and verified source feedb
   }
 });
 
+test("foundational planning continues partial progress using unrounded weighted headroom", async () => {
+  const timestamp = new Date().toISOString();
+  for (const { rows, expected } of [
+    { rows: [["hardware", 1.4, 4], ["api", 77, 2]], expected: "hardware" },
+    { rows: [["zero", 0, 1], ["partial", 40, 4]], expected: "partial" },
+    { rows: [["narrower", 99.94, 1], ["wider", 99.92, 1]], expected: "wider" },
+  ]) {
+    const evaluations = rows.map(([id, _score, weight]) => ({ id, name: id, prompt: "Measure", weight, enabled: true, createdAt: timestamp }));
+    const latest = new Map(rows.map(([id, score]) => [id, { id: `run-${id}`, evaluationId: id, score, status: "completed", context: "baseline", commit: "base", createdAt: timestamp, durationMs: 1 }]));
+    const proposals = evaluations.flatMap((evaluation) => [0, 1].map((copy) => ({
+      title: `${evaluation.id}-${copy}`, description: "One tested capability", rationale: "Unlock the next milestone", predictedImpact: 0,
+      lane: "foundational", milestone: "Prove one capability", milestoneCredit: 10, evaluationIds: [evaluation.id], resources: [],
+    })));
+    const codex = new CodexClient();
+    let prompt;
+    codex.structured = async (_cwd, input) => { prompt = input; return { ideas: proposals }; };
+    const ideas = await codex.planIdeas("/worktree", evaluations, latest, [], { parallelism: 3, evaluatorModel: "gpt-6-astra" });
+    assert.match(prompt, new RegExp(`Reserve exactly one proposal for evaluation '${expected}'`));
+    assert.match(prompt, /a nonzero score does not close this lane/);
+    assert.deepEqual(ideas.filter((idea) => idea.lane === "foundational").map((idea) => idea.evaluationIds), [[expected]]);
+    assert.ok(ideas.every((idea) => idea.predictedImpact === 0), "milestone credit never inflates measured impact");
+    assert.ok(ideas.filter((idea) => idea.lane === "incremental").every((idea) => idea.milestone === "" && idea.milestoneCredit === 0));
+  }
+});
+
+test("foundational planning excludes unmeasured or disabled gaps and preserves delivery occupancy", async () => {
+  const timestamp = new Date().toISOString();
+  const evaluation = { id: "partial", name: "Partial", prompt: "Measure", weight: 4, enabled: true, createdAt: timestamp };
+  const disabled = { ...evaluation, id: "disabled", weight: 10, enabled: false };
+  const proposal = { title: "Next milestone", description: "One capability", rationale: "Keep progressing", predictedImpact: 0, lane: "foundational", milestone: "One tested capability", milestoneCredit: 10, evaluationIds: ["partial", "disabled"], resources: [] };
+  const codex = new CodexClient();
+  let prompt;
+  codex.structured = async (_cwd, input) => { prompt = input; return { ideas: [proposal] }; };
+  const run = (score) => ({ id: "run", evaluationId: "partial", score, status: "completed", context: "baseline", commit: "base", createdAt: timestamp, durationMs: 1 });
+  const plan = (latest, existing = [], pending = false) => codex.planIdeas("/worktree", [disabled, evaluation], latest, existing, { parallelism: 3, evaluatorModel: "gpt-6-astra" }, pending);
+  for (const score of [undefined, 100, -1, 101, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const latest = new Map([["disabled", run(0)], ["partial", run(score)]]);
+    const ideas = await plan(latest);
+    assert.match(prompt, /No enabled evaluation currently has a measured, valid score below 100/);
+    assert.equal(ideas[0].lane, "incremental");
+    assert.deepEqual(ideas[0].evaluationIds, ["partial"]);
+    assert.equal(ideas[0].milestoneCredit, 0);
+  }
+  const latest = new Map([["disabled", run(0)], ["partial", run(1.4)]]);
+  for (const status of ["queued", "running"]) {
+    const ideas = await plan(latest, [{ ...proposal, id: "existing", status, createdAt: timestamp, updatedAt: timestamp, source: "manual" }]);
+    assert.match(prompt, /foundational lane is already occupied/);
+    assert.equal(ideas[0].lane, "incremental");
+  }
+  const completed = { ...proposal, id: "completed", status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual" };
+  assert.equal((await plan(latest, [completed], true))[0].lane, "incremental", "an approved but undelivered milestone still owns the slot");
+  assert.equal((await plan(latest, [completed], false))[0].lane, "foundational", "delivery opens the next partially scored milestone");
+  assert.match(prompt, /Reserve exactly one proposal for evaluation 'partial'/);
+  assert.doesNotMatch(prompt, /"id": "disabled"/);
+});
+
 test("post-commit evidence prompt preserves measurement scope and resumes the author with a bounded timeout", async () => {
   const codex = new CodexClient();
   let call;
