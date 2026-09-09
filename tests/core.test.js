@@ -2611,6 +2611,55 @@ process.exit(0);
   }
 });
 
+test("GitHub check polling waits past the former five-minute budget", async () => {
+  const root = tmpdir();
+  const head = "0123456789abcdef0123456789abcdef01234567";
+  const git = new GitService(root, join(root, ".burner"), { intervalMs: 0 });
+  let calls = 0;
+  git.githubJson = async () => {
+    const pending = ++calls <= 150;
+    return {
+      state: "OPEN", headRefOid: head,
+      statusCheckRollup: [{ name: "Python compatibility", status: pending ? "IN_PROGRESS" : "COMPLETED", conclusion: pending ? null : "SUCCESS" }],
+    };
+  };
+  await git.waitForPrChecks(root, 42, head);
+  assert.equal(calls, 151, "healthy CI may finish after the old 120-poll limit");
+});
+
+test("GitHub pending-check timeouts remain bounded and retryable", async () => {
+  const root = tmpdir();
+  const head = "0123456789abcdef0123456789abcdef01234567";
+  for (const checkAttempts of [undefined, 2]) {
+    const git = new GitService(root, join(root, ".burner"), { intervalMs: 0, checkAttempts });
+    let calls = 0;
+    git.githubJson = async () => {
+      calls += 1;
+      return { state: "OPEN", headRefOid: head, statusCheckRollup: [{ name: "CI", status: "IN_PROGRESS" }] };
+    };
+    await assert.rejects(() => git.waitForPrChecks(root, 42, head), (error) =>
+      error instanceof TransientMergeGateError && /checks did not finish.*CI/.test(error.message));
+    assert.equal(calls, checkAttempts ?? 360, "both the default and an explicit smaller budget are finite");
+  }
+});
+
+test("longer GitHub check polling never accepts a different or failing head", async () => {
+  const root = tmpdir();
+  const head = "0123456789abcdef0123456789abcdef01234567";
+  const git = new GitService(root, join(root, ".burner"), { intervalMs: 0, checkAttempts: 2 });
+  git.githubJson = async () => ({
+    state: "OPEN", headRefOid: "another-head",
+    statusCheckRollup: [{ name: "CI", status: "COMPLETED", conclusion: "SUCCESS" }],
+  });
+  await assert.rejects(() => git.waitForPrChecks(root, 42, head), /checks never observed expected head/);
+  git.githubJson = async () => ({
+    state: "OPEN", headRefOid: head,
+    statusCheckRollup: [{ name: "CI", status: "COMPLETED", conclusion: "FAILURE" }],
+  });
+  await assert.rejects(() => git.waitForPrChecks(root, 42, head), (error) =>
+    !(error instanceof TransientMergeGateError) && /Burner will not merge a failing head/.test(error.message));
+});
+
 test("leaf and composite merges poll the exact post-stamp candidate head", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-merge-head-plumbing-test-"));
   try {

@@ -376,7 +376,10 @@ export class GitService {
   }
 
   private async waitForPrChecks(cwd: string, number: number, expectedHead: string): Promise<void> {
-    const attempts = this.mergePolling.checkAttempts ?? 120;
+    // A release-wheel build plus a full compatibility suite can exceed the
+    // old five-minute polling budget. Keep waiting bounded without relaxing
+    // the exact-head or terminal-failure gates below.
+    const attempts = this.mergePolling.checkAttempts ?? 360;
     const noCheckGraceAttempts = Math.min(attempts, this.mergePolling.noCheckGraceAttempts ?? 4);
     const intervalMs = this.mergePolling.intervalMs ?? 2_500;
     let lastPending: string[] = [];
