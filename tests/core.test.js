@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { get } from "node:http";
 import { createConnection } from "node:net";
 import { execFile } from "node:child_process";
@@ -2231,6 +2231,89 @@ test("git service assembles source branches into an actual composite worktree", 
     const recovered = await git.createExistingWorktree("evolving", "burner/composite-test");
     assert.equal(await import("node:fs/promises").then((fs) => fs.readFile(join(recovered, "experiment.txt"), "utf8")), "win\n", "missing but registered worktrees must self-heal");
     await git.removeWorktree(recovered);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resuming an existing worktree preserves staged, unstaged, untracked, and ignored work", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner resume-worktree-test-"));
+  try {
+    await exec(root, "git", ["init", "-b", "main"]);
+    await writeFile(join(root, ".gitignore"), ".burner/\ntarget/\n");
+    await writeFile(join(root, "base.txt"), "base\n");
+    await exec(root, "git", ["add", "."]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "base"]);
+    const git = new GitService(root, join(root, ".burner"));
+    const worktree = await git.createWorktree("saved", "burner/saved", "main");
+    const head = await git.head(worktree);
+    await writeFile(join(worktree, "base.txt"), "staged\n");
+    await exec(worktree, "git", ["add", "base.txt"]);
+    await writeFile(join(worktree, "base.txt"), "unstaged\n");
+    await writeFile(join(worktree, "untracked.txt"), "new implementation\n");
+    await mkdir(join(worktree, "target"));
+    await writeFile(join(worktree, "target", "evidence.json"), '{"measured":true}\n');
+
+    assert.equal(await git.createExistingWorktree("saved", "burner/saved"), worktree);
+    assert.equal(await git.head(worktree), head);
+    assert.equal(await exec(worktree, "git", ["show", ":base.txt"]), "staged\n");
+    assert.equal(await readFile(join(worktree, "base.txt"), "utf8"), "unstaged\n");
+    assert.equal(await readFile(join(worktree, "untracked.txt"), "utf8"), "new implementation\n");
+    assert.equal(await readFile(join(worktree, "target", "evidence.json"), "utf8"), '{"measured":true}\n');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resuming a worktree refuses a different branch without deleting its files", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-resume-branch-test-"));
+  try {
+    await exec(root, "git", ["init", "-b", "main"]);
+    await writeFile(join(root, "base.txt"), "base\n");
+    await exec(root, "git", ["add", "."]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "base"]);
+    const git = new GitService(root, join(root, ".burner"));
+    const worktree = await git.createWorktree("saved", "burner/saved", "main");
+    await writeFile(join(worktree, "untracked.txt"), "keep me\n");
+
+    await assert.rejects(() => git.createExistingWorktree("saved", "main"), /Refusing to recreate existing worktree.*left untouched/);
+    assert.equal((await exec(worktree, "git", ["branch", "--show-current"])).trim(), "burner/saved");
+    assert.equal(await readFile(join(worktree, "untracked.txt"), "utf8"), "keep me\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resuming a worktree refuses unrelated directories, repositories, files, and symlinks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-resume-path-test-"));
+  try {
+    await exec(root, "git", ["init", "-b", "main"]);
+    await writeFile(join(root, "base.txt"), "base\n");
+    await exec(root, "git", ["add", "."]);
+    await exec(root, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "base"]);
+    const git = new GitService(root, join(root, ".burner"));
+    const parent = join(root, ".burner", "worktrees");
+    const directory = join(parent, "directory");
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "saved.txt"), "unrelated files\n");
+    await assert.rejects(() => git.createExistingWorktree("directory", "main"), /Refusing to recreate existing worktree/);
+    assert.equal(await readFile(join(directory, "saved.txt"), "utf8"), "unrelated files\n");
+
+    const foreign = join(parent, "foreign");
+    await exec(root, "git", ["init", "-b", "main", foreign]);
+    await writeFile(join(foreign, "saved.txt"), "foreign repository\n");
+    await exec(foreign, "git", ["add", "."]);
+    await exec(foreign, "git", ["-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-m", "foreign"]);
+    await assert.rejects(() => git.createExistingWorktree("foreign", "main"), /Refusing to recreate existing worktree/);
+    assert.equal(await readFile(join(foreign, "saved.txt"), "utf8"), "foreign repository\n");
+
+    await writeFile(join(parent, "file"), "not a directory\n");
+    await assert.rejects(() => git.createExistingWorktree("file", "main"), /Refusing to recreate existing worktree/);
+    assert.equal(await readFile(join(parent, "file"), "utf8"), "not a directory\n");
+
+    await symlink(directory, join(parent, "link"), "dir");
+    await assert.rejects(() => git.createExistingWorktree("link", "main"), /Refusing to recreate existing worktree/);
+    assert.equal(await readFile(join(directory, "saved.txt"), "utf8"), "unrelated files\n");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -1,4 +1,4 @@
-import { mkdir, rm } from "node:fs/promises";
+import { lstat, mkdir, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { CompositeSource, ReviewRound, ScoreDelta } from "../types.js";
 import { runCommand } from "./process.js";
@@ -82,11 +82,39 @@ export class GitService {
     throw new TransientMergeGateError(lastError || `GitHub remained unavailable while ${description}.`);
   }
 
+  private async pruneWorktrees(): Promise<void> {
+    const prune = await runCommand("git", ["worktree", "prune", "--expire", "now"], { cwd: this.root });
+    if (prune.exitCode !== 0) throw new Error(prune.stderr.trim() || "Could not prune stale worktree registrations");
+  }
+
   private async prepareWorktreePath(path: string, worktreesDir: string): Promise<void> {
     await mkdir(worktreesDir, { recursive: true });
     await rm(path, { recursive: true, force: true });
-    const prune = await runCommand("git", ["worktree", "prune", "--expire", "now"], { cwd: this.root });
-    if (prune.exitCode !== 0) throw new Error(prune.stderr.trim() || "Could not prune stale worktree registrations");
+    await this.pruneWorktrees();
+  }
+
+  private async reuseExistingWorktree(path: string, branch: string): Promise<boolean> {
+    const existing = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (!existing) return false;
+    const mismatch = () => new Error("Refusing to recreate existing worktree " + path + ": its repository or branch does not match; saved files were left untouched.");
+    if (!existing.isDirectory() || existing.isSymbolicLink()) throw mismatch();
+
+    const [top, common, head, expectedCommon] = await Promise.all([
+      runCommand("git", ["rev-parse", "--path-format=absolute", "--show-toplevel"], { cwd: path }),
+      runCommand("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: path }),
+      runCommand("git", ["symbolic-ref", "--quiet", "HEAD"], { cwd: path }),
+      runCommand("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: this.root }),
+    ]);
+    if ([top, common, head, expectedCommon].some((result) => result.exitCode !== 0)) throw mismatch();
+    const [actualPath, topPath, commonPath, expectedCommonPath] = await Promise.all([
+      realpath(path), realpath(top.stdout.trim()), realpath(common.stdout.trim()), realpath(expectedCommon.stdout.trim()),
+    ]);
+    const branchRef = branch.startsWith("refs/heads/") ? branch : "refs/heads/" + branch;
+    if (topPath !== actualPath || commonPath !== expectedCommonPath || head.stdout.trim() !== branchRef) throw mismatch();
+    return true;
   }
 
   async status(): Promise<{ available: boolean; branch?: string; commit?: string; dirty?: boolean }> {
@@ -162,7 +190,11 @@ export class GitService {
   async createExistingWorktree(runId: string, branch: string): Promise<string> {
     const worktreesDir = join(this.dataDir, "worktrees");
     const path = join(worktreesDir, runId);
-    await this.prepareWorktreePath(path, worktreesDir);
+    // Resuming must retain staged, unstaged, untracked, and ignored files.
+    // In particular, an interrupted author may not have committed its work yet.
+    if (await this.reuseExistingWorktree(path, branch)) return path;
+    await mkdir(worktreesDir, { recursive: true });
+    await this.pruneWorktrees();
     const add = await runCommand("git", ["worktree", "add", path, branch], { cwd: this.root });
     if (add.exitCode !== 0) throw new Error(add.stderr.trim() || "Could not check out the living composite worktree");
     return path;
