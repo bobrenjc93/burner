@@ -564,6 +564,155 @@ test("post-commit evidence prompt preserves measurement scope and resumes the au
   assert.match(call[1], /Do not commit, push, create branches, or open pull requests/);
   assert.match(call[1], /does not approve the branch or replace any independent review/);
   assert.match(call[1], /Burner owns the canonical merge-coupled evaluation progress artifacts/);
+  const compositePrompt = call[1];
+  await codex.refreshAgentEvidence("/worktree", "main", "Combined", "author", "implementation-sha", { agentModel: "gpt-6-astra" });
+  assert.equal(call[0], "/worktree");
+  assert.equal(call[2], "gpt-6-astra");
+  assert.equal(call[3], "author");
+  assert.equal(call[4], 30 * 60 * 1000);
+  assert.equal(call[1], compositePrompt.replace("for this composite.", "for this candidate."));
+});
+
+async function createAgentEvidenceFixture() {
+  const root = await mkdtemp(join(tmpdir(), "burner-agent-evidence-test-"));
+  const store = new StateStore(root);
+  await store.init();
+  await store.update((state) => {
+    state.settings.portfolioReviewRounds = 3;
+    state.agentRuns.push({
+      id: "agent", ideaId: "idea", status: "running", branch: "candidate", worktree: root,
+      startedAt: new Date().toISOString(), deltas: [], resources: [], reviewRounds: [],
+      lastMessage: "Implementation complete",
+    });
+  });
+  return { root, store, orchestrator: new Orchestrator(root, store, new EventHub(), { yolo: true }) };
+}
+
+test("leaf reviews measure clean code and review separately committed evidence after initial work and repairs", async () => {
+  const { root, store, orchestrator } = await createAgentEvidenceFixture();
+  try {
+    let head = "implementation-1";
+    let dirty = false;
+    let evidenceCalls = 0;
+    let reviews = 0;
+    const order = [];
+    orchestrator.git = {
+      head: async () => head, hasChanges: async () => dirty,
+      commit: async (_cwd, message) => {
+        assert.equal(dirty, true);
+        head = message === "burner: refresh committed candidate evidence" ? "evidence-" + evidenceCalls : "implementation-2";
+        dirty = false;
+        order.push("commit:" + head);
+      },
+    };
+    orchestrator.assertCandidateDoesNotOwnProgress = async (_cwd, commit) => { assert.equal(commit, head); };
+    orchestrator.codex = {
+      refreshAgentEvidence: async (_cwd, base, title, thread, commit) => {
+        evidenceCalls += 1;
+        assert.equal(base, "main");
+        assert.equal(title, "Leaf");
+        assert.equal(thread, evidenceCalls === 1 ? "author" : "revised-author");
+        assert.equal(commit, "implementation-" + evidenceCalls);
+        assert.equal(dirty, false);
+        assert.equal(store.get().agentRuns[0].reviewApproved, false);
+        order.push("measure:" + commit);
+        dirty = true;
+        return { message: "Evidence refreshed", threadId: "evidence-author-" + evidenceCalls };
+      },
+      review: async (_cwd, _base, scope) => {
+        reviews += 1;
+        assert.equal(dirty, false);
+        assert.equal(head, "evidence-" + reviews);
+        assert.match(scope, /post-commit evidence handoff \(unverified context, not approval\): Evidence refreshed/);
+        order.push("review:" + head);
+        return reviews === 1
+          ? { approved: false, summary: "Fix", findings: [{ severity: "high", title: "Bug", detail: "Repair code", file: "src/app.ts" }] }
+          : { approved: true, summary: "Approved", findings: [] };
+      },
+      revise: async (_cwd, thread) => {
+        assert.equal(thread, "evidence-author-1");
+        order.push("revise");
+        dirty = true;
+        return { message: "Code repaired", threadId: "revised-author" };
+      },
+    };
+    const result = await orchestrator.reviewAgent(root, "agent", "Leaf", "main", "author", store.get().settings);
+    assert.deepEqual(order, ["measure:implementation-1", "commit:evidence-1", "review:evidence-1", "revise", "commit:implementation-2", "measure:implementation-2", "commit:evidence-2", "review:evidence-2"]);
+    assert.equal(result.threadId, "evidence-author-2");
+    assert.equal(result.message, "Code repaired");
+    assert.equal(store.get().agentRuns[0].authorThreadId, "evidence-author-2");
+    assert.deepEqual(store.get().agentRuns[0].reviewRounds.map((round) => [round.commit, round.approved]), [["evidence-1", false], ["evidence-2", true]]);
+    assert.equal(store.get().evaluationRuns.length, 0);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("leaf evidence preserves no-ops and blocks dirty inputs, moved heads, failed measurements and protected edits", async () => {
+  for (const scenario of ["no-op", "dirty-start", "moved-head", "failed", "protected"]) {
+    const { root, store, orchestrator } = await createAgentEvidenceFixture();
+    try {
+      let head = "implementation";
+      let calls = 0;
+      let commits = 0;
+      let reviews = 0;
+      orchestrator.git = { head: async () => head, hasChanges: async () => scenario === "dirty-start", commit: async () => { commits += 1; } };
+      orchestrator.assertCandidateDoesNotOwnProgress = async () => { if (scenario === "protected") throw new Error("protected progress changed"); };
+      orchestrator.codex = {
+        refreshAgentEvidence: async () => {
+          calls += 1;
+          if (scenario === "failed") throw new Error("measurement failed");
+          if (scenario === "moved-head") head = "agent-owned-commit";
+          return { threadId: "author", message: "No stale evidence" };
+        },
+        review: async () => { reviews += 1; return { approved: true, summary: "Approved", findings: [] }; },
+      };
+      const promise = orchestrator.reviewAgent(root, "agent", "Leaf", "main", "author", store.get().settings);
+      if (scenario === "no-op") await promise;
+      else await assert.rejects(promise, /clean, committed|changed HEAD|measurement failed|protected progress changed/);
+      assert.equal(calls, scenario === "dirty-start" ? 0 : 1, scenario);
+      assert.equal(commits, 0, scenario);
+      assert.equal(reviews, scenario === "no-op" ? 1 : 0, scenario);
+      assert.equal(store.get().agentRuns[0].reviewRounds.length, scenario === "no-op" ? 1 : 0, scenario);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test("leaf reviews recheck live model, cumulative budget and cadence after evidence collection", async () => {
+  for (const scenario of ["model", "budget", "cadence"]) {
+    const { root, store, orchestrator } = await createAgentEvidenceFixture();
+    try {
+      await store.update((state) => {
+        state.settings.portfolioReviewRounds = 2;
+        state.settings.agentModel = "old-model";
+        state.agentRuns[0].reviewRounds.push({ id: "old", round: 1, commit: "old", approved: false, summary: "Fix", findings: [], createdAt: new Date().toISOString() });
+      });
+      orchestrator.git = { head: async () => "implementation", hasChanges: async () => false };
+      orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
+      let cadenceChecks = 0;
+      orchestrator.assertAgentReviewCadence = async () => {
+        if (++cadenceChecks === 2 && scenario === "cadence") throw new Error("cadence expired during evidence");
+      };
+      let reviews = 0;
+      orchestrator.codex = {
+        refreshAgentEvidence: async () => {
+          await store.update((state) => {
+            state.settings.agentModel = "new-model";
+            if (scenario === "budget") state.settings.portfolioReviewRounds = 1;
+          });
+          return { threadId: "author", message: "No stale evidence" };
+        },
+        review: async (_cwd, _base, _scope, settings) => {
+          reviews += 1;
+          assert.equal(settings.agentModel, "new-model");
+          return { approved: true, summary: "Approved", findings: [] };
+        },
+      };
+      const promise = orchestrator.reviewAgent(root, "agent", "Leaf", "main", "author", store.get().settings);
+      if (scenario === "model") await promise;
+      else await assert.rejects(promise, /bounded review budget|cadence expired during evidence/);
+      assert.equal(reviews, scenario === "model" ? 1 : 0, scenario);
+      assert.equal(store.get().agentRuns[0].reviewRounds.length, scenario === "model" ? 2 : 1);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
 });
 
 test("composite reviews run on separately committed evidence after both initial integration and a code repair", async () => {
@@ -1228,6 +1377,7 @@ test("YOLO yields a long review loop while an approved fallback can still use th
 
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     let reviewed = false;
+    orchestrator.refreshAgentEvidence = async () => ({ threadId: "thread", message: "No measured artifacts" });
     orchestrator.codex = { review: async () => { reviewed = true; throw new Error("review should not start"); } };
     await assert.rejects(
       () => orchestrator.reviewAgent(root, "current", "Current", "main", "thread", store.get().settings),
@@ -4373,6 +4523,7 @@ test("YOLO portfolio opens a draft composite before review and bounds review rou
     });
     const opened = [];
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    orchestrator.refreshAgentEvidence = async () => ({ threadId: "thread", message: "No measured artifacts" });
     orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
     orchestrator.git = {
       push: async () => undefined,
@@ -4412,6 +4563,7 @@ test("review budgets are live and cumulative for agents and composites", async (
     let reviewCalls = 0;
     let revisionCalls = 0;
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+    orchestrator.refreshAgentEvidence = async () => ({ threadId: "thread", message: "No measured artifacts" });
     orchestrator.git = { head: async () => "head", hasChanges: async () => false };
     orchestrator.codex = {
       review: async () => {
@@ -4957,6 +5109,7 @@ test("every Codex role and structured fallback uses Astra medium without automat
     assert.equal(author.threadId, "thread-test");
     assert.equal((await codex.integrateComposite(root, "Combined", ["Improve"], settings)).message, "Author complete");
     assert.equal((await codex.refreshCompositeEvidence(root, "main", "Combined", author.threadId, "implementation-sha", settings)).message, "Author complete");
+    assert.equal((await codex.refreshAgentEvidence(root, "main", "Leaf", author.threadId, "implementation-sha", settings)).message, "Author complete");
     const revision = await codex.revise(root, author.threadId, { approved: false, summary: "Fix it", findings: [{ severity: "high", title: "Bug", detail: "Resolve", file: "app.js" }] }, settings);
     assert.equal(revision.message, "Author complete");
     const review = await codex.review(root, "main", "Improve", settings);

@@ -373,9 +373,17 @@ export class CodexClient {
   }
 
   async refreshCompositeEvidence(cwd: string, baseBranch: string, title: string, threadId: string, implementationCommit: string, settings: BurnerSettings): Promise<SessionResult> {
+    return this.refreshEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings, "composite");
+  }
+
+  async refreshAgentEvidence(cwd: string, baseBranch: string, title: string, threadId: string, implementationCommit: string, settings: BurnerSettings): Promise<SessionResult> {
+    return this.refreshEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings, "candidate");
+  }
+
+  private async refreshEvidence(cwd: string, baseBranch: string, title: string, threadId: string, implementationCommit: string, settings: BurnerSettings, kind: "composite" | "candidate"): Promise<SessionResult> {
     const prompt = [
-      "Perform the post-commit evidence step for this composite. Burner has now committed the implementation, so final measurements can use a clean code commit before independent review.",
-      `Composite: ${title}`,
+      `Perform the post-commit evidence step for this ${kind}. Burner has now committed the implementation, so final measurements can use a clean code commit before independent review.`,
+      `Change: ${title}`,
       `Base branch: ${baseBranch}. Clean implementation commit: ${implementationCommit}.`,
       "Inspect the complete candidate diff against the base. Only refresh measured artifacts introduced or changed by this candidate that claim to describe its final implementation and are now stale. If none need refreshing, make no changes and report that briefly. Preserve historical baseline measurements and unrelated artifacts unchanged.",
       MEASURED_ARTIFACT_PROVENANCE,

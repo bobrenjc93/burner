@@ -3876,6 +3876,31 @@ export class Orchestrator {
     }
   }
 
+  private async assertAgentReviewCadence(state: BurnerState, runId: string, findings: ReviewResult["findings"]): Promise<void> {
+    const run = state.agentRuns.find((item) => item.id === runId);
+    if (!this.portfolioMode() || !state.orchestrator.enabled || !run?.baseCommit) return;
+    const baseCommit = run.parentCompositeId
+      ? await this.git.resolveRef(state.settings.baseBranch)
+      : run.baseCommit;
+    const cadence = agentReviewCadenceHeadroom(state, baseCommit, runId);
+    if (!cadence.allowed && !(await this.cadenceFallbackAwaitsOwnerPublication(state, baseCommit, runId))) {
+      throw new PortfolioCadenceYieldError(findings, cadence.remainingMs, cadence.requiredMs);
+    }
+  }
+
+  private async refreshAgentEvidence(cwd: string, runId: string, title: string, baseBranch: string, threadId: string, settings: BurnerState["settings"]): Promise<SessionResult> {
+    if (await this.git.hasChanges(cwd)) throw new Error("Candidate evidence refresh requires a clean, committed implementation.");
+    const implementationCommit = await this.git.head(cwd);
+    await this.updateAgent(runId, { status: "revising", reviewApproved: false });
+    await this.store.addActivity({ type: "agent", message: `Checking committed candidate evidence: ${title}`, detail: `Implementation ${implementationCommit}; independent review and all evaluation gates still follow.` });
+    const evidence = await this.codex.refreshAgentEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings);
+    if (await this.git.head(cwd) !== implementationCommit) throw new Error("The candidate evidence agent changed HEAD; Burner must own the evidence commit.");
+    await this.assertCandidateDoesNotOwnProgress(cwd, implementationCommit);
+    if (await this.git.hasChanges(cwd)) await this.git.commit(cwd, "burner: refresh committed candidate evidence");
+    await this.updateAgent(runId, { authorThreadId: evidence.threadId });
+    return evidence;
+  }
+
   private async reviewAgent(cwd: string, runId: string, title: string, baseBranch: string, threadId: string, _settings: BurnerState["settings"]): Promise<SessionResult> {
     let currentThreadId = threadId;
     let message = this.store.get().agentRuns.find((run) => run.id === runId)?.lastMessage ?? "";
@@ -3886,18 +3911,18 @@ export class Orchestrator {
       const roundsUsed = currentRun?.reviewRounds.length ?? 0;
       const liveSettings = liveState.settings;
       if (roundsUsed >= this.portfolioReviewLimit(liveSettings)) break;
-      if (this.portfolioMode() && liveState.orchestrator.enabled && currentRun?.baseCommit) {
-        const cadenceBaseCommit = currentRun.parentCompositeId
-          ? await this.git.resolveRef(liveSettings.baseBranch)
-          : currentRun.baseCommit;
-        const cadence = agentReviewCadenceHeadroom(liveState, cadenceBaseCommit, runId);
-        if (!cadence.allowed && !(await this.cadenceFallbackAwaitsOwnerPublication(liveState, cadenceBaseCommit, runId))) {
-          throw new PortfolioCadenceYieldError(lastFindings, cadence.remainingMs, cadence.requiredMs);
-        }
-      }
-      const roundNumber = roundsUsed + 1;
+      await this.assertAgentReviewCadence(liveState, runId, lastFindings);
+      const evidence = await this.refreshAgentEvidence(cwd, runId, title, baseBranch, currentThreadId, liveSettings);
+      currentThreadId = evidence.threadId;
+      const reviewState = this.store.get();
+      const reviewSettings = reviewState.settings;
+      const currentRounds = reviewState.agentRuns.find((run) => run.id === runId)?.reviewRounds.length ?? 0;
+      if (currentRounds >= this.portfolioReviewLimit(reviewSettings)) break;
+      await this.assertAgentReviewCadence(reviewState, runId, lastFindings);
+      const roundNumber = currentRounds + 1;
       await this.updateAgent(runId, { status: "reviewing" });
-      const review = await this.codex.review(cwd, baseBranch, title, liveSettings);
+      const reviewScope = `${title}\n\nAuthor's post-commit evidence handoff (unverified context, not approval): ${evidence.message.slice(0, 4_000)}`;
+      const review = await this.codex.review(cwd, baseBranch, reviewScope, reviewSettings);
       lastFindings = review.findings;
       const round: ReviewRound = { id: id("review"), round: roundNumber, commit: await this.git.head(cwd), approved: review.approved, summary: review.summary, findings: review.findings, createdAt: now() };
       await this.store.update((state) => state.agentRuns.find((run) => run.id === runId)?.reviewRounds.push(round));
@@ -3911,19 +3936,10 @@ export class Orchestrator {
         return { message, threadId: currentThreadId };
       }
       const revisionSettings = this.store.get().settings;
-      const currentRounds = this.store.get().agentRuns.find((run) => run.id === runId)?.reviewRounds.length ?? 0;
-      if (currentRounds >= this.portfolioReviewLimit(revisionSettings)) break;
+      const revisionRounds = this.store.get().agentRuns.find((run) => run.id === runId)?.reviewRounds.length ?? 0;
+      if (revisionRounds >= this.portfolioReviewLimit(revisionSettings)) break;
       const revisionState = this.store.get();
-      const revisionRun = revisionState.agentRuns.find((run) => run.id === runId);
-      if (this.portfolioMode() && revisionState.orchestrator.enabled && revisionRun?.baseCommit) {
-        const cadenceBaseCommit = revisionRun.parentCompositeId
-          ? await this.git.resolveRef(revisionState.settings.baseBranch)
-          : revisionRun.baseCommit;
-        const cadence = agentReviewCadenceHeadroom(revisionState, cadenceBaseCommit, runId);
-        if (!cadence.allowed && !(await this.cadenceFallbackAwaitsOwnerPublication(revisionState, cadenceBaseCommit, runId))) {
-          throw new PortfolioCadenceYieldError(lastFindings, cadence.remainingMs, cadence.requiredMs);
-        }
-      }
+      await this.assertAgentReviewCadence(revisionState, runId, lastFindings);
       await this.updateAgent(runId, { status: "revising" });
       const revisionStartCommit = await this.git.head(cwd);
       const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), revisionSettings);
