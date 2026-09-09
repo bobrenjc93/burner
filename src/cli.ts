@@ -44,6 +44,7 @@ Server options:
                           port; an explicit --port never moves)
   --host <host>           host to bind (default: 127.0.0.1)
   --no-open               do not open a browser
+  --paused                start with scheduling paused, including YOLO
   --yolo                  autonomously run and master-cook leaf PRs
   --yolo-batch-size <n>   leaf PRs per composite (default: 10; 1 merges leaves)
 
@@ -258,11 +259,13 @@ function parseServerArgs(argv: string[]) {
   let port = "4321";
   let portExplicit = false;
   let shouldOpen = true;
+  let startPaused = false;
   let yolo = false;
   let yoloBatchSize = 10;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--no-open") { shouldOpen = false; continue; }
+    if (arg === "--paused") { startPaused = true; continue; }
     if (arg === "--yolo") { yolo = true; continue; }
     if (arg === "--yolo-batch-size") {
       const value = Number(argv[++index]);
@@ -276,7 +279,7 @@ function parseServerArgs(argv: string[]) {
     if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
     directory = arg;
   }
-  return { directory, host, port, portExplicit, shouldOpen, yolo, yoloBatchSize };
+  return { directory, host, port, portExplicit, shouldOpen, startPaused, yolo, yoloBatchSize };
 }
 
 function openBrowser(url: string): void {
@@ -305,6 +308,7 @@ async function main(): Promise<void> {
     root, host: options.host, port,
     portScanLimit: options.portExplicit ? 1 : 64,
     yolo: options.yolo, yoloBatchSize: options.yoloBatchSize,
+    startPaused: options.startPaused,
     onTerminate: (reason) => void shutdown(reason),
   });
   const url = `http://${options.host}:${burner.port}`;
@@ -315,8 +319,9 @@ async function main(): Promise<void> {
   console.log("");
   console.log(colors.red("  ⚠ Codex agents have unrestricted filesystem and command access as your user.\n"));
   if (options.yolo) console.log(colors.red(options.yoloBatchSize === 1
-    ? "  ⚠ YOLO autopilot is active: Burner may open and merge approved leaf PRs.\n"
-    : `  ⚠ YOLO portfolio is active: Burner will cook batches of ${options.yoloBatchSize} leaf PRs into composites.\n`));
+    ? `  ⚠ YOLO autopilot is ${options.startPaused ? "configured" : "active"}: Burner may open and merge approved leaf PRs.\n`
+    : `  ⚠ YOLO portfolio is ${options.startPaused ? "configured" : "active"}: Burner will cook batches of ${options.yoloBatchSize} leaf PRs into composites.\n`));
+  if (options.startPaused) console.log(colors.dim("  Scheduling is paused. Use Ignite or POST /api/orchestrator/start to resume.\n"));
   console.log(colors.dim("  Press Ctrl+C to cool down.\n"));
   if (options.shouldOpen) openBrowser(url);
 

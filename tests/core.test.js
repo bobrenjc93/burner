@@ -90,6 +90,67 @@ test("closing the orchestrator disables scheduling and aborts Codex work", async
   }
 });
 
+test("paused startup overrides saved scheduling, auto-run, and YOLO until resumed", async () => {
+  for (const autoRun of [false, true]) {
+    for (const yolo of [false, true]) {
+      const root = await mkdtemp(join(tmpdir(), "burner-paused-init-"));
+      let orchestrator;
+      try {
+        const store = new StateStore(root);
+        await store.init();
+        await store.update((state) => {
+          state.settings.autoRun = autoRun;
+          state.orchestrator.enabled = true;
+        });
+        orchestrator = new Orchestrator(root, store, new EventHub(), { yolo, yoloBatchSize: 2 });
+        orchestrator.initializeProtectedParentRepository = async () => undefined;
+        orchestrator.git.status = async () => ({ available: false });
+        let preflights = 0;
+        orchestrator.preflightYolo = async () => {
+          preflights += 1;
+          assert.equal(store.get().orchestrator.enabled, false, "pause must precede preflight");
+        };
+        let dispatches = 0;
+        orchestrator.tick = async () => { if (store.get().orchestrator.enabled) dispatches += 1; };
+
+        await orchestrator.init({ startPaused: true });
+        assert.equal(store.get().orchestrator.enabled, false);
+        assert.equal(store.get().settings.autoRun, autoRun, "the flag must not rewrite saved settings");
+        assert.equal(preflights, yolo ? 1 : 0, "paused YOLO still checks runtime readiness");
+        assert.equal(dispatches, 0);
+        await orchestrator.setEnabled(true);
+        assert.equal(store.get().orchestrator.enabled, true);
+        assert.ok(dispatches > 0, "explicit resume must still dispatch work");
+      } finally {
+        await orchestrator?.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test("default startup still honors auto-run and YOLO", async () => {
+  for (const [autoRun, yolo] of [[false, false], [true, false], [false, true], [true, true]]) {
+    const root = await mkdtemp(join(tmpdir(), "burner-default-init-"));
+    let orchestrator;
+    try {
+      const store = new StateStore(root);
+      await store.init();
+      await store.update((state) => { state.settings.autoRun = autoRun; });
+      orchestrator = new Orchestrator(root, store, new EventHub(), { yolo, yoloBatchSize: 2 });
+      orchestrator.initializeProtectedParentRepository = async () => undefined;
+      orchestrator.git.status = async () => ({ available: false });
+      orchestrator.preflightYolo = async () => undefined;
+      orchestrator.tick = async () => undefined;
+      await orchestrator.init();
+      assert.equal(store.get().orchestrator.enabled, autoRun || yolo);
+    } finally {
+      await orchestrator?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("Codex external edits pause Burner without reverting the protected parent repository", async () => {
   const outer = await mkdtemp(join(tmpdir(), "burner-parent-boundary-test-"));
   const target = join(outer, "target");
@@ -1326,6 +1387,8 @@ test("headless CLI configures evaluations, ideas, and conservative settings as J
     assert.match(help, /Codex agents?[\s\S]*unrestricted filesystem and command access/);
     assert.match(help, /--yolo\s+autonomously run and master-cook leaf PRs/);
     assert.match(help, /--yolo-batch-size <n>\s+leaf PRs per composite/);
+    assert.match(help, /--paused\s+start with scheduling paused/);
+    await assert.rejects(() => exec(root, "node", [cli, "--paused", "--no-open", "--port", "0"]), /Port must be an integer/);
     await assert.rejects(() => exec(root, "node", [cli, "--no-open", "--yolo-batch-size", "0"]), /integer between 1 and 100/);
     assert.deepEqual(JSON.parse(await exec(root, "node", [cli, "eval", "clear", "--yes", "-C", root])), { removed: 3 });
     const evaluation = JSON.parse(await exec(root, "node", [cli, "eval", "add", "-C", root, "--name", "Correctness", "--prompt", "Score correctness out of 100", "--command", "./full", "--screening-command", "./quick", "--weight", "2"]));
@@ -2064,6 +2127,34 @@ test("merge-gate retry recreates a delivered worktree and sends the failure to t
     assert.equal(run.quarantinedAt, undefined);
     assert.equal(run.fullMergeValidation, undefined);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("paused server startup retains auto-run settings and supports API resume", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "burner-paused-server-"));
+  let burner;
+  let dispatches = 0;
+  // Never launch real automation if the startup override regresses.
+  t.mock.method(Orchestrator.prototype, "tick", async function () {
+    if (this.store.get().orchestrator.enabled) dispatches += 1;
+  });
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    await store.update((state) => { state.settings.autoRun = true; });
+    burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0, startPaused: true });
+    assert.equal(burner.store.get().orchestrator.enabled, false);
+    assert.equal(burner.store.get().settings.autoRun, true);
+    assert.equal(dispatches, 0);
+    const port = burner.server.address().port;
+    const response = await fetch(`http://127.0.0.1:${port}/api/orchestrator/start`, { method: "POST" });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { enabled: true });
+    assert.equal(burner.store.get().orchestrator.enabled, true);
+    assert.ok(dispatches > 0);
+  } finally {
+    await burner?.close();
     await rm(root, { recursive: true, force: true });
   }
 });

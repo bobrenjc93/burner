@@ -9,7 +9,7 @@ import { StateStore, validateEvaluation } from "./lib/store.js";
 import type { BurnerSettings, Idea } from "./types.js";
 import { errorMessage, id, now } from "./lib/utils.js";
 
-export type BurnerServerOptions = { root: string; host: string; port: number; portScanLimit?: number; dev?: boolean; yolo?: boolean; yoloBatchSize?: number; onTerminate?: (reason: string) => void };
+export type BurnerServerOptions = { root: string; host: string; port: number; portScanLimit?: number; dev?: boolean; yolo?: boolean; yoloBatchSize?: number; startPaused?: boolean; onTerminate?: (reason: string) => void };
 
 type Route = { method: string; pattern: RegExp; keys: string[]; handler: Handler };
 type Handler = (request: IncomingMessage, response: ServerResponse, params: Record<string, string>, body: Record<string, unknown>) => Promise<void> | void;
@@ -88,7 +88,7 @@ export async function createBurnerServer(options: BurnerServerOptions) {
   await store.init();
   const events = new EventHub();
   const orchestrator = new Orchestrator(root, store, events, { yolo: options.yolo, yoloBatchSize: options.yoloBatchSize, onTerminate: options.onTerminate });
-  await orchestrator.init();
+  await orchestrator.init({ startPaused: options.startPaused });
   const publicDir = fileURLToPath(new URL("./public", import.meta.url));
   if (!existsSync(publicDir)) throw new Error(`Burner web assets are missing at ${publicDir}. Run npm run build.`);
 

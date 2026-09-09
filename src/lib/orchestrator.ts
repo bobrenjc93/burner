@@ -1041,7 +1041,10 @@ export class Orchestrator {
     }, { afterInvocation: () => this.assertProtectedParentUnchanged() });
   }
 
-  async init(): Promise<void> {
+  async init(options: { startPaused?: boolean } = {}): Promise<void> {
+    // A maintenance restart must not dispatch work before the operator can
+    // inspect recovered state, even when auto-run or YOLO normally starts it.
+    if (options.startPaused) await this.setEnabled(false);
     await this.initializeProtectedParentRepository();
     await this.locks.init();
     const orphanedLocks = await this.locks.reapOrphans();
@@ -1060,7 +1063,7 @@ export class Orchestrator {
     if (this.yolo) await this.preflightYolo();
     this.timer = setInterval(() => void this.tick(), 5_000);
     this.timer.unref();
-    if (this.store.get().settings.autoRun || this.yolo) await this.setEnabled(true);
+    if (!options.startPaused && (this.store.get().settings.autoRun || this.yolo)) await this.setEnabled(true);
   }
 
   async close(): Promise<void> {

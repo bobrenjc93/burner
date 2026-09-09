@@ -70,6 +70,8 @@ Commands:
 
 Run `burner` from the repo you want to improve, configure evaluation prompts in the UI, and run a baseline. “Ignite” starts the continuous loop. Pausing stops new dispatches but lets already-running agents finish safely.
 
+For a maintenance restart, use `burner --paused --yolo --no-open ./my-project`. The dashboard starts without dispatching work, even when YOLO or saved auto-run settings normally start it. Inspect recovered state, then resume with Ignite or `POST /api/orchestrator/start`. The flag does not change saved auto-run settings or disable explicit manual API actions; drain active work before stopping the old process.
+
 Burner creates `.burner/evaluations.json` and a sibling `.gitignore` that exposes only that file to Git. Commit both files with the repository so fresh checkouts use the same scoring rubric; existing projects copy their definitions into this file automatically. Repositories that already ignore the entire `.burner/` directory may need one initial `git add -f .burner/.gitignore .burner/evaluations.json`. Command-backed evaluations are executable project configuration, so review changes to this file before running them.
 
 The same workflow is scriptable. Commands emit JSON, and `-C` selects the target repository:
