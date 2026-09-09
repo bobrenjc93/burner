@@ -9,7 +9,7 @@ import test from "node:test";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeEvaluationFloor, compositeExperimentBaseline, compositeRevisionHeadroom, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldAwaitFoundationalDelivery, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeEvaluationFloor, compositeExperimentBaseline, compositeRevisionHeadroom, compositeSourceRegressions, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldAwaitFoundationalDelivery, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, isTransientGitHubFailure, TransientMergeGateError } from "../dist/lib/git.js";
@@ -290,6 +290,194 @@ test("candidate evaluation plumbing preserves living-composite calibration", asy
     assert.equal(runs[0].score, 60);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+function compositeRegressionFixture() {
+  const timestamp = "2026-01-01T00:00:00.000Z";
+  const baseline = {
+    id: "baseline", evaluationId: "quality", commit: "base", createdAt: timestamp,
+    status: "completed", context: "baseline", durationMs: 1, score: 95,
+    evaluationDefinitionVersion: "v1", promptSampleCount: 3,
+  };
+  const candidate = {
+    ...baseline, id: "candidate", commit: "head", context: "agent", agentRunId: "leaf", score: 90,
+    summary: "Python-dependent core storage regressed.", evidence: ["Host copies duplicate buffers."],
+    suggestions: ["Move allocation and transfers into the native backend."],
+  };
+  return {
+    sources: [{ agentRunId: "leaf", prNumber: 7, title: "CUDA storage", branch: "leaf", kind: "pull_request" }],
+    state: {
+      evaluations: [{ id: "quality", name: "Architecture", enabled: true, definitionVersion: "v1" }],
+      evaluationRuns: [baseline, candidate],
+      agentRuns: [{
+        id: "leaf", status: "completed", baseCommit: "base", reviewApproved: true,
+        reviewRounds: [{ commit: "head", approved: true }],
+        deltas: [{ evaluationId: "quality", before: 95, after: 90, delta: -5 }],
+      }],
+    },
+  };
+}
+
+test("composite integration receives only current confirmed source regressions", () => {
+  const { state, sources } = compositeRegressionFixture();
+  const snapshot = structuredClone(state);
+  const feedback = compositeSourceRegressions(state, sources, "base");
+  assert.deepEqual(feedback, [{
+    source: "PR #7: CUDA storage", commit: "head", evaluation: "Architecture", before: 95, after: 90,
+    summary: "Python-dependent core storage regressed.", evidence: ["Host copies duplicate buffers."],
+    suggestions: ["Move allocation and transfers into the native backend."],
+  }]);
+  assert.deepEqual(state, snapshot, "building context must not mutate score or review authority");
+  assert.deepEqual(compositeSourceRegressions(state, [], "base"), [], "excluded leaves must not leak into the handoff");
+  assert.deepEqual(compositeSourceRegressions(state, [{ ...sources[0], agentRunId: "missing" }], "base"), []);
+  for (const [name, mutate] of [
+    ["disabled rubric", (s) => { s.evaluations[0].enabled = false; }],
+    ["different base", (s) => { s.agentRuns[0].baseCommit = "older-base"; }],
+    ["unfinished candidate", (s) => { s.agentRuns[0].status = "evaluating"; }],
+    ["unapproved candidate", (s) => { s.agentRuns[0].reviewApproved = false; }],
+    ["unapproved final review", (s) => { s.agentRuns[0].reviewRounds[0].approved = false; }],
+    ["old candidate commit", (s) => { s.evaluationRuns[1].commit = "older-head"; }],
+    ["old baseline commit", (s) => { s.evaluationRuns[0].commit = "older-base"; }],
+    ["old candidate rubric", (s) => { s.evaluationRuns[1].evaluationDefinitionVersion = "v0"; }],
+    ["old baseline rubric", (s) => { s.evaluationRuns[0].evaluationDefinitionVersion = "v0"; }],
+    ["unconfirmed candidate", (s) => { s.evaluationRuns[1].promptSampleCount = 1; }],
+    ["unconfirmed baseline", (s) => { s.evaluationRuns[0].promptSampleCount = 1; }],
+    ["failed candidate evaluation", (s) => { s.evaluationRuns[1].status = "failed"; }],
+    ["unfinished baseline", (s) => { s.evaluationRuns[0].status = "running"; }],
+    ["mismatched after score", (s) => { s.evaluationRuns[1].score = 89; }],
+    ["mismatched before score", (s) => { s.evaluationRuns[0].score = 94; }],
+    ["flat delta", (s) => { s.agentRuns[0].deltas[0].delta = 0; }],
+    ["missing delta", (s) => { delete s.agentRuns[0].deltas[0].delta; }],
+    ["newer unconfirmed sample", (s) => { s.evaluationRuns.push({ ...s.evaluationRuns[1], createdAt: "2026-01-02T00:00:00.000Z", promptSampleCount: 1 }); }],
+  ]) {
+    const changed = structuredClone(state);
+    mutate(changed);
+    assert.deepEqual(compositeSourceRegressions(changed, sources, "base"), [], name);
+  }
+});
+
+test("composite source command feedback uses the matching screening baseline", () => {
+  const { state, sources } = compositeRegressionFixture();
+  state.evaluations[0].command = "full-check";
+  state.evaluations[0].screeningCommand = "quick-check";
+  state.evaluationRuns[0].context = "screening_baseline";
+  for (const run of state.evaluationRuns) delete run.promptSampleCount;
+  state.evaluationRuns.push({ ...state.evaluationRuns[0], id: "full", context: "baseline", score: 100 });
+  assert.equal(compositeSourceRegressions(state, sources, "base")[0].before, 95);
+  state.evaluationRuns = state.evaluationRuns.filter((run) => run.context !== "screening_baseline");
+  assert.deepEqual(compositeSourceRegressions(state, sources, "base"), [], "a full score cannot stand in for a missing screen");
+  delete state.evaluations[0].screeningCommand;
+  state.agentRuns[0].deltas[0].before = 100;
+  assert.equal(compositeSourceRegressions(state, sources, "base")[0].before, 100);
+});
+
+test("source feedback reconstructs legacy leaf confirmation cohorts without resampling", () => {
+  const { state, sources } = compositeRegressionFixture();
+  delete state.evaluationRuns[1].promptSampleCount;
+  const seed = state.evaluationRuns[1];
+  const confirmation = (id, score) => ({ ...seed, id, score, context: "composite", createdAt: "2026-01-02T00:00:00.000Z" });
+  state.evaluationRuns.push(confirmation("sample-2", 91), confirmation("sample-3", 89));
+  assert.equal(compositeSourceRegressions(state, sources, "base")[0].after, 90, "use the median, not the latest raw score");
+  for (const [name, mutate] of [
+    ["missing sample", (s) => { s.evaluationRuns.pop(); }],
+    ["failed sample", (s) => { s.evaluationRuns[3].status = "failed"; }],
+    ["another head", (s) => { s.evaluationRuns[3].commit = "old-head"; }],
+    ["another rubric", (s) => { s.evaluationRuns[3].evaluationDefinitionVersion = "v0"; }],
+    ["another agent", (s) => { s.evaluationRuns[3].agentRunId = "other-leaf"; }],
+    ["actual composite", (s) => { s.evaluationRuns[3].compositeId = "other-composite"; }],
+    ["before seed", (s) => { s.evaluationRuns[3].createdAt = "2025-12-31T00:00:00.000Z"; }],
+    ["duplicate sample", (s) => { s.evaluationRuns[3].id = "sample-2"; }],
+    ["ambiguous cohort", (s) => { s.evaluationRuns.push(confirmation("extra", 90)); }],
+    ["median differs from delivered delta", (s) => { s.evaluationRuns[3].score = 94; }],
+  ]) {
+    const changed = structuredClone(state);
+    mutate(changed);
+    assert.deepEqual(compositeSourceRegressions(changed, sources, "base"), [], name);
+  }
+});
+
+test("integrator prompt carries repair context without changing delivery or scoring gates", async () => {
+  const codex = new CodexClient();
+  const { state, sources } = compositeRegressionFixture();
+  let prompt;
+  codex.unstructuredSession = async (_cwd, input, model) => {
+    prompt = input;
+    assert.equal(model, "gpt-6-astra");
+    return { message: "Integrated", threadId: "integration-thread" };
+  };
+  const settings = { agentModel: "gpt-6-astra" };
+  await codex.integrateComposite("/worktree", "Combined", ["CUDA storage"], settings, {
+    description: "Preserve the public CUDA roundtrip while fixing native ownership.",
+    sourceRegressions: compositeSourceRegressions(state, sources, "base"),
+  });
+  assert.match(prompt, /Preserve the public CUDA roundtrip while fixing native ownership/);
+  assert.match(prompt, /"source": "PR #7: CUDA storage"/);
+  assert.match(prompt, /"commit": "head"/);
+  assert.match(prompt, /Move allocation and transfers into the native backend/);
+  assert.match(prompt, /not measurements of the combined tree/);
+  assert.match(prompt, /preserving every included change's intent/);
+  assert.match(prompt, /Do not remove supported behavior, weaken tests, alter evaluation definitions or scoring/);
+  assert.match(prompt, /this context does not waive any gate/);
+  await codex.integrateComposite("/worktree", "Combined", ["CUDA storage"], settings);
+  assert.doesNotMatch(prompt, /Confirmed source evaluation regressions/);
+  assert.doesNotMatch(prompt, /Integration context:/);
+});
+
+test("fresh and resumed composite builds forward scope and verified source feedback", async () => {
+  for (const resume of [false, true]) {
+    const root = await mkdtemp(join(tmpdir(), "burner-integration-handoff-test-"));
+    try {
+      const { state: fixture, sources } = compositeRegressionFixture();
+      const store = new StateStore(root);
+      await store.init();
+      const timestamp = new Date().toISOString();
+      const allSources = [...sources, { agentRunId: "other", title: "Other change", branch: "other", kind: "pull_request" }];
+      await store.update((state) => {
+        state.evaluations = fixture.evaluations.map((evaluation) => ({ ...evaluation, prompt: "Score architecture", weight: 1, createdAt: timestamp }));
+        state.evaluationRuns = fixture.evaluationRuns;
+        state.agentRuns = fixture.agentRuns;
+        state.composites.push({
+          id: "combined", title: "Combined", description: "Repair native ownership", status: resume ? "rebuilding" : "queued",
+          branch: "combined", worktree: root, sources: allSources, baseCommit: "base",
+          rebuildMode: resume ? "resume" : undefined, deltas: [], reviewRounds: [], isLiving: false,
+          createdAt: timestamp, updatedAt: timestamp,
+        });
+      });
+      const orchestrator = new Orchestrator(root, store, new EventHub());
+      const lock = { release: async () => undefined };
+      orchestrator.locks = { tryAcquireAll: async () => lock, acquire: async () => lock };
+      orchestrator.git = {
+        status: async () => ({ available: true, dirty: false }), resolveRef: async () => "base",
+        createWorktree: async () => root, createExistingWorktree: async () => root,
+        fetchBranch: async (_remote, branch) => branch,
+        mergeBranch: async (_cwd, branch) => ({ conflict: branch === "leaf" }),
+        hasChanges: async () => false, head: async () => "head", removeWorktree: async () => undefined,
+      };
+      orchestrator.restoreBurnerProgressFromCommit = async () => false;
+      orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
+      orchestrator.publishCompositeDraft = async () => undefined;
+      orchestrator.ensureLivingComposite = async () => undefined;
+      const calls = [];
+      orchestrator.codex = {
+        integrateComposite: async (_cwd, _title, titles, _settings, context) => {
+          calls.push({ titles, context });
+          return { threadId: "integration-thread", message: "Integrated" };
+        },
+      };
+      orchestrator.reviewComposite = async () => { throw new Error("test stops after integration handoff"); };
+      await orchestrator.buildComposite("combined", resume);
+      assert.equal(calls.length, resume ? 1 : 2);
+      assert.deepEqual(calls.at(-1).titles, ["CUDA storage", "Other change"], "resumed builds retain the complete included scope");
+      for (const call of calls) {
+        assert.equal(call.context.description, "Repair native ownership");
+        assert.equal(call.context.sourceRegressions[0].source, "PR #7: CUDA storage");
+        assert.equal(call.context.sourceRegressions[0].after, 90);
+      }
+      assert.match(store.get().composites[0].error, /test stops after integration handoff/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 

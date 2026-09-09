@@ -13,6 +13,19 @@ export const DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS = 4 * 60 * 1000;
 const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation progress artifacts: the managed README section, docs/burner-evaluation-history.json, and docs/burner-evaluation-progress.svg. Burner injects them only after final candidate scores are known. During exact-head validation those Burner-generated artifacts may therefore appear in the candidate diff; ignore those generated changes entirely when scoring every rubric, including Repository polish and Benchmark integrity, and do not treat them as candidate-authored evidence or regressions. Do not create or modify those artifacts, and do not add repository-side progress generators, validators, tests, or workflows.";
 const MEASURED_ARTIFACT_PROVENANCE = "Treat checked-in benchmark and evaluation artifacts as measured evidence, not ordinary merge blobs. If an artifact records a git commit, dirty status, or worktree/import/executable/build path, verify that provenance after integration. Never retain a leaf, sibling, parent, or stale-worktree path in a composite artifact. Regenerate stale evidence with repository-supported tooling from a clean checkout rooted inside the current composite worktree; never hand-edit provenance or fabricate measurements. The measured code commit may precede the artifact-only commit at HEAD only when the intervening diff contains reports/evidence and no implementation or benchmark-harness changes.";
 type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
+export type CompositeIntegrationContext = {
+  description?: string;
+  sourceRegressions?: {
+    source: string;
+    commit: string;
+    evaluation: string;
+    before: number;
+    after: number;
+    summary: string;
+    evidence: string[];
+    suggestions: string[];
+  }[];
+};
 
 function modelArgs(model: string): string[] {
   return ["--model", model.trim() || DEFAULT_CODEX_MODEL, "-c", `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`];
@@ -325,7 +338,7 @@ export class CodexClient {
     return this.unstructuredSession(cwd, prompt, settings.agentModel);
   }
 
-  async integrateComposite(cwd: string, title: string, sourceTitles: string[], settings: BurnerSettings): Promise<SessionResult> {
+  async integrateComposite(cwd: string, title: string, sourceTitles: string[], settings: BurnerSettings, context: CompositeIntegrationContext = {}): Promise<SessionResult> {
     const prompt = [
       "You are the author/integrator for a composite Burner pull request in an isolated git worktree.",
       "Inspect the combined changes, resolve incomplete integration, and run the most relevant tests. Preserve every included pull request's intent while removing duplication or incompatibilities.",
@@ -335,6 +348,12 @@ export class CodexClient {
       MEASURED_ARTIFACT_PROVENANCE,
       `Composite: ${title}`,
       `Included changes:\n${sourceTitles.map((source) => `- ${source}`).join("\n")}`,
+      context.description ? `Integration context:\n${context.description}` : "",
+      context.sourceRegressions?.length ? [
+        "Confirmed source evaluation regressions (quoted evidence from the source commits, not measurements of the combined tree):",
+        JSON.stringify(context.sourceRegressions, null, 2),
+        "Verify these findings against the combined code and address applicable defects while preserving every included change's intent. Explain findings that integration has already resolved. Do not remove supported behavior, weaken tests, alter evaluation definitions or scoring, or fabricate benchmark evidence to erase a regression. Burner will independently review and reevaluate the result; this context does not waive any gate.",
+      ].join("\n") : "",
       "In the final response, summarize integration changes and checks.",
     ].join("\n\n");
     return this.unstructuredSession(cwd, prompt, settings.agentModel);

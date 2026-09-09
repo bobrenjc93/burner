@@ -1,7 +1,7 @@
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import type { AgentRun, BurnerState, CompositePr, CompositeSource, Evaluation, EvaluationRun, Idea, ReviewRound, RuntimeStatus, ScoreDelta } from "../types.js";
-import { CodexClient, type ReviewResult, type SessionResult } from "./codex.js";
+import { CodexClient, type CompositeIntegrationContext, type ReviewResult, type SessionResult } from "./codex.js";
 import { EventHub } from "./events.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, isTransientGitHubFailure } from "./git.js";
 import type { PullRequestSummary } from "./git.js";
@@ -110,6 +110,65 @@ function isCurrentEvaluationRun(evaluation: Evaluation, run: EvaluationRun | und
 export function isAuthoritativeFullBaseline(evaluation: Evaluation, run: EvaluationRun | undefined, commit: string): boolean {
   return isCurrentEvaluationRun(evaluation, run, commit) &&
     (Boolean(evaluation.command) || (run!.promptSampleCount ?? 0) >= 3);
+}
+
+export function compositeSourceRegressions(state: BurnerState, sources: readonly CompositeSource[], baseCommit: string): NonNullable<CompositeIntegrationContext["sourceRegressions"]> {
+  const feedback: NonNullable<CompositeIntegrationContext["sourceRegressions"]> = [];
+  const latest = (runs: EvaluationRun[]) => runs.sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
+  for (const source of sources) {
+    const agent = state.agentRuns.find((run) => run.id === source.agentRunId);
+    if (!agent || agent.status !== "completed" || agent.baseCommit !== baseCommit || !finalReviewApproved(agent.reviewApproved, agent.reviewRounds)) continue;
+    const commit = agent.reviewRounds.at(-1)?.commit;
+    if (!commit) continue;
+    for (const delta of agent.deltas) {
+      if (!Number.isFinite(delta.delta) || delta.delta! >= 0) continue;
+      const evaluation = state.evaluations.find((item) => item.id === delta.evaluationId && item.enabled);
+      if (!evaluation) continue;
+      let candidate = latest(state.evaluationRuns.filter((run) =>
+        run.context === "agent" && run.agentRunId === agent.id && run.evaluationId === evaluation.id &&
+        isCurrentEvaluationRun(evaluation, run, commit),
+      ));
+      // Leaf confirmation currently stores its two extra samples in the full
+      // composite lane without persisting a median row. Reconstruct only that
+      // exact three-sample cohort after the latest leaf seed; never promote a
+      // lone noisy sample or mix another head, rubric, or composite into it.
+      if (!evaluation.command && candidate && (candidate.promptSampleCount ?? 0) < 3) {
+        const confirmations = state.evaluationRuns.filter((run) =>
+          run.context === "composite" && !run.compositeId && run.agentRunId === agent.id &&
+          run.evaluationId === evaluation.id && isCurrentEvaluationRun(evaluation, run, commit) &&
+          run.createdAt >= candidate!.createdAt && run.status === "completed" && Number.isFinite(run.score),
+        );
+        const samples = [candidate, ...confirmations];
+        if (
+          candidate.status !== "completed" || !Number.isFinite(candidate.score) || confirmations.length !== 2 ||
+          new Set(samples.map((run) => run.id)).size !== 3
+        ) continue;
+        const median = samples.sort((a, b) => a.score! - b.score!)[1]!;
+        candidate = { ...median, promptSampleCount: 3 };
+      }
+      const baseline = latest(state.evaluationRuns.filter((run) =>
+        (evaluation.screeningCommand ? run.context === "screening_baseline" : run.context === "baseline" || run.context === "manual") &&
+        run.evaluationId === evaluation.id && isCurrentEvaluationRun(evaluation, run, baseCommit),
+      ));
+      if (
+        candidate?.status !== "completed" || baseline?.status !== "completed" ||
+        !Number.isFinite(candidate.score) || !Number.isFinite(baseline.score) ||
+        candidate.score !== delta.after || baseline.score !== delta.before || candidate.score! >= baseline.score! ||
+        (!evaluation.command && ((candidate.promptSampleCount ?? 0) < 3 || (baseline.promptSampleCount ?? 0) < 3))
+      ) continue;
+      feedback.push({
+        source: `${source.prNumber ? `PR #${source.prNumber}: ` : ""}${source.title}`,
+        commit,
+        evaluation: evaluation.name,
+        before: baseline.score!,
+        after: candidate.score!,
+        summary: (candidate.summary ?? delta.summary ?? "").slice(0, 1_000),
+        evidence: (candidate.evidence ?? []).slice(0, 8).map((item) => item.slice(0, 500)),
+        suggestions: (candidate.suggestions ?? []).slice(0, 6).map((item) => item.slice(0, 500)),
+      });
+    }
+  }
+  return feedback;
 }
 
 export function compositeEvaluationFloor(state: BurnerState, compositeId: string): Map<string, EvaluationRun> {
@@ -3612,7 +3671,10 @@ export class Orchestrator {
         const sourceRef = await this.git.fetchBranch(settings.remote, source.branch);
         const merge = await this.git.mergeBranch(worktree, sourceRef);
         if (merge.conflict) {
-          const resolver = await this.codex.integrateComposite(worktree, composite.title, [source.title], settings);
+          const resolver = await this.codex.integrateComposite(worktree, composite.title, [source.title], settings, {
+            description: composite.description,
+            sourceRegressions: compositeSourceRegressions(this.store.get(), [source], baseCommit),
+          });
           if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: resolve composite conflict for ${source.prNumber ? `#${source.prNumber}` : source.title}`);
           await this.updateComposite(compositeId, { authorThreadId: resolver.threadId, updatedAt: now() });
         }
@@ -3625,7 +3687,10 @@ export class Orchestrator {
 
       await this.publishCompositeDraft(worktree, compositeId, "integrating the combined source branches", settings);
       const integrationStartCommit = await this.git.head(worktree);
-      const author = await this.codex.integrateComposite(worktree, composite.title, sourcesToMerge.map((source) => source.title), settings);
+      const author = await this.codex.integrateComposite(worktree, composite.title, composite.sources.map((source) => source.title), settings, {
+        description: composite.description,
+        sourceRegressions: compositeSourceRegressions(this.store.get(), composite.sources, baseCommit),
+      });
       await this.assertCandidateDoesNotOwnProgress(worktree, integrationStartCommit);
       if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: integrate ${composite.title}`);
       await this.updateComposite(compositeId, { authorThreadId: author.threadId, updatedAt: now() });
