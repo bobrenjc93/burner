@@ -146,6 +146,8 @@ Each implementation author runs in a persistent Codex session. After Burner comm
 
 The **Master cook** view combines two or more open Burner PRs. Burner creates a worktree from the current base, merges the selected branches, asks an integration author to resolve conflicts and test the result, completes the same review loop, then runs every evaluation on that exact code state. Its composite score is therefore measured directly—not calculated by adding individual scores.
 
+Automatic merging leaves owner-gated drafts unpublished. An explicit **Merge** request authorizes publication after the exact-head and configured-check gates pass: Burner marks a draft ready, rechecks CI, and pins the final merge to the expected commit. A changed head or failed check prevents the merge.
+
 Same-branch resume retries reuse the existing worktree after verifying its repository and branch. Staged and unstaged edits, untracked files, and ignored build or measurement output are preserved. An unexpected directory, repository, branch, file, or symlink stops the retry without deleting it. Missing worktrees are recreated from the saved branch.
 
 The integration author also receives the composite description and confirmed source-evaluation regressions, including evidence and repair suggestions. Feedback must match the reviewed source commit, current rubric, and comparable baseline; prompt feedback requires three independent samples. These are repair leads to verify against the combined code, not substitutes for its independent review or final evaluations.

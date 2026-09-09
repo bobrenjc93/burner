@@ -360,7 +360,28 @@ export class GitService {
         return;
       }
       await this.waitForPrChecks(cwd, number, expectedHead);
-      const result = await runCommand("gh", ["pr", "merge", String(number), "--merge"], { cwd, timeoutMs: 10 * 60 * 1000 });
+      // An explicit merge request also authorizes publishing its checked draft.
+      // Automatic scheduling still leaves owner-gated drafts alone before it
+      // reaches this method. Recheck identity before changing publication state.
+      const publication = await this.githubJson<{ state: "OPEN" | "CLOSED" | "MERGED"; headRefOid: string; isDraft: boolean }>(
+        cwd,
+        ["pr", "view", String(number), "--json", "state,headRefOid,isDraft"],
+        `inspect PR #${number} before publication`,
+      );
+      if (publication.state === "MERGED") {
+        await this.markPrDisposition(cwd, number, "merged").catch(() => undefined);
+        return;
+      }
+      if (publication.state !== "OPEN" || publication.headRefOid !== expectedHead) {
+        throw new TransientMergeGateError(`PR #${number} changed before publication; expected open head ${expectedHead.slice(0, 8)}.`);
+      }
+      if (publication.isDraft) {
+        await this.markPrReady(cwd, number);
+        // Publishing can trigger additional checks. Preserve the exact-head
+        // gate, and pin the final mutation against a later concurrent push.
+        await this.waitForPrChecks(cwd, number, expectedHead);
+      }
+      const result = await runCommand("gh", ["pr", "merge", String(number), "--merge", "--match-head-commit", expectedHead], { cwd, timeoutMs: 10 * 60 * 1000 });
       if (result.exitCode === 0) {
         await this.markPrDisposition(cwd, number, "merged").catch(() => undefined);
         return;

@@ -2784,6 +2784,96 @@ test("closing a source PR that GitHub already marked merged is idempotent", asyn
   }
 });
 
+test("explicit merging publishes only an exact checked draft and pins the final head", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-draft-publication-test-"));
+  const bin = join(root, "bin");
+  const argsLog = join(root, "gh-args.jsonl");
+  await import("node:fs/promises").then((fs) => fs.mkdir(bin));
+  const executable = join(bin, "gh");
+  await writeFile(executable, [
+    "#!/usr/bin/env node",
+    'const fs=require("fs");',
+    'fs.appendFileSync(process.env.BURNER_TEST_DRAFT_MERGE_ARGS,JSON.stringify(process.argv.slice(2))+"\\n");',
+  ].join("\n"));
+  await chmod(executable, 0o755);
+  const previousPath = process.env.PATH;
+  const previousLog = process.env.BURNER_TEST_DRAFT_MERGE_ARGS;
+  process.env.PATH = bin + ":" + previousPath;
+  process.env.BURNER_TEST_DRAFT_MERGE_ARGS = argsLog;
+  const head = "0123456789abcdef0123456789abcdef01234567";
+  const exercise = async (options = {}) => {
+    await writeFile(argsLog, "");
+    const events = [];
+    let checks = 0;
+    const git = new GitService(root, join(root, ".burner"), { mergeAttempts: 1, intervalMs: 0 });
+    git.waitForPrMergeability = async () => {
+      events.push("mergeability");
+      return { state: "OPEN", headRefOid: head, mergeable: "MERGEABLE" };
+    };
+    git.waitForPrChecks = async () => {
+      events.push("checks");
+      if (++checks === options.failChecksAt) throw new Error("required CI failed");
+    };
+    git.githubJson = async (cwd, args) => {
+      assert.equal(cwd, root);
+      assert.deepEqual(args, ["pr", "view", "42", "--json", "state,headRefOid,isDraft"]);
+      events.push("publication");
+      return { state: options.state ?? "OPEN", headRefOid: options.head ?? head, isDraft: options.draft ?? true };
+    };
+    git.markPrReady = async () => {
+      events.push("ready");
+      if (options.readyError) throw new Error("could not publish draft");
+    };
+    git.markPrDisposition = async () => { events.push("disposition"); };
+    let error;
+    try { await git.mergePr(root, 42, head); } catch (caught) { error = caught; }
+    const calls = (await readFile(argsLog, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    return { error, events, calls };
+  };
+  try {
+    const published = await exercise();
+    assert.equal(published.error, undefined);
+    assert.deepEqual(published.events, ["mergeability", "checks", "publication", "ready", "checks", "disposition"]);
+    assert.deepEqual(published.calls, [["pr", "merge", "42", "--merge", "--match-head-commit", head]]);
+
+    const ready = await exercise({ draft: false });
+    assert.equal(ready.error, undefined);
+    assert.deepEqual(ready.events, ["mergeability", "checks", "publication", "disposition"]);
+    assert.equal(ready.calls.length, 1);
+
+    const failing = await exercise({ failChecksAt: 1 });
+    assert.match(failing.error.message, /required CI failed/);
+    assert.deepEqual(failing.events, ["mergeability", "checks"]);
+    assert.deepEqual(failing.calls, []);
+
+    for (const options of [{ head: "changed" }, { state: "CLOSED" }]) {
+      const changed = await exercise(options);
+      assert.ok(changed.error instanceof TransientMergeGateError);
+      assert.deepEqual(changed.events, ["mergeability", "checks", "publication"]);
+      assert.deepEqual(changed.calls, []);
+    }
+
+    const publicationFailed = await exercise({ readyError: true });
+    assert.match(publicationFailed.error.message, /could not publish draft/);
+    assert.deepEqual(publicationFailed.calls, []);
+
+    const triggeredChecksFailed = await exercise({ failChecksAt: 2 });
+    assert.match(triggeredChecksFailed.error.message, /required CI failed/);
+    assert.deepEqual(triggeredChecksFailed.events, ["mergeability", "checks", "publication", "ready", "checks"]);
+    assert.deepEqual(triggeredChecksFailed.calls, []);
+
+    const merged = await exercise({ state: "MERGED" });
+    assert.equal(merged.error, undefined);
+    assert.deepEqual(merged.events, ["mergeability", "checks", "publication", "disposition"]);
+    assert.deepEqual(merged.calls, []);
+  } finally {
+    process.env.PATH = previousPath;
+    if (previousLog === undefined) delete process.env.BURNER_TEST_DRAFT_MERGE_ARGS;
+    else process.env.BURNER_TEST_DRAFT_MERGE_ARGS = previousLog;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("GitHub merge waits for the pushed head and retries transient not-mergeable responses", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-mergeability-test-"));
   const bin = join(root, "bin");
@@ -2797,6 +2887,7 @@ test("GitHub merge waits for the pushed head and retries transient not-mergeable
   const executable = join(bin, "gh");
   await writeFile(executable, `#!/usr/bin/env node
 const fs=require("fs");const args=process.argv.slice(2);const path=process.env.BURNER_TEST_GH_STATE;const state=fs.existsSync(path)?JSON.parse(fs.readFileSync(path,"utf8")):{views:0,checkViews:0,merges:0};
+if(args[0]==="pr"&&args[1]==="view"&&args.includes("state,headRefOid,isDraft")){console.log(JSON.stringify({state:"OPEN",headRefOid:process.env.BURNER_TEST_HEAD,isDraft:false}));process.exit(0);}
 if(args[0]==="pr"&&args[1]==="view"&&args.includes("state,headRefOid,statusCheckRollup")){state.checkViews++;fs.writeFileSync(path,JSON.stringify(state));const pending=state.checkViews===1;const failed=process.env.BURNER_TEST_CHECK_FAIL==="1";const checks=process.env.BURNER_TEST_NO_CHECKS==="1"?[]:[{__typename:"CheckRun",name:"CI",status:pending?"IN_PROGRESS":"COMPLETED",conclusion:pending?null:failed?"FAILURE":"SUCCESS"}];console.log(JSON.stringify({state:"OPEN",headRefOid:process.env.BURNER_TEST_HEAD,statusCheckRollup:checks}));process.exit(0);}
 if(args[0]==="pr"&&args[1]==="view"){state.views++;if(process.env.BURNER_TEST_RESET_ONCE==="1"&&!state.reset){state.reset=1;fs.writeFileSync(path,JSON.stringify(state));console.error("read: connection reset by peer");process.exit(1);}fs.writeFileSync(path,JSON.stringify(state));const mergeable=process.env.BURNER_TEST_CONFLICT==="1"?"CONFLICTING":process.env.BURNER_TEST_ALWAYS_UNKNOWN==="1"?"UNKNOWN":state.views===1?"UNKNOWN":"MERGEABLE";const prState=process.env.BURNER_TEST_CLOSED_ONCE==="1"&&!state.reopened?"CLOSED":"OPEN";console.log(JSON.stringify({state:prState,mergeable,headRefOid:process.env.BURNER_TEST_HEAD}));process.exit(0);}
 if(args[0]==="pr"&&args[1]==="reopen"){state.reopened=(state.reopened||0)+1;fs.writeFileSync(path,JSON.stringify(state));process.exit(0);}
