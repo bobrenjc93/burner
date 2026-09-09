@@ -899,7 +899,7 @@ test("YOLO yields a long review loop while an approved fallback can still use th
   }
 });
 
-test("YOLO yields a cpu-heavy review when an approved leaf only awaits command evaluation", async () => {
+test("YOLO yields a cpu-heavy review only to viable command-waiting leaves", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-command-fallback-test-"));
   try {
     const store = new StateStore(root);
@@ -925,6 +925,8 @@ test("YOLO yields a cpu-heavy review when an approved leaf only awaits command e
         },
       ];
       state.evaluationRuns = [
+        { id: "prompt-base", evaluationId: "prompt", score: 79, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", promptSampleCount: 3, evaluationDefinitionVersion: "prompt-v1" },
+        { id: "command-base", evaluationId: "command", score: 100, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", evaluationDefinitionVersion: "command-v1" },
         { id: "prompt-run", evaluationId: "prompt", score: 80, commit: "fallback-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "agent", agentRunId: "fallback", evaluationDefinitionVersion: "prompt-v1" },
         { id: "command-run", evaluationId: "command", commit: "fallback-head", createdAt: timestamp, durationMs: 0, status: "running", context: "agent", agentRunId: "fallback", evaluationDefinitionVersion: "command-v1" },
       ];
@@ -935,6 +937,39 @@ test("YOLO yields a cpu-heavy review when an approved leaf only awaits command e
       remainingMs: 19 * 60_000,
       requiredMs: 20 * 60_000,
     });
+
+    const ready = store.get();
+    for (const mutation of [
+      (state) => { state.evaluationRuns.find((run) => run.id === "prompt-run").score = 78; },
+      (state) => { state.settings.compositeAbsorbThreshold = 1; },
+      (state) => { state.evaluationRuns.find((run) => run.id === "prompt-base").commit = "old-base"; },
+      (state) => { state.evaluationRuns.find((run) => run.id === "prompt-base").evaluationDefinitionVersion = "prompt-v0"; },
+      (state) => { state.evaluationRuns.find((run) => run.id === "prompt-base").promptSampleCount = 1; },
+      (state) => { state.evaluationRuns = state.evaluationRuns.filter((run) => run.id !== "command-base"); },
+    ]) {
+      const notReady = structuredClone(ready);
+      mutation(notReady);
+      assert.equal(agentReviewCadenceHeadroom(notReady, "base", "current", currentTime).allowed, true,
+        "regressing, below-threshold, or uncalibrated command-waiting leaves cannot evict a review");
+    }
+
+    const flat = structuredClone(ready);
+    flat.evaluationRuns.find((run) => run.id === "prompt-run").score = 79;
+    assert.equal(agentReviewCadenceHeadroom(flat, "base", "current", currentTime).allowed, false,
+      "threshold-equal monotonic candidates retain the configured merge policy");
+
+    const screening = structuredClone(ready);
+    screening.evaluations.push({ id: "screen", name: "Screen", prompt: "Run", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp, definitionVersion: "screen-v1" });
+    screening.evaluationRuns.push(
+      { id: "screen-full-base", evaluationId: "screen", score: 100, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline", evaluationDefinitionVersion: "screen-v1" },
+      { id: "screen-base", evaluationId: "screen", score: 50, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "screening_baseline", evaluationDefinitionVersion: "screen-v1" },
+      { id: "screen-run", evaluationId: "screen", score: 50, commit: "fallback-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "agent", agentRunId: "fallback", evaluationDefinitionVersion: "screen-v1" },
+    );
+    assert.equal(agentReviewCadenceHeadroom(screening, "base", "current", currentTime).allowed, false,
+      "completed screens are compared with the current screening baseline, not the full-command score");
+    screening.evaluationRuns.find((run) => run.id === "screen-run").score = 49;
+    assert.equal(agentReviewCadenceHeadroom(screening, "base", "current", currentTime).allowed, true,
+      "a completed command regression cannot be hidden by another pending command");
 
     await store.update((state) => {
       state.agentRuns.find((run) => run.id === "current").resources = [];

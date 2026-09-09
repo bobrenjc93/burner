@@ -531,8 +531,10 @@ export function agentReviewCadenceHeadroom(
     ) return false;
     const candidateCommit = run.reviewRounds.at(-1)?.commit;
     if (!candidateCommit) return false;
+    const enabledEvaluations = state.evaluations.filter((item) => item.enabled);
+    const optimisticDeltas: ScoreDelta[] = [];
     let pendingCommand = false;
-    for (const evaluation of state.evaluations.filter((item) => item.enabled)) {
+    for (const evaluation of enabledEvaluations) {
       const latest = state.evaluationRuns.filter((evaluationRun) =>
         evaluationRun.context === "agent" &&
         evaluationRun.agentRunId === run.id &&
@@ -545,16 +547,41 @@ export function agentReviewCadenceHeadroom(
         if (latest.status === "running") pendingCommand = true;
         else if (latest.status !== "completed" || !Number.isFinite(latest.score)) return false;
       } else if (latest.status !== "completed" || !Number.isFinite(latest.score)) return false;
+
+      const screening = Boolean(evaluation.screeningCommand);
+      const baseline = state.evaluationRuns.filter((evaluationRun) =>
+        (screening
+          ? evaluationRun.context === "screening_baseline"
+          : evaluationRun.context === "baseline" || evaluationRun.context === "manual") &&
+        evaluationRun.evaluationId === evaluation.id &&
+        evaluationRun.status === "completed" &&
+        Number.isFinite(evaluationRun.score) &&
+        isCurrentEvaluationRun(evaluation, evaluationRun, baseCommit),
+      ).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
+      if (!baseline || (!evaluation.command && !isAuthoritativeFullBaseline(evaluation, baseline, baseCommit))) return false;
+      // A command still waiting on this review's lock can at best score 100.
+      // Known regressions or an unreachable impact threshold cannot justify
+      // abandoning the only other candidate, even before the suite finishes.
+      const after = latest.status === "running" ? 100 : latest.score!;
+      optimisticDeltas.push({
+        evaluationId: evaluation.id,
+        name: evaluation.name,
+        before: baseline.score!,
+        after,
+        delta: Math.round((after - baseline.score!) * 10) / 10,
+      });
     }
-    return pendingCommand;
+    const { enabled, commands } = yoloEvaluationSets(state);
+    const maximumImpact = weightedScore(enabledEvaluations, new Map(optimisticDeltas.map((delta) => [delta.evaluationId, delta.delta!])));
+    return pendingCommand && isYoloCandidate(optimisticDeltas, maximumImpact, enabled, commands, state.settings.compositeAbsorbThreshold);
   });
   const fallbackReady = Boolean(fallback && (fallback.kind !== "agent" || fallback.id !== currentRunId)) ||
     validatingCompositeReady || commandQueuedAgentReady;
   // Do not discard completed author work merely because another idea is
   // queued. Dispatch headroom already prevents starting work too late, and a
   // queued replacement is not safer than the candidate that reached review.
-  // Only an independently approved fallback, an approved leaf waiting solely
-  // on command evaluations, or an already-cooked composite can justify
+  // Only an independently approved fallback, a viable approved leaf waiting
+  // solely on command evaluations, or an already-cooked composite can justify
   // yielding this loop. The latter two matter even before a final PR is ready:
   // their command evaluations may be waiting on cpu-heavy held by this agent,
   // so letting the review continue can deadlock the merge tail behind the very
