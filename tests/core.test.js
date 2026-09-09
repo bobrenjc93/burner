@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { get } from "node:http";
 import { createConnection } from "node:net";
 import { execFile } from "node:child_process";
@@ -2100,6 +2100,44 @@ test("resource locks are exclusive and recover after release", async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("concurrent resource lock publication keeps one complete owner and cleans temporary files", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-lock-publication-test-"));
+  try {
+    const contenders = Array.from({ length: 24 }, (_, index) => ({ manager: new LockManager(root), owner: `agent-${index}` }));
+    const results = await Promise.all(contenders.map(({ manager, owner }) => manager.tryAcquire("cpu-heavy", owner)));
+    const winnerIndex = results.findIndex(Boolean);
+    assert.equal(results.filter(Boolean).length, 1);
+    const metadata = JSON.parse(await readFile(join(root, "cpu-heavy.lock"), "utf8"));
+    assert.equal(metadata.owner, contenders[winnerIndex].owner);
+    assert.equal(metadata.pid, process.pid);
+    assert.ok(Number.isFinite(Date.parse(metadata.createdAt)));
+    assert.deepEqual(await readdir(root), ["cpu-heavy.lock"]);
+    assert.deepEqual(await contenders[0].manager.reapOrphans(), []);
+    await results[winnerIndex].release();
+    assert.deepEqual(await readdir(root), []);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("incomplete legacy lock metadata is busy until released rather than an evaluation error", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-lock-incomplete-test-"));
+  try {
+    const locks = new LockManager(root);
+    const path = join(root, "cpu-heavy.lock");
+    for (const incomplete of ["", '{"owner":']) {
+      await writeFile(path, incomplete);
+      assert.equal(await locks.tryAcquire("cpu-heavy", "waiting-agent"), undefined);
+      await assert.rejects(locks.acquire("cpu-heavy", "waiting-agent", { timeoutMs: 25, pollMs: 10 }), /Timed out waiting for resource lock/);
+      assert.equal(await readFile(path, "utf8"), incomplete, "the unknown owner's lock must remain intact");
+    }
+    await writeFile(path, JSON.stringify({ owner: "first-agent", pid: process.pid, createdAt: new Date().toISOString() }));
+    assert.equal(await locks.tryAcquire("cpu-heavy", "waiting-agent"), undefined);
+    await rm(path);
+    const acquired = await locks.acquire("cpu-heavy", "waiting-agent", { timeoutMs: 100, pollMs: 10 });
+    await acquired.release();
+    assert.deepEqual(await readdir(root), []);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("restart recovery makes every interrupted agent phase resumable", async () => {

@@ -1,4 +1,5 @@
-import { mkdir, open, readFile, readdir, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { link, mkdir, open, readFile, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { errorMessage, now } from "./utils.js";
 
@@ -17,9 +18,20 @@ export class LockManager {
     const safeName = name.replace(/[^a-zA-Z0-9._-]/g, "-");
     const path = join(this.lockDir, `${safeName}.lock`);
     try {
-      const handle = await open(path, "wx");
-      await handle.writeFile(JSON.stringify({ owner, pid: process.pid, createdAt: now() }));
-      await handle.close();
+      // Publish complete metadata atomically without replacing another owner.
+      // Opening the public path first exposes an empty file to concurrent readers.
+      const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+      const handle = await open(temporaryPath, "wx");
+      try {
+        try {
+          await handle.writeFile(JSON.stringify({ owner, pid: process.pid, createdAt: now() }));
+        } finally {
+          await handle.close();
+        }
+        await link(temporaryPath, path);
+      } finally {
+        await rm(temporaryPath, { force: true });
+      }
       let released = false;
       return {
         name,
@@ -38,6 +50,9 @@ export class LockManager {
           return this.tryAcquire(name, owner);
         }
       } catch (readError) {
+        // Older publishers can still expose incomplete metadata. Treat that as
+        // contention: never steal an unknown owner's lock or fail a waiting eval.
+        if (readError instanceof SyntaxError) return undefined;
         if ((readError as NodeJS.ErrnoException).code !== "ENOENT") {
           throw new Error(`Could not inspect lock ${name}: ${errorMessage(readError)}`);
         }
