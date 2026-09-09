@@ -174,6 +174,8 @@ Burner also treats the target worktree as the mutation boundary. Author, revisio
 
 Each idea may declare resource locks. Locks are acquired atomically under `.burner/locks`, in sorted order, and held for the full agent run. If any requested resource is busy, the idea stays queued. Git worktree mutations use a separate short-lived metadata lock.
 
+Within one Burner process, blocking requests (including queued command evaluations) receive FIFO priority over new job leases. This does not change held-lock lifetimes or cross-process exclusion.
+
 Concurrency is configurable but defaults to **1**. This favors slower monotonic progress and prevents speculative agents from invalidating one another. Living-line experiments also take a composite-specific lock, so increasing global concurrency never allows two agents to mutate the same lineage simultaneously.
 
 ## Development

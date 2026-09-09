@@ -6,7 +6,15 @@ import { errorMessage, now } from "./utils.js";
 export type HeldLock = { name: string; release: () => Promise<void> };
 export type AcquireOptions = { timeoutMs?: number; pollMs?: number };
 
+function lockKey(name: string): string {
+  return name.replace(/[^a-zA-Z0-9._-]/g, "-");
+}
+
 export class LockManager {
+  // FIFO admission is local to this manager; file locks still provide
+  // cross-process exclusion. New job leases must not bypass waiting evals.
+  private readonly waiters = new Map<string, symbol[]>();
+
   constructor(private readonly lockDir: string, private readonly staleMs = 6 * 60 * 60 * 1000) {}
 
   async init(): Promise<void> {
@@ -14,8 +22,14 @@ export class LockManager {
   }
 
   async tryAcquire(name: string, owner: string): Promise<HeldLock | undefined> {
+    return this.tryAcquireQueued(name, owner);
+  }
+
+  private async tryAcquireQueued(name: string, owner: string, waiter?: symbol): Promise<HeldLock | undefined> {
+    const safeName = lockKey(name);
+    const first = this.waiters.get(safeName)?.[0];
+    if (first !== undefined && first !== waiter) return undefined;
     await this.init();
-    const safeName = name.replace(/[^a-zA-Z0-9._-]/g, "-");
     const path = join(this.lockDir, `${safeName}.lock`);
     try {
       // Publish complete metadata atomically without replacing another owner.
@@ -47,7 +61,7 @@ export class LockManager {
         const contents = JSON.parse(await readFile(path, "utf8")) as { createdAt?: string };
         if (contents.createdAt && Date.now() - new Date(contents.createdAt).getTime() > this.staleMs) {
           await rm(path, { force: true });
-          return this.tryAcquire(name, owner);
+          return this.tryAcquireQueued(name, owner, waiter);
         }
       } catch (readError) {
         // Older publishers can still expose incomplete metadata. Treat that as
@@ -65,11 +79,21 @@ export class LockManager {
     const timeoutMs = options.timeoutMs ?? 2 * 60 * 1000;
     const pollMs = Math.max(10, options.pollMs ?? 100);
     const deadline = Date.now() + timeoutMs;
-    while (true) {
-      const lock = await this.tryAcquire(name, owner);
-      if (lock) return lock;
-      if (Date.now() >= deadline) throw new Error(`Timed out waiting for resource lock '${name}'.`);
-      await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(1, deadline - Date.now()))));
+    const key = lockKey(name);
+    const waiter = Symbol(owner);
+    const queue = this.waiters.get(key) ?? [];
+    queue.push(waiter);
+    this.waiters.set(key, queue);
+    try {
+      while (true) {
+        const lock = await this.tryAcquireQueued(name, owner, waiter);
+        if (lock) return lock;
+        if (Date.now() >= deadline) throw new Error(`Timed out waiting for resource lock '${name}'.`);
+        await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(1, deadline - Date.now()))));
+      }
+    } finally {
+      queue.splice(queue.indexOf(waiter), 1);
+      if (!queue.length) this.waiters.delete(key);
     }
   }
 

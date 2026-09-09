@@ -2161,6 +2161,100 @@ test("concurrent resource lock publication keeps one complete owner and cleans t
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("waiting resource requests take priority over new job leases without blocking unrelated resources", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-lock-waiter-priority-test-"));
+  const locks = new LockManager(root);
+  const initialize = locks.init.bind(locks);
+  let unblock;
+  let started;
+  const blocked = new Promise((resolve) => { unblock = resolve; });
+  const entered = new Promise((resolve) => { started = resolve; });
+  let first = true;
+  locks.init = async () => {
+    if (first) { first = false; started(); await blocked; }
+    await initialize();
+  };
+  const waiting = locks.acquire("cpu/heavy", "waiting-evaluation", { timeoutMs: 2_000, pollMs: 10 });
+  let newcomer;
+  let unrelated;
+  let direct;
+  try {
+    await entered;
+    newcomer = await locks.tryAcquireAll(["aaa", "cpu-heavy"], "new-idea");
+    assert.equal(newcomer, undefined, "new work must not overtake an existing waiter, including aliased lock names");
+    direct = await locks.tryAcquire("cpu-heavy", "new-direct-request");
+    assert.equal(direct, undefined);
+    assert.deepEqual(await locks.list(), [], "a failed multi-resource lease must release its partial acquisition");
+    unrelated = await locks.tryAcquireAll(["gpu"], "independent-idea");
+    assert.ok(unrelated, "waiter priority must be per resource");
+  } finally {
+    await newcomer?.release();
+    await direct?.release();
+    await unrelated?.release();
+    unblock();
+    await (await waiting).release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resource waiters are FIFO even with the same owner and a timed-out follower", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-lock-fifo-test-"));
+  const locks = new LockManager(root);
+  const initialize = locks.init.bind(locks);
+  let unblock;
+  let started;
+  const blocked = new Promise((resolve) => { unblock = resolve; });
+  const entered = new Promise((resolve) => { started = resolve; });
+  let first = true;
+  locks.init = async () => {
+    if (first) { first = false; started(); await blocked; }
+    await initialize();
+  };
+  const order = [];
+  const firstWaiter = locks.acquire("gpu", "same-owner", { timeoutMs: 2_000, pollMs: 10 }).then(async (lock) => {
+    order.push("first");
+    await lock.release();
+  });
+  let secondWaiter;
+  try {
+    await entered;
+    await assert.rejects(locks.acquire("gpu", "timed-out-follower", { timeoutMs: 0, pollMs: 10 }).then(async (lock) => {
+      await lock.release();
+      return lock;
+    }), /Timed out waiting/);
+    secondWaiter = locks.acquire("gpu", "same-owner", { timeoutMs: 2_000, pollMs: 10 }).then(async (lock) => {
+      order.push("second");
+      await lock.release();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.deepEqual(order, [], "a follower cannot acquire while the earlier request is initializing");
+    unblock();
+    await Promise.all([firstWaiter, secondWaiter]);
+    assert.deepEqual(order, ["first", "second"]);
+    const later = await locks.tryAcquire("gpu", "later-job");
+    assert.ok(later, "completed and timed-out waiters must leave no reservation behind");
+    await later.release();
+  } finally {
+    unblock();
+    await Promise.allSettled([firstWaiter, secondWaiter]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resource acquisition errors clear waiter reservations", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-lock-error-cleanup-test-"));
+  try {
+    const locks = new LockManager(root);
+    const initialize = locks.init.bind(locks);
+    locks.init = async () => { throw new Error("injected initialization failure"); };
+    await assert.rejects(locks.acquire("cpu-heavy", "failed-evaluation"), /injected initialization failure/);
+    locks.init = initialize;
+    const recovered = await locks.tryAcquireAll(["cpu-heavy"], "next-job");
+    assert.ok(recovered);
+    await recovered.release();
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("incomplete legacy lock metadata is busy until released rather than an evaluation error", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-lock-incomplete-test-"));
   try {
