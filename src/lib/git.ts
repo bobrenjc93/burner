@@ -23,11 +23,14 @@ export class TransientMergeGateError extends Error {
 }
 
 const transientGitHubPattern = /connection (?:reset|refused|closed)|error connecting to|network (?:error|failure)|timed? out|timeout|unexpected eof|tls|temporary failure|service unavailable|no route to host|failed to connect|could not resolve host|http (?:429|5\d\d)|stream (?:error|disconnected)|socket (?:not open|hang up)/i;
+// GitHub and forward proxies can report throttling without an HTTP 429. Keep
+// these signatures explicit: a generic 403 or authorization error is not a retry.
+const rateLimitedGitHubPattern = /\bratelimit by OnRequestRateLimitFilter\b|\b(?:API|secondary) rate limit (?:already )?exceeded\b|\b(?:exceeded|hit) (?:a |the )?(?:API|secondary) rate limit\b/i;
 
 export function isTransientGitHubFailure(error: unknown): boolean {
   if (error instanceof TransientMergeGateError) return true;
   const message = error instanceof Error ? error.message : String(error);
-  return transientGitHubPattern.test(message);
+  return transientGitHubPattern.test(message) || rateLimitedGitHubPattern.test(message);
 }
 
 type PullRequestMergeStatus = {

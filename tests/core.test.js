@@ -36,6 +36,67 @@ test("GitHub transport classification recognizes gh connection errors", () => {
   assert.equal(isTransientGitHubFailure("GraphQL: Pull Request is not mergeable"), false);
 });
 
+test("GitHub throttling is transient without treating authorization failures as retries", () => {
+  for (const message of [
+    'Post "https://api.github.com/graphql": [Raindrop] Ratelimit by OnRequestRateLimitFilter, on_request_ratelimiter_handle_global_apex_domain_rps_override',
+    "API rate limit exceeded for user ID 123 (HTTP 403)",
+    "GraphQL: API rate limit already exceeded for user ID 123.",
+    "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.",
+    "You have hit the secondary rate limit. Please retry later.",
+    "HTTP 429: Too Many Requests",
+  ]) assert.equal(isTransientGitHubFailure(new Error(message)), true, message);
+  for (const message of [
+    "HTTP 401: Bad credentials",
+    "HTTP 403: Resource not accessible by integration",
+    "GraphQL: Could not resolve to a Repository",
+    "GraphQL: Pull Request is not mergeable",
+    "HTTP 403: Forbidden; check your permissions or rate limit configuration",
+  ]) assert.equal(isTransientGitHubFailure(message), false, message);
+});
+
+test("GitHub reads retry proxy throttling with a bounded budget and fail closed on authorization", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-rate-limit-test-"));
+  const bin = join(root, "bin");
+  const statePath = join(root, "gh-state.json");
+  const previousPath = process.env.PATH;
+  try {
+    await mkdir(bin);
+    const executable = join(bin, "gh");
+    await writeFile(executable, [
+      "#!/usr/bin/env node",
+      'const fs = require("fs");',
+      `const path = ${JSON.stringify(statePath)};`,
+      'const state = JSON.parse(fs.readFileSync(path, "utf8"));',
+      "state.attempts += 1;",
+      "fs.writeFileSync(path, JSON.stringify(state));",
+      "if (state.attempts <= state.failures) { console.error(state.message); process.exit(1); }",
+      "console.log(JSON.stringify({ isDraft: true }));",
+    ].join("\n"));
+    await chmod(executable, 0o755);
+    process.env.PATH = `${bin}:${previousPath ?? ""}`;
+    const git = new GitService(root, join(root, ".burner"), { transportAttempts: 3, intervalMs: 0 });
+    const throttled = "[Raindrop] Ratelimit by OnRequestRateLimitFilter, on_request_ratelimiter_handle_global_apex_domain_rps_override";
+    await writeFile(statePath, JSON.stringify({ attempts: 0, failures: 2, message: throttled }));
+    assert.equal(await git.isPrDraft(root, 42), true);
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).attempts, 3);
+
+    await writeFile(statePath, JSON.stringify({ attempts: 0, failures: 10, message: throttled }));
+    await assert.rejects(() => git.isPrDraft(root, 42), (error) =>
+      error instanceof TransientMergeGateError && error.message === throttled);
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).attempts, 3, "persistent throttling must leave the bounded retry loop");
+
+    const forbidden = "HTTP 403: Resource not accessible by integration";
+    await writeFile(statePath, JSON.stringify({ attempts: 0, failures: 10, message: forbidden }));
+    await assert.rejects(() => git.isPrDraft(root, 42), (error) =>
+      !(error instanceof TransientMergeGateError) && error.message === forbidden);
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).attempts, 1, "authorization failures must not be retried");
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("command timeouts terminate descendant processes and return exit code 124", async () => {
   const started = Date.now();
   const result = await runCommand("/bin/sh", ["-c", "sleep 30 & wait"], { cwd: process.cwd(), timeoutMs: 50 });
