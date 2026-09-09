@@ -367,6 +367,7 @@ export class CodexClient {
       "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree. If a finding depends on external behavior, use hermetic fixtures or document the dependency; do not patch the external producer.",
       "Do not commit, push, or open a pull request; Burner handles git delivery.",
       `${PROGRESS_OWNERSHIP} If feedback asks for a current unmerged PR history point or duplicate progress infrastructure, do not implement that invalid request; explain that Burner stamps the point after final evaluation instead.`,
+      MEASURED_ARTIFACT_PROVENANCE,
       `Review summary: ${review.summary}`,
       `Findings:\n${review.findings.map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.title}${finding.file ? ` (${finding.file})` : ""}: ${finding.detail}`).join("\n")}`,
       "If a finding is invalid, verify that carefully and explain it, but make all justified fixes.",

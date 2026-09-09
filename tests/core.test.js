@@ -607,8 +607,9 @@ test("artifact prompts preserve historical setup reruns without granting current
   await codex.integrateComposite("/worktree", "Combined", ["Setup disclosure"], settings);
   await codex.refreshCompositeEvidence("/worktree", "main", "Combined", "author", "current-implementation", settings);
   await codex.refreshAgentEvidence("/worktree", "main", "Historical setup", "author", "current-implementation", settings);
+  await codex.revise("/worktree", "author", { approved: false, summary: "Historical setup feedback", findings: [] }, settings);
   await codex.review("/worktree", "main", "Historical setup", settings);
-  assert.equal(prompts.length, 4);
+  assert.equal(prompts.length, 5);
   for (const prompt of prompts) {
     assert.match(prompt, /For current-candidate evidence, apply these rules/);
     assert.match(prompt, /intervening diff contains reports\/evidence and no implementation or benchmark-harness changes/);
@@ -5301,6 +5302,7 @@ test("every Codex role and structured fallback uses Astra medium without automat
     assert.match(evidenceCall.input, /Finish within 30 minutes/);
     assert.match(revisionCall.input, /Never modify parent or sibling repositories/);
     assert.match(revisionCall.input, /do not implement that invalid request/);
+    assert.match(revisionCall.input, /do not require rerunning unchanged historical workloads solely to supply setup metadata/);
     const reviewerCalls = calls.filter(({ input }) => input.includes("independent, rigorous reviewer"));
     assert.equal(reviewerCalls.length, 2);
     assert.match(reviewerCalls[0].input, /comprehensive blocker pass now/);
