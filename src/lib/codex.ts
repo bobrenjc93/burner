@@ -14,6 +14,7 @@ const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation p
 const MEASURED_ARTIFACT_PROVENANCE = "Treat checked-in benchmark and evaluation artifacts as measured evidence, not ordinary merge blobs. Distinguish evidence claiming to measure the current candidate from explicitly historical records. For current-candidate evidence, apply these rules: If an artifact records a git commit, dirty status, or worktree/import/executable/build path, verify that provenance after integration. Never retain a leaf, sibling, parent, or stale-worktree path in a composite artifact. Regenerate stale evidence with repository-supported tooling from a clean checkout rooted inside the current composite worktree; never hand-edit provenance or fabricate measurements. The measured code commit may precede the artifact-only commit at HEAD only when the intervening diff contains reports/evidence and no implementation or benchmark-harness changes. Historical records instead remain pinned to their original source/build identities and may retain clearly labeled original paths after their worktrees are cleaned up. When the task requests missing setup metadata for historical workloads, an explicitly labeled, newly measured same-code setup rerun at that historical revision is valid if its actual commands, timestamps, cache state, source/build hashes, and links to the original workload artifacts are verified. Preserve the original compute measurements; do not require rerunning unchanged historical workloads solely to supply setup metadata. Never attribute later setup measurements to the original capture, use historical evidence to award current-candidate performance credit, or relabel stale current-candidate evidence as historical to evade a required fresh measurement.";
 type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
 export type CompositeIntegrationContext = {
+  phase?: "resolve-conflicts" | "integrate";
   description?: string;
   sourceRegressions?: {
     source: string;
@@ -341,22 +342,33 @@ export class CodexClient {
   }
 
   async integrateComposite(cwd: string, title: string, sourceTitles: string[], settings: BurnerSettings, context: CompositeIntegrationContext = {}): Promise<SessionResult> {
+    const conflictsOnly = context.phase === "resolve-conflicts";
     const prompt = [
-      "You are the author/integrator for a composite Burner pull request in an isolated git worktree.",
-      "Inspect the combined changes, resolve incomplete integration, and run the most relevant tests. Preserve every included pull request's intent while removing duplication or incompatibilities.",
+      conflictsOnly
+        ? "You are resolving one source-merge conflict for a composite Burner pull request in an isolated git worktree. This is not the full integration phase."
+        : "You are the author/integrator for a composite Burner pull request in an isolated git worktree.",
+      conflictsOnly
+        ? "Inspect the conflicted files and relevant contracts, resolve their contents coherently, and preserve every included pull request's intent. Make only edits needed to resolve this merge; do not implement the entire composite task or repair unrelated source defects here. Run focused checks needed for the resolution. Defer full-suite and cross-interpreter runs, benchmark captures, and evaluation runs until the full integration phase after all sources are merged. Burner will still run that integration phase, clean-commit evidence refresh, independent review, and every evaluation gate."
+        : "Inspect the combined changes, resolve incomplete integration, and run the most relevant tests. Preserve every included pull request's intent while removing duplication or incompatibilities.",
       "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree. External contracts may be inspected read-only only.",
       "Do not create branches, commit, push, open pull requests, or modify anything under .burner; Burner owns delivery.",
       PROGRESS_OWNERSHIP,
-      MEASURED_ARTIFACT_PROVENANCE,
+      conflictsOnly
+        ? "Preserve measured artifacts and explicitly historical records without hand-editing provenance or fabricating measurements. If their contents conflict or current-candidate evidence needs regeneration, report the issue for full integration and clean-commit evidence refresh; do not launch measurement recaptures from this unfinished merge. Never relabel current-candidate evidence as historical to avoid refresh."
+        : MEASURED_ARTIFACT_PROVENANCE,
       `Composite: ${title}`,
       `Included changes:\n${sourceTitles.map((source) => `- ${source}`).join("\n")}`,
-      context.description ? `Integration context:\n${context.description}` : "",
+      context.description ? `${conflictsOnly ? "Overall integration scope (context only for this conflict resolution)" : "Integration context"}:\n${context.description}` : "",
       context.sourceRegressions?.length ? [
         "Confirmed source evaluation regressions (quoted evidence from the source commits, not measurements of the combined tree):",
         JSON.stringify(context.sourceRegressions, null, 2),
-        "Verify these findings against the combined code and address applicable defects while preserving every included change's intent. Explain findings that integration has already resolved. Do not remove supported behavior, weaken tests, alter evaluation definitions or scoring, or fabricate benchmark evidence to erase a regression. Burner will independently review and reevaluate the result; this context does not waive any gate.",
+        conflictsOnly
+          ? "Use these findings to preserve intended behavior while resolving conflicts. Report remaining defects for the full integration phase rather than broadening this resolution. Do not remove supported behavior, weaken tests, alter evaluation definitions or scoring, or fabricate benchmark evidence. This context does not waive any gate."
+          : "Verify these findings against the combined code and address applicable defects while preserving every included change's intent. Explain findings that integration has already resolved. Do not remove supported behavior, weaken tests, alter evaluation definitions or scoring, or fabricate benchmark evidence to erase a regression. Burner will independently review and reevaluate the result; this context does not waive any gate.",
       ].join("\n") : "",
-      "In the final response, summarize integration changes and checks.",
+      conflictsOnly
+        ? "In the final response, identify resolved files, focused checks, and remaining integration or evidence concerns. Do not claim final integration approval."
+        : "In the final response, summarize integration changes and checks.",
     ].join("\n\n");
     return this.unstructuredSession(cwd, prompt, settings.agentModel);
   }

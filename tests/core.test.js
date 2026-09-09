@@ -529,6 +529,8 @@ test("fresh and resumed composite builds forward scope and verified source feedb
       orchestrator.reviewComposite = async () => { throw new Error("test stops after integration handoff"); };
       await orchestrator.buildComposite("combined", resume);
       assert.equal(calls.length, resume ? 1 : 2);
+      if (!resume) assert.equal(calls[0].context.phase, "resolve-conflicts", "source conflicts use the bounded resolution phase");
+      assert.equal(calls.at(-1).context.phase, undefined, "full integration still runs after all source merges, including resumed builds");
       assert.deepEqual(calls.at(-1).titles, ["CUDA storage", "Other change"], "resumed builds retain the complete included scope");
       for (const call of calls) {
         assert.equal(call.context.description, "Repair native ownership");
@@ -540,6 +542,44 @@ test("fresh and resumed composite builds forward scope and verified source feedb
       await rm(root, { recursive: true, force: true });
     }
   }
+});
+
+test("conflict resolution defers broad validation without weakening final integration", async () => {
+  const codex = new CodexClient();
+  const { state, sources } = compositeRegressionFixture();
+  let prompt;
+  codex.unstructuredSession = async (_cwd, input) => {
+    prompt = input;
+    return { message: "Conflicts resolved", threadId: "resolver" };
+  };
+  const context = {
+    phase: "resolve-conflicts",
+    description: "Preserve CUDA storage and historical setup records.",
+    sourceRegressions: compositeSourceRegressions(state, sources, "base"),
+  };
+  const settings = { agentModel: "gpt-6-astra" };
+  await codex.integrateComposite("/worktree", "Combined", ["CUDA storage"], settings, context);
+  assert.match(prompt, /This is not the full integration phase/);
+  assert.match(prompt, /Make only edits needed to resolve this merge/);
+  assert.match(prompt, /Run focused checks needed for the resolution/);
+  assert.match(prompt, /Defer full-suite and cross-interpreter runs, benchmark captures, and evaluation runs/);
+  assert.match(prompt, /clean-commit evidence refresh, independent review, and every evaluation gate/);
+  assert.match(prompt, /Overall integration scope \(context only for this conflict resolution\)/);
+  assert.match(prompt, /Preserve CUDA storage and historical setup records/);
+  assert.match(prompt, /Report remaining defects for the full integration phase/);
+  assert.match(prompt, /without hand-editing provenance or fabricating measurements/);
+  assert.match(prompt, /Never relabel current-candidate evidence as historical/);
+  assert.match(prompt, /Do not remove supported behavior, weaken tests, alter evaluation definitions or scoring/);
+  assert.match(prompt, /Never modify parent or sibling repositories/);
+  assert.match(prompt, /Burner owns the canonical merge-coupled evaluation progress artifacts/);
+  assert.doesNotMatch(prompt, /Regenerate stale evidence with repository-supported tooling/);
+  assert.doesNotMatch(prompt, /Verify these findings against the combined code and address applicable defects/);
+
+  await codex.integrateComposite("/worktree", "Combined", ["CUDA storage"], settings, { ...context, phase: "integrate" });
+  assert.match(prompt, /author\/integrator/);
+  assert.match(prompt, /Verify these findings against the combined code and address applicable defects/);
+  assert.match(prompt, /Regenerate stale evidence with repository-supported tooling/);
+  assert.doesNotMatch(prompt, /Defer full-suite and cross-interpreter runs/);
 });
 
 test("foundational planning continues partial progress using unrounded weighted headroom", async () => {

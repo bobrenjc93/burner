@@ -3700,6 +3700,7 @@ export class Orchestrator {
         const merge = await this.git.mergeBranch(worktree, sourceRef);
         if (merge.conflict) {
           const resolver = await this.codex.integrateComposite(worktree, composite.title, [source.title], settings, {
+            phase: "resolve-conflicts",
             description: composite.description,
             sourceRegressions: compositeSourceRegressions(this.store.get(), [source], baseCommit),
           });
