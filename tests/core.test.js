@@ -4754,6 +4754,121 @@ test("a pending same-PR base refresh claims the next available agent slot", asyn
   }
 });
 
+test("an approved unpublished base-move checkpoint reclaims a slot after the current baseline is ready", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-unpublished-refresh-slot-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.settings.parallelism = 1;
+      state.composites.push({
+        id: "parent", title: "Merged parent", description: "", status: "merged", branch: "burner/parent",
+        worktree: "", sources: [], deltas: [], reviewRounds: [], createdAt: timestamp, updatedAt: timestamp,
+      });
+      state.ideas.push({
+        id: "idea-pending", title: "Keep the approved work", description: "", rationale: "Preserve the checkpoint",
+        predictedImpact: 1, evaluationIds: [], resources: [], status: "failed", source: "manual",
+        createdAt: timestamp, updatedAt: timestamp, agentRunId: "run-pending",
+      });
+      state.agentRuns.push({
+        id: "run-pending", ideaId: "idea-pending", status: "failed", branch: "burner/existing-work", worktree: root,
+        startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "existing-thread",
+        baseRef: "burner/parent", baseCommit: "before-progress-stamp", parentCompositeId: "parent",
+        error: "The experiment base moved during the review loop. Retry this idea from the latest living line.",
+        reviewApproved: true,
+        reviewRounds: [{ id: "review-1", round: 1, commit: "approved-head", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    const refreshed = [];
+    orchestrator.refreshAgentBaseAndRetry = async (runId) => {
+      refreshed.push(runId);
+      orchestrator.retryingAgentIds.add(runId);
+      return store.get().agentRuns.find((run) => run.id === runId);
+    };
+
+    orchestrator.missingBaselineEvaluations = () => [{ id: "missing" }];
+    assert.equal(orchestrator.schedulePendingBaseRefreshes("merged-main"), 0);
+    orchestrator.missingBaselineEvaluations = () => [];
+    orchestrator.activeAgents.add("busy");
+    assert.equal(orchestrator.schedulePendingBaseRefreshes("merged-main"), 0);
+    assert.deepEqual(refreshed, []);
+
+    orchestrator.activeAgents.delete("busy");
+    assert.equal(orchestrator.schedulePendingBaseRefreshes("merged-main"), 1);
+    assert.deepEqual(refreshed, ["run-pending"]);
+    assert.equal(orchestrator.schedulePendingBaseRefreshes("merged-main"), 0, "do not schedule an active refresh twice");
+    assert.equal(store.get().ideas.length, 1, "do not queue a replacement idea");
+    assert.equal(store.get().agentRuns[0].branch, "burner/existing-work");
+    assert.equal(store.get().agentRuns[0].authorThreadId, "existing-thread");
+    assert.equal(store.get().agentRuns[0].prNumber, undefined, "recovery must not invent a PR before validation");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unpublished base refresh eligibility excludes unrelated, superseded, and unsafe checkpoints", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-unpublished-refresh-filter-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "head", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+    const variants = [
+      ["main", {}, {}],
+      ["open-parent", { parentCompositeId: "open" }, {}],
+      ["merged-parent", { parentCompositeId: "merged" }, {}],
+      ["main-advanced-during-evaluation", { error: "The base branch moved during evaluation. Retry this idea to recalculate against the new main." }, {}],
+      ["parent-advanced-during-evaluation", { parentCompositeId: "open", error: "The living composite advanced during evaluation. Retry this experiment from its latest state." }, {}],
+      ["parent-merged-before-absorption", { parentCompositeId: "merged", error: "The living composite is no longer available for absorption." }, {}],
+      ["unavailable-parent-without-identity", { error: "The living composite is no longer available for absorption." }, {}],
+      ["parent-closed-before-absorption", { parentCompositeId: "closed", error: "The living composite is no longer available for absorption." }, {}],
+      ["missing-parent", { parentCompositeId: "missing" }, {}],
+      ["closed-parent", { parentCompositeId: "closed" }, {}],
+      ["failed-parent", { parentCompositeId: "failed" }, {}],
+      ["rebuilding-parent", { parentCompositeId: "rebuilding" }, {}],
+      ["active", { status: "reviewing" }, {}],
+      ["no-thread", { authorThreadId: undefined }, {}],
+      ["no-base-ref", { baseRef: undefined }, {}],
+      ["no-base-commit", { baseCommit: undefined }, {}],
+      ["not-approved", { reviewApproved: false }, {}],
+      ["review-rejected", { reviewRounds: [{ ...approvedRound, approved: false }] }, {}],
+      ["other-error", { error: "Candidate evaluation remained incomplete." }, {}],
+      ["closed-pr", { prNumber: 42, prState: "closed" }, {}],
+      ["superseded", {}, { agentRunId: "newer-run" }],
+      ["dismissed", {}, { status: "dismissed" }],
+      ["retrying", {}, {}],
+      ["published", { prNumber: 43, prState: "open", error: "Base advanced to new-base; same-PR refresh pending." }, {}],
+    ];
+    await store.update((state) => {
+      for (const status of ["open", "merged", "closed", "failed", "rebuilding"]) {
+        state.composites.push({ id: status, title: status, description: "", status, branch: `burner/${status}`, worktree: "", sources: [], deltas: [], reviewRounds: [], createdAt: timestamp, updatedAt: timestamp });
+      }
+      for (const [id, runPatch, ideaPatch] of variants) {
+        state.ideas.push({
+          id: `idea-${id}`, title: id, description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [],
+          status: "failed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: id, ...ideaPatch,
+        });
+        state.agentRuns.push({
+          id, ideaId: `idea-${id}`, status: "failed", branch: `burner/${id}`, worktree: root,
+          startedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread", baseRef: "main", baseCommit: "old-base",
+          error: "The experiment base moved during the review loop. Retry this idea from the latest living line.",
+          reviewApproved: true, reviewRounds: [approvedRound], ...runPatch,
+        });
+      }
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.retryingAgentIds.add("retrying");
+    assert.deepEqual(orchestrator.pendingBaseRefreshes(store.get()).map((run) => run.id), [
+      "main", "open-parent", "merged-parent", "main-advanced-during-evaluation",
+      "parent-advanced-during-evaluation", "parent-merged-before-absorption", "published",
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("pending same-PR base refreshes wait for a complete current-base baseline", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-pending-refresh-baseline-test-"));
   try {

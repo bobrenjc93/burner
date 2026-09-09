@@ -60,6 +60,12 @@ class CandidateEvaluationError extends Error {
 }
 
 const CANDIDATE_EVALUATION_PROTOCOL = "baseline-anchored-v2";
+const BASE_REFRESH_ERRORS = {
+  review: "The experiment base moved during the review loop. Retry this idea from the latest living line.",
+  evaluation: "The base branch moved during evaluation. Retry this idea to recalculate against the new main.",
+  parentUnavailable: "The living composite is no longer available for absorption.",
+  experimentEvaluation: "The living composite advanced during evaluation. Retry this experiment from its latest state.",
+};
 
 function nextEvaluationTimestamp(runs: readonly Pick<EvaluationRun, "createdAt">[]): string {
   const latest = runs.reduce((maximum, run) => Math.max(maximum, Date.parse(run.createdAt) || 0), 0);
@@ -2576,10 +2582,25 @@ export class Orchestrator {
   private pendingBaseRefreshes(state: BurnerState): AgentRun[] {
     return state.agentRuns.filter((run) => {
       const idea = state.ideas.find((item) => item.id === run.ideaId);
-      return run.status === "failed" &&
-        run.prNumber !== undefined &&
+      const publishedRefresh = run.prNumber !== undefined &&
         run.prState === "open" &&
-        run.error?.includes("same-PR refresh pending") === true &&
+        run.error?.includes("same-PR refresh pending") === true;
+      const parent = run.parentCompositeId
+        ? state.composites.find((composite) => composite.id === run.parentCompositeId)
+        : undefined;
+      // A base can advance or merge after review but before the first PR is
+      // published (including a merge-time progress stamp). Keep that approved
+      // checkpoint on the same refresh/review/evaluation path as published work.
+      const baseMoved = run.error === BASE_REFRESH_ERRORS.review ||
+        run.error === BASE_REFRESH_ERRORS.evaluation ||
+        (Boolean(parent) && (run.error === BASE_REFRESH_ERRORS.parentUnavailable ||
+          run.error === BASE_REFRESH_ERRORS.experimentEvaluation));
+      const unpublishedRefresh = run.prNumber === undefined &&
+        baseMoved &&
+        Boolean(run.authorThreadId && run.baseRef && run.baseCommit) &&
+        (!run.parentCompositeId || parent?.status === "open" || parent?.status === "merged");
+      return run.status === "failed" &&
+        (publishedRefresh || unpublishedRefresh) &&
         finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
         idea?.status === "failed" &&
         idea.agentRunId === run.id &&
@@ -3089,7 +3110,7 @@ export class Orchestrator {
         // integrate it while an unrelated author drains. Waiting for every
         // author to finish can consume the entire composite-validation tail
         // and force a direct-leaf fallback even though capacity was idle.
-        // A retained same-PR refresh has priority over cooking once its current
+        // A retained candidate refresh has priority over cooking once its current
         // base has a complete baseline, so do not fill its future slot here.
         if (!this.pendingBaseRefreshes(initial).length &&
           this.activeAgents.size < initial.settings.parallelism &&
@@ -3115,7 +3136,7 @@ export class Orchestrator {
         });
         return;
       }
-      // A reviewed PR retained across a base merge reclaims the next available
+      // A reviewed candidate retained across a base merge reclaims the next available
       // slot only after the exact current base has a complete evaluation set.
       // Otherwise the retry cannot compute a comparable impact.
       if (this.schedulePendingBaseRefreshes(dispatchBaseCommit)) return;
@@ -3215,8 +3236,8 @@ export class Orchestrator {
     const state = this.store.get();
     const composite = state.composites.find((item) => item.id === compositeId);
     const run = state.agentRuns.find((item) => item.id === runId);
-    if (!composite || composite.status !== "open" || !run?.baseCommit) throw new Error("The living composite is no longer available for absorption.");
-    if (await this.git.resolveRef(composite.branch) !== run.baseCommit) throw new Error("The living composite advanced during evaluation. Retry this experiment from its latest state.");
+    if (!composite || composite.status !== "open" || !run?.baseCommit) throw new Error(BASE_REFRESH_ERRORS.parentUnavailable);
+    if (await this.git.resolveRef(composite.branch) !== run.baseCommit) throw new Error(BASE_REFRESH_ERRORS.experimentEvaluation);
     await this.git.push(worktree, settings.remote, branch);
     const absorbedAt = now();
     await this.store.update((draft) => {
@@ -3531,7 +3552,7 @@ export class Orchestrator {
     const reviewed = await this.reviewAgent(worktree, runId, idea.title, base.ref, authorThreadId, settings);
     const lastMessage = reviewed.message || initialMessage;
     await this.updateAgent(runId, { lastMessage, authorThreadId: reviewed.threadId, reviewApproved: true });
-    if (await this.git.resolveRef(base.ref) !== base.commit) throw new Error("The experiment base moved during the review loop. Retry this idea from the latest living line.");
+    if (await this.git.resolveRef(base.ref) !== base.commit) throw new Error(BASE_REFRESH_ERRORS.review);
     await this.updateAgent(runId, { status: "evaluating" });
     let afterRuns = await this.runCandidateEvaluations(
       "agent",
@@ -3568,7 +3589,7 @@ export class Orchestrator {
     }
     let pr: { url: string; number?: number } | undefined;
     if (settings.autoCreatePrs || this.yolo) {
-      if (await this.git.resolveRef(base.ref) !== base.commit) throw new Error("The base branch moved during evaluation. Retry this idea to recalculate against the new main.");
+      if (await this.git.resolveRef(base.ref) !== base.commit) throw new Error(BASE_REFRESH_ERRORS.evaluation);
       await this.updateAgent(runId, { status: "opening_pr" });
       if (!(await this.git.remoteExists(settings.remote))) throw new Error(`Git remote '${settings.remote}' does not exist.`);
       await this.git.push(worktree, settings.remote, branch);
