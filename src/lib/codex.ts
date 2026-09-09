@@ -372,6 +372,22 @@ export class CodexClient {
     return this.unstructuredSession(cwd, prompt, settings.agentModel, threadId);
   }
 
+  async refreshCompositeEvidence(cwd: string, baseBranch: string, title: string, threadId: string, implementationCommit: string, settings: BurnerSettings): Promise<SessionResult> {
+    const prompt = [
+      "Perform the post-commit evidence step for this composite. Burner has now committed the implementation, so final measurements can use a clean code commit before independent review.",
+      `Composite: ${title}`,
+      `Base branch: ${baseBranch}. Clean implementation commit: ${implementationCommit}.`,
+      "Inspect the complete candidate diff against the base. Only refresh measured artifacts introduced or changed by this candidate that claim to describe its final implementation and are now stale. If none need refreshing, make no changes and report that briefly. Preserve historical baseline measurements and unrelated artifacts unchanged.",
+      MEASURED_ARTIFACT_PROVENANCE,
+      "Use existing repository-supported build and measurement tooling from the committed implementation. Keep the established workload matrix, reference, denominator, unsupported outcomes, and slow results. Changes in this step must be limited to regenerated evidence and its accompanying documentation. Do not change implementation, dependencies, tests, benchmark harnesses, evaluation definitions, scoring, or supported behavior. If those changes are required, leave the evidence untouched and report the blocker for independent review instead of manufacturing a passing report.",
+      "All generated files and edits must stay inside this worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or paths outside this worktree. Do not commit, push, create branches, or open pull requests; Burner owns delivery.",
+      PROGRESS_OWNERSHIP,
+      "This step does not approve the branch or replace any independent review, tests, evaluations, or merge gates. Do not rerun unrelated full test suites just to repeat validation already completed by the author; run the checks needed to validate the regenerated evidence.",
+      "Finish within 30 minutes. Summarize artifacts regenerated, their measured commit and checks, or any remaining blocker.",
+    ].join("\n\n");
+    return this.unstructuredSession(cwd, prompt, settings.agentModel, threadId, 30 * 60 * 1000);
+  }
+
   async review(cwd: string, baseBranch: string, title: string, settings: BurnerSettings): Promise<ReviewResult> {
     const prompt = [
       "Act as an independent, rigorous reviewer. Review the complete branch diff against the base branch.",
@@ -470,6 +486,7 @@ export class CodexClient {
     prompt: string,
     model: string,
     resumeThreadId?: string,
+    timeoutMs = 2 * 60 * 60 * 1000,
   ): Promise<SessionResult> {
     const tempDir = await mkdtemp(join(tmpdir(), "burner-agent-"));
     const outputPath = join(tempDir, "output.md");
@@ -484,7 +501,7 @@ export class CodexClient {
       const result = await this.runCodex(args, {
         cwd,
         input: prompt,
-        timeoutMs: 2 * 60 * 60 * 1000,
+        timeoutMs,
         onStderr: (line) => this.onProgress?.(line),
       });
       if (result.exitCode !== 0) throw new Error(commandFailure(result, `codex exec exited with ${result.exitCode}`));

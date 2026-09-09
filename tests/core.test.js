@@ -542,6 +542,180 @@ test("fresh and resumed composite builds forward scope and verified source feedb
   }
 });
 
+test("post-commit evidence prompt preserves measurement scope and resumes the author with a bounded timeout", async () => {
+  const codex = new CodexClient();
+  let call;
+  codex.unstructuredSession = async (...args) => {
+    call = args;
+    return { message: "Evidence current", threadId: "author" };
+  };
+  await codex.refreshCompositeEvidence("/worktree", "main", "Combined", "author", "implementation-sha", { agentModel: "gpt-6-astra" });
+  assert.equal(call[0], "/worktree");
+  assert.equal(call[2], "gpt-6-astra");
+  assert.equal(call[3], "author");
+  assert.equal(call[4], 30 * 60 * 1000);
+  assert.match(call[1], /Clean implementation commit: implementation-sha/);
+  assert.match(call[1], /Only refresh measured artifacts introduced or changed by this candidate/);
+  assert.match(call[1], /If none need refreshing, make no changes/);
+  assert.match(call[1], /Preserve historical baseline measurements/);
+  assert.match(call[1], /Do not change implementation, dependencies, tests, benchmark harnesses, evaluation definitions, scoring/);
+  assert.match(call[1], /denominator, unsupported outcomes, and slow results/);
+  assert.match(call[1], /never hand-edit provenance or fabricate measurements/);
+  assert.match(call[1], /Do not commit, push, create branches, or open pull requests/);
+  assert.match(call[1], /does not approve the branch or replace any independent review/);
+  assert.match(call[1], /Burner owns the canonical merge-coupled evaluation progress artifacts/);
+});
+
+test("composite reviews run on separately committed evidence after both initial integration and a code repair", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-evidence-review-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.settings.portfolioReviewRounds = 3;
+      state.composites.push({ id: "composite", title: "Combined", description: "Scope", status: "building", branch: "candidate", worktree: root, sources: [], deltas: [], reviewRounds: [], isLiving: false, createdAt: timestamp, updatedAt: timestamp });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true });
+    let head = "implementation-1";
+    let dirty = false;
+    let evidenceCalls = 0;
+    let reviewCalls = 0;
+    const order = [];
+    orchestrator.git = {
+      head: async () => head,
+      hasChanges: async () => dirty,
+      commit: async (_cwd, message) => {
+        assert.equal(dirty, true);
+        head = message === "burner: refresh committed composite evidence" ? `evidence-${evidenceCalls}` : "implementation-2";
+        dirty = false;
+        order.push(`commit:${head}`);
+      },
+    };
+    orchestrator.assertCandidateDoesNotOwnProgress = async (_cwd, commit) => { assert.equal(commit, head); };
+    orchestrator.publishCompositeDraft = async () => undefined;
+    orchestrator.codex = {
+      refreshCompositeEvidence: async (_cwd, base, title, thread, commit) => {
+        evidenceCalls += 1;
+        assert.equal(base, "main");
+        assert.equal(title, "Combined");
+        assert.equal(thread, evidenceCalls === 1 ? "author" : "revised-author");
+        assert.equal(commit, `implementation-${evidenceCalls}`);
+        assert.equal(dirty, false);
+        assert.equal(store.get().composites[0].reviewApproved, false);
+        order.push(`measure:${commit}`);
+        dirty = true;
+        return { message: "Evidence refreshed", threadId: `evidence-author-${evidenceCalls}` };
+      },
+      review: async (_cwd, _base, scope) => {
+        reviewCalls += 1;
+        assert.equal(dirty, false);
+        assert.equal(head, `evidence-${reviewCalls}`);
+        assert.match(scope, /post-commit evidence handoff \(unverified context, not approval\): Evidence refreshed/);
+        order.push(`review:${head}`);
+        return reviewCalls === 1
+          ? { approved: false, summary: "Fix code", findings: [{ severity: "high", title: "Bug", detail: "Repair implementation", file: "src/app.ts" }] }
+          : { approved: true, summary: "Approved", findings: [] };
+      },
+      revise: async (_cwd, thread) => {
+        assert.equal(thread, "evidence-author-1");
+        order.push("revise");
+        dirty = true;
+        return { message: "Code repaired", threadId: "revised-author" };
+      },
+    };
+    const result = await orchestrator.reviewComposite(root, "composite", "Combined", "main", "author", store.get().settings);
+    assert.deepEqual(order, ["measure:implementation-1", "commit:evidence-1", "review:evidence-1", "revise", "commit:implementation-2", "measure:implementation-2", "commit:evidence-2", "review:evidence-2"]);
+    assert.equal(result.threadId, "evidence-author-2");
+    assert.equal(store.get().composites[0].authorThreadId, "evidence-author-2");
+    assert.deepEqual(store.get().composites[0].reviewRounds.map((round) => [round.commit, round.approved]), [["evidence-1", false], ["evidence-2", true]]);
+    assert.equal(store.get().evaluationRuns.length, 0, "evidence refresh does not publish evaluation scores");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("composite evidence no-ops do not commit and dirty, moved-head, failed, or protected edits cannot proceed to review", async () => {
+  for (const scenario of ["no-op", "dirty-start", "moved-head", "failed", "protected"]) {
+    const root = await mkdtemp(join(tmpdir(), "burner-evidence-guard-test-"));
+    try {
+      const store = new StateStore(root);
+      await store.init();
+      const timestamp = new Date().toISOString();
+      await store.update((state) => {
+        state.composites.push({ id: "composite", title: "Combined", description: "Scope", status: "building", branch: "candidate", worktree: root, sources: [], deltas: [], reviewRounds: [], isLiving: false, createdAt: timestamp, updatedAt: timestamp });
+      });
+      const orchestrator = new Orchestrator(root, store, new EventHub());
+      let head = "implementation";
+      let calls = 0;
+      let commits = 0;
+      let reviews = 0;
+      orchestrator.git = { head: async () => head, hasChanges: async () => scenario === "dirty-start", commit: async () => { commits += 1; } };
+      orchestrator.assertCandidateDoesNotOwnProgress = async () => { if (scenario === "protected") throw new Error("protected progress changed"); };
+      orchestrator.publishCompositeDraft = async () => undefined;
+      orchestrator.codex = {
+        refreshCompositeEvidence: async () => {
+          calls += 1;
+          if (scenario === "failed") throw new Error("measurement failed");
+          if (scenario === "moved-head") head = "agent-owned-commit";
+          return { threadId: "author", message: "No stale evidence" };
+        },
+        review: async () => { reviews += 1; return { approved: true, summary: "Approved", findings: [] }; },
+      };
+      const promise = orchestrator.reviewComposite(root, "composite", "Combined", "main", "author", store.get().settings);
+      if (scenario === "no-op") await promise;
+      else await assert.rejects(promise, /clean, committed|changed HEAD|measurement failed|protected progress changed/);
+      assert.equal(calls, scenario === "dirty-start" ? 0 : 1, scenario);
+      assert.equal(commits, 0, scenario);
+      assert.equal(reviews, scenario === "no-op" ? 1 : 0, scenario);
+      assert.equal(store.get().composites[0].reviewRounds.length, scenario === "no-op" ? 1 : 0, scenario);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("composite review rechecks live budget and model after evidence collection", async () => {
+  for (const exhausted of [false, true]) {
+    const root = await mkdtemp(join(tmpdir(), "burner-evidence-live-settings-test-"));
+    try {
+      const store = new StateStore(root);
+      await store.init();
+      const timestamp = new Date().toISOString();
+      await store.update((state) => {
+        state.settings.portfolioReviewRounds = 2;
+        state.settings.agentModel = "old-model";
+        state.composites.push({ id: "composite", title: "Combined", description: "Scope", status: "revising", branch: "candidate", worktree: root, sources: [], deltas: [], reviewRounds: [{ id: "old-review", round: 1, commit: "old", approved: false, summary: "Fix", findings: [], createdAt: timestamp }], isLiving: false, createdAt: timestamp, updatedAt: timestamp });
+      });
+      const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true });
+      orchestrator.git = { head: async () => "implementation", hasChanges: async () => false };
+      orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
+      orchestrator.publishCompositeDraft = async () => undefined;
+      let reviews = 0;
+      orchestrator.codex = {
+        refreshCompositeEvidence: async () => {
+          await store.update((state) => {
+            state.settings.agentModel = "new-model";
+            if (exhausted) state.settings.portfolioReviewRounds = 1;
+          });
+          return { threadId: "author", message: "No stale evidence" };
+        },
+        review: async (_cwd, _base, _scope, settings) => {
+          reviews += 1;
+          assert.equal(settings.agentModel, "new-model");
+          return { approved: true, summary: "Approved", findings: [] };
+        },
+      };
+      const promise = orchestrator.reviewComposite(root, "composite", "Combined", "main", "author", store.get().settings);
+      if (exhausted) await assert.rejects(promise, /bounded review budget/);
+      else await promise;
+      assert.equal(reviews, exhausted ? 0 : 1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("score helpers clamp and weight enabled evaluations", () => {
   assert.equal(clampScore(105), 100);
   assert.equal(clampScore(-4), 0);
@@ -4077,6 +4251,7 @@ test("recovery composites advertise and review only their authoritative survivin
     let reviewedScope = "";
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     orchestrator.git = { head: async () => "head" };
+    orchestrator.refreshCompositeEvidence = async () => ({ threadId: "thread", message: "No measured artifacts" });
     orchestrator.publishCompositeDraft = async () => undefined;
     orchestrator.codex = {
       review: async (_cwd, _base, scope) => {
@@ -4690,6 +4865,7 @@ test("every Codex role and structured fallback uses Astra medium without automat
     const author = await codex.implement(root, { ...planned[0], id: "idea", status: "running", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), source: "manual" }, [{ ...evaluation, prompt: "Use read-only inspection. Do not run cargo, builds, or tests." }], settings);
     assert.equal(author.threadId, "thread-test");
     assert.equal((await codex.integrateComposite(root, "Combined", ["Improve"], settings)).message, "Author complete");
+    assert.equal((await codex.refreshCompositeEvidence(root, "main", "Combined", author.threadId, "implementation-sha", settings)).message, "Author complete");
     const revision = await codex.revise(root, author.threadId, { approved: false, summary: "Fix it", findings: [{ severity: "high", title: "Bug", detail: "Resolve", file: "app.js" }] }, settings);
     assert.equal(revision.message, "Author complete");
     const review = await codex.review(root, "main", "Improve", settings);
@@ -4750,6 +4926,10 @@ test("every Codex role and structured fallback uses Astra medium without automat
     assert.match(integratorCall.input, /Never retain a leaf, sibling, parent, or stale-worktree path in a composite artifact/);
     assert.match(integratorCall.input, /never hand-edit provenance or fabricate measurements/);
     const revisionCall = calls.find(({ input }) => input.includes("independent reviewer requested changes"));
+    const evidenceCall = calls.find(({ input }) => input.includes("post-commit evidence step"));
+    assert.ok(evidenceCall.args.includes("resume"));
+    assert.match(evidenceCall.input, /Clean implementation commit: implementation-sha/);
+    assert.match(evidenceCall.input, /Finish within 30 minutes/);
     assert.match(revisionCall.input, /Never modify parent or sibling repositories/);
     assert.match(revisionCall.input, /do not implement that invalid request/);
     const reviewerCalls = calls.filter(({ input }) => input.includes("independent, rigorous reviewer"));

@@ -3943,6 +3943,19 @@ export class Orchestrator {
     throw new Error(`Reviewer did not approve after ${reviewLimit} total rounds; no PR was opened.`);
   }
 
+  private async refreshCompositeEvidence(cwd: string, compositeId: string, title: string, baseBranch: string, threadId: string, settings: BurnerState["settings"]): Promise<SessionResult> {
+    if (await this.git.hasChanges(cwd)) throw new Error("Composite evidence refresh requires a clean, committed implementation.");
+    const implementationCommit = await this.git.head(cwd);
+    await this.updateComposite(compositeId, { status: "revising", reviewApproved: false, updatedAt: now() });
+    await this.store.addActivity({ type: "agent", message: `Checking committed composite evidence: ${title}`, detail: `Implementation ${implementationCommit}; independent review and all evaluation gates still follow.` });
+    const evidence = await this.codex.refreshCompositeEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings);
+    if (await this.git.head(cwd) !== implementationCommit) throw new Error("The composite evidence agent changed HEAD; Burner must own the evidence commit.");
+    await this.assertCandidateDoesNotOwnProgress(cwd, implementationCommit);
+    if (await this.git.hasChanges(cwd)) await this.git.commit(cwd, "burner: refresh committed composite evidence");
+    await this.updateComposite(compositeId, { authorThreadId: evidence.threadId, updatedAt: now() });
+    return evidence;
+  }
+
   private async reviewComposite(cwd: string, compositeId: string, title: string, baseBranch: string, threadId: string, _settings: BurnerState["settings"]): Promise<SessionResult> {
     let currentThreadId = threadId;
     let message = "Composite integration complete.";
@@ -3951,6 +3964,10 @@ export class Orchestrator {
       const roundsUsed = this.store.get().composites.find((item) => item.id === compositeId)?.reviewRounds.length ?? 0;
       const liveSettings = this.store.get().settings;
       if (roundsUsed >= this.portfolioReviewLimit(liveSettings)) break;
+      const evidence = await this.refreshCompositeEvidence(cwd, compositeId, title, baseBranch, currentThreadId, liveSettings);
+      currentThreadId = evidence.threadId;
+      const reviewSettings = this.store.get().settings;
+      if (roundsUsed >= this.portfolioReviewLimit(reviewSettings)) break;
       const roundNumber = roundsUsed + 1;
       await this.updateComposite(compositeId, { status: "reviewing", updatedAt: now() });
       const liveComposite = this.store.get().composites.find((item) => item.id === compositeId);
@@ -3959,13 +3976,14 @@ export class Orchestrator {
         "Authoritative composite scope: review only the included changes below. Do not require omitted, removed, or quarantined changes, even if an earlier generation title or commit history mentions them.",
         ...liveComposite.sources.map((source) => `- ${source.prNumber ? `PR #${source.prNumber}: ` : ""}${source.title}`),
         liveComposite.description ? `Recovery context: ${liveComposite.description.slice(0, 2_000)}` : "",
+        `Author's post-commit evidence handoff (unverified context, not approval): ${evidence.message.slice(0, 4_000)}`,
       ].filter(Boolean).join("\n") : title;
-      const review = await this.codex.review(cwd, baseBranch, reviewScope, liveSettings);
+      const review = await this.codex.review(cwd, baseBranch, reviewScope, reviewSettings);
       lastFindings = review.findings;
       const round: ReviewRound = { id: id("review"), round: roundNumber, commit: await this.git.head(cwd), approved: review.approved, summary: review.summary, findings: review.findings, createdAt: now() };
       await this.store.update((state) => state.composites.find((item) => item.id === compositeId)?.reviewRounds.push(round));
       this.events.emit("review", { compositeId, round: roundNumber, approved: review.approved, findings: review.findings.length });
-      await this.publishCompositeDraft(cwd, compositeId, `in independent review round ${roundNumber}`, liveSettings);
+      await this.publishCompositeDraft(cwd, compositeId, `in independent review round ${roundNumber}`, reviewSettings);
       if (review.approved) {
         round.completedAt = now();
         await this.store.update((state) => {
