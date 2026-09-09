@@ -115,6 +115,8 @@ YOLO reviews are bounded independently from manual work. The default portfolio c
 
 Manual `POST /api/ideas` requests can use the same reserved lane with `lane: "foundational"`, a nonempty `milestone` (at most 1,000 characters), and optional numeric `milestoneCredit` from 0 to 100. The default remains incremental with no milestone credit. Invalid lane or milestone fields are rejected before queueing. At most one foundational slot is reserved, whether ideas came from the planner or the API; credit never alters evaluation scores or merge gates.
 
+Leaf reviewers receive the original task requirements as well as the unverified evidence handoff. Current-candidate measurements require current, clean provenance; explicitly historical workload records retain their original source/build identities. Missing historical setup costs may be supplied by a clearly labeled, verified same-code rerun without rewriting original compute measurements. Historical records never substitute for fresh evidence required by the current task or earn current-candidate performance credit.
+
 Each leaf selected for a portfolio generation:
 
 - was approved by the final independent review round;

@@ -598,6 +598,30 @@ test("foundational planning excludes unmeasured or disabled gaps and preserves d
   assert.doesNotMatch(prompt, /"id": "disabled"/);
 });
 
+test("artifact prompts preserve historical setup reruns without granting current-candidate credit", async () => {
+  const codex = new CodexClient();
+  const prompts = [];
+  codex.unstructuredSession = async (_cwd, prompt) => { prompts.push(prompt); return { message: "Done", threadId: "author" }; };
+  codex.reviewStructured = async (_cwd, _base, prompt) => { prompts.push(prompt); return { approved: true, summary: "Reviewed", findings: [] }; };
+  const settings = { agentModel: "gpt-6-astra" };
+  await codex.integrateComposite("/worktree", "Combined", ["Setup disclosure"], settings);
+  await codex.refreshCompositeEvidence("/worktree", "main", "Combined", "author", "current-implementation", settings);
+  await codex.refreshAgentEvidence("/worktree", "main", "Historical setup", "author", "current-implementation", settings);
+  await codex.review("/worktree", "main", "Historical setup", settings);
+  assert.equal(prompts.length, 4);
+  for (const prompt of prompts) {
+    assert.match(prompt, /For current-candidate evidence, apply these rules/);
+    assert.match(prompt, /intervening diff contains reports\/evidence and no implementation or benchmark-harness changes/);
+    assert.match(prompt, /Historical records instead remain pinned to their original source\/build identities/);
+    assert.match(prompt, /newly measured same-code setup rerun at that historical revision/);
+    assert.match(prompt, /actual commands, timestamps, cache state, source\/build hashes/);
+    assert.match(prompt, /do not require rerunning unchanged historical workloads solely to supply setup metadata/);
+    assert.match(prompt, /Never attribute later setup measurements to the original capture/);
+    assert.match(prompt, /relabel stale current-candidate evidence as historical to evade a required fresh measurement/);
+    assert.match(prompt, /never hand-edit provenance or fabricate measurements/);
+  }
+});
+
 test("post-commit evidence prompt preserves measurement scope and resumes the author with a bounded timeout", async () => {
   const codex = new CodexClient();
   let call;
@@ -647,6 +671,11 @@ async function createAgentEvidenceFixture() {
 test("leaf reviews measure clean code and review separately committed evidence after initial work and repairs", async () => {
   const { root, store, orchestrator } = await createAgentEvidenceFixture();
   try {
+    const taskScope = "Add a same-code setup rerun for the historical release. Preserve all original compute measurements; do not rerun them to supply setup metadata.";
+    await store.update((state) => state.ideas.push({
+      id: "idea", title: "Historical setup", description: taskScope, rationale: "Disclose missing setup costs", predictedImpact: 0,
+      evaluationIds: [], resources: [], status: "running", source: "manual", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }));
     let head = "implementation-1";
     let dirty = false;
     let evidenceCalls = 0;
@@ -679,6 +708,8 @@ test("leaf reviews measure clean code and review separately committed evidence a
         reviews += 1;
         assert.equal(dirty, false);
         assert.equal(head, "evidence-" + reviews);
+        assert.match(scope, /Original task scope \(requirements, not proof that the implementation satisfies them\)/);
+        assert.ok(scope.includes(taskScope), "both initial and repair reviews receive the complete task requirements");
         assert.match(scope, /post-commit evidence handoff \(unverified context, not approval\): Evidence refreshed/);
         order.push("review:" + head);
         return reviews === 1

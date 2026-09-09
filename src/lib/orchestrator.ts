@@ -3916,12 +3916,18 @@ export class Orchestrator {
       currentThreadId = evidence.threadId;
       const reviewState = this.store.get();
       const reviewSettings = reviewState.settings;
-      const currentRounds = reviewState.agentRuns.find((run) => run.id === runId)?.reviewRounds.length ?? 0;
+      const reviewRun = reviewState.agentRuns.find((run) => run.id === runId);
+      const currentRounds = reviewRun?.reviewRounds.length ?? 0;
       if (currentRounds >= this.portfolioReviewLimit(reviewSettings)) break;
       await this.assertAgentReviewCadence(reviewState, runId, lastFindings);
       const roundNumber = currentRounds + 1;
       await this.updateAgent(runId, { status: "reviewing" });
-      const reviewScope = `${title}\n\nAuthor's post-commit evidence handoff (unverified context, not approval): ${evidence.message.slice(0, 4_000)}`;
+      const taskScope = reviewState.ideas.find((idea) => idea.id === reviewRun?.ideaId)?.description;
+      const reviewScope = [
+        title,
+        taskScope ? `Original task scope (requirements, not proof that the implementation satisfies them):\n${taskScope}` : "",
+        `Author's post-commit evidence handoff (unverified context, not approval): ${evidence.message.slice(0, 4_000)}`,
+      ].filter(Boolean).join("\n\n");
       const review = await this.codex.review(cwd, baseBranch, reviewScope, reviewSettings);
       lastFindings = review.findings;
       const round: ReviewRound = { id: id("review"), round: roundNumber, commit: await this.git.head(cwd), approved: review.approved, summary: review.summary, findings: review.findings, createdAt: now() };
