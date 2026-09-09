@@ -2447,6 +2447,9 @@ export class Orchestrator {
       : undefined;
     const parentComposite = recordedParentComposite?.status === "open" ? recordedParentComposite : undefined;
     const mergedParentComposite = recordedParentComposite?.status === "merged" ? recordedParentComposite : undefined;
+    const refreshResources = mergedParentComposite
+      ? run.resources.filter((resource) => resource !== `living-${mergedParentComposite.id}`)
+      : run.resources;
     if (run.parentCompositeId && !parentComposite && !mergedParentComposite) {
       throw new Error("The candidate's parent composite is no longer open; it cannot be refreshed without changing its intended base.");
     }
@@ -2466,7 +2469,7 @@ export class Orchestrator {
     let lease: { locks: HeldLock[]; release: () => Promise<void> } | undefined;
     let worktree = run.worktree;
     try {
-      lease = await this.locks.tryAcquireAll(run.resources, `${run.id}-base-refresh`);
+      lease = await this.locks.tryAcquireAll(refreshResources, `${run.id}-base-refresh`);
       if (!lease) throw new Error("A required resource is currently locked.");
       const latestBaseRef = parentComposite
         ? await this.git.fetchBranch(state.settings.remote, parentComposite.branch)
@@ -2526,9 +2529,7 @@ export class Orchestrator {
           baseRef: latestBaseRef,
           baseCommit: latestBaseCommit,
           parentCompositeId: parentComposite?.id,
-          resources: mergedParentComposite
-            ? currentRun.resources.filter((resource) => resource !== `living-${mergedParentComposite.id}`)
-            : currentRun.resources,
+          resources: refreshResources,
           authorThreadId,
           lastMessage,
           completedAt: refreshedAt,
@@ -2563,6 +2564,9 @@ export class Orchestrator {
       handedOff = true;
       return retried;
     } catch (error) {
+      // Lock contention has not changed the candidate. Preserve any pending
+      // base-refresh marker so a later scheduling tick can reclaim its slot.
+      if (!lease) throw error;
       const message = errorMessage(error);
       await this.updateAgent(run.id, { status: "failed", error: message, completedAt: now() });
       await this.store.update((draft) => {

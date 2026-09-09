@@ -1922,6 +1922,12 @@ test("latest-base refresh promotes an unpublished candidate after its parent com
     orchestrator.restoreBurnerProgressFromCommit = async () => false;
     const merged = [];
     const pushed = [];
+    const requestedResources = [];
+    const acquireResources = orchestrator.locks.tryAcquireAll.bind(orchestrator.locks);
+    orchestrator.locks.tryAcquireAll = async (resources, owner) => {
+      requestedResources.push([...resources]);
+      return acquireResources(resources, owner);
+    };
     orchestrator.git = {
       resolveRef: async (ref) => ref === "main" ? "new-main" : ref,
       head: async () => "candidate-head",
@@ -1945,6 +1951,7 @@ test("latest-base refresh promotes an unpublished candidate after its parent com
     assert.equal(run.baseCommit, "new-main");
     assert.equal(run.parentCompositeId, undefined);
     assert.deepEqual(run.resources, []);
+    assert.deepEqual(requestedResources, [[]], "do not reacquire an obsolete merged-parent lock");
     assert.equal(idea.baseCompositeId, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -4864,6 +4871,48 @@ test("unpublished base refresh eligibility excludes unrelated, superseded, and u
       "main", "open-parent", "merged-parent", "main-advanced-during-evaluation",
       "parent-advanced-during-evaluation", "parent-merged-before-absorption", "published",
     ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("busy resources preserve published and unpublished pending base-refresh checkpoints", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-busy-base-refresh-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      for (const published of [false, true]) {
+        const id = published ? "published" : "unpublished";
+        state.ideas.push({
+          id: `idea-${id}`, title: id, description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [],
+          status: "failed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: id,
+        });
+        state.agentRuns.push({
+          id, ideaId: `idea-${id}`, status: "failed", branch: `burner/${id}`, worktree: root,
+          startedAt: timestamp, completedAt: timestamp, deltas: [], resources: ["cpu-heavy"],
+          authorThreadId: `thread-${id}`, baseRef: "main", baseCommit: "old-base",
+          error: published
+            ? "Base advanced to new-base; same-PR refresh pending."
+            : "The experiment base moved during the review loop. Retry this idea from the latest living line.",
+          ...(published ? { prNumber: 42, prState: "open" } : {}),
+          reviewApproved: true,
+          reviewRounds: [{ id: `review-${id}`, round: 1, commit: "head", approved: true, summary: "Approved", findings: [], createdAt: timestamp }],
+        });
+      }
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.locks.tryAcquireAll = async () => undefined;
+    orchestrator.git = { resolveRef: async () => assert.fail("busy refresh must stop before touching Git") };
+    const before = structuredClone(store.get().agentRuns);
+    for (const run of before) {
+      await assert.rejects(orchestrator.refreshAgentBaseAndRetry(run.id), /required resource is currently locked/);
+      assert.equal(orchestrator.retryingAgentIds.has(run.id), false);
+    }
+    assert.deepEqual(store.get().agentRuns, before, "contention must not erase the pending error or alter provenance");
+    assert.equal(orchestrator.activeAgents.size, 0, "release temporary scheduling reservations");
+    assert.deepEqual(orchestrator.pendingBaseRefreshes(store.get()).map((run) => run.id), ["unpublished", "published"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
