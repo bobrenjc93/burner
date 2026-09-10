@@ -3135,7 +3135,21 @@ export class Orchestrator {
       if (await this.terminateIfStalled()) return;
       if (this.portfolioMode()) await this.recordCadenceBreach();
       if (this.yolo && this.runningEvaluations === 0 && this.activeComposites.size === 0) {
-        if (this.activeAgents.size === 0 && await this.autoMergeNext()) return;
+        if (this.activeAgents.size === 0) {
+          // Finish an already queued integration before spending the idle window
+          // validating an unrelated leaf or cooking another batch. Keep forced
+          // cycles and incomplete baselines on their existing scheduling path.
+          if (!force && initial.composites.some((composite) => composite.status === "queued" || composite.status === "rebuilding")) {
+            const baseCommit = await this.git.resolveRef(initial.settings.baseBranch);
+            const current = this.store.get();
+            if (!current.orchestrator.enabled || this.runningEvaluations > 0 || this.activeAgents.size > 0 || this.activeComposites.size > 0) return;
+            if (!this.missingBaselineEvaluations(baseCommit, current).length) {
+              await this.scheduleComposites();
+              return;
+            }
+          }
+          if (await this.autoMergeNext()) return;
+        }
         // Once a full leaf batch is ready, use a free parallelism slot to
         // integrate it while an unrelated author drains. Waiting for every
         // author to finish can consume the entire composite-validation tail
