@@ -144,3 +144,34 @@ test("queued composite priority rechecks baseline definitions after resolving th
   await orchestrator.tick();
   assert.deepEqual(calls, ["merge"]);
 });
+
+test("reserved composite sources do not also dispatch same-PR base refreshes", async (t) => {
+  const reservedStatuses = ["queued", "building", "reviewing", "revising", "evaluating", "rebuilding", "open"];
+  for (const status of [...reservedStatuses, "failed", "closed", "merged"]) {
+    const { store, orchestrator } = await fixture(t, { status });
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      for (const id of ["reserved", "unrelated"]) {
+        state.ideas.push({
+          id: `idea-${id}`, title: id, description: "Refresh retained work", rationale: "No orphan PRs",
+          predictedImpact: 1, evaluationIds: [], resources: [], status: "failed", source: "manual",
+          createdAt: timestamp, updatedAt: timestamp, agentRunId: id,
+        });
+        state.agentRuns.push({
+          id, ideaId: `idea-${id}`, status: "failed", branch: `burner/${id}`, worktree: "",
+          startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: `author-${id}`,
+          baseRef: "main", baseCommit: "old-base", prNumber: id === "reserved" ? 10 : 11, prState: "open",
+          error: "Base advanced to base; same-PR refresh pending.", reviewApproved: true,
+          reviewRounds: [{ round: 1, commit: "head", approved: true, summary: "Approved", findings: [], createdAt: timestamp }],
+        });
+      }
+      state.composites[0].sources = [{ agentRunId: "reserved", prNumber: 10, title: "Reserved source", branch: "burner/reserved", kind: "pull_request" }];
+    });
+    const refreshed = [];
+    orchestrator.refreshAgentBaseAndRetry = async (id) => { refreshed.push(id); };
+    const expected = reservedStatuses.includes(status) ? ["unrelated"] : ["reserved", "unrelated"];
+    assert.deepEqual(orchestrator.pendingBaseRefreshes(store.get()).map((run) => run.id), expected, status);
+    assert.equal(orchestrator.schedulePendingBaseRefreshes("base"), expected.length, status);
+    assert.deepEqual(refreshed, expected, "unreserved work stays eligible, and terminal composites release their sources");
+  }
+});

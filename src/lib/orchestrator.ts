@@ -2610,6 +2610,7 @@ export class Orchestrator {
   }
 
   private pendingBaseRefreshes(state: BurnerState): AgentRun[] {
+    const reserved = reservedCompositeSourceIds(state);
     return state.agentRuns.filter((run) => {
       const idea = state.ideas.find((item) => item.id === run.ideaId);
       const publishedRefresh = run.prNumber !== undefined &&
@@ -2630,6 +2631,7 @@ export class Orchestrator {
         Boolean(run.authorThreadId && run.baseRef && run.baseCommit) &&
         (!run.parentCompositeId || parent?.status === "open" || parent?.status === "merged");
       return run.status === "failed" &&
+        !reserved.has(run.id) &&
         (publishedRefresh || unpublishedRefresh) &&
         finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
         idea?.status === "failed" &&
@@ -3115,7 +3117,8 @@ export class Orchestrator {
     this.events.emit("state", this.store.get());
     if (staleBaseRefreshRunIds.length && this.store.get().orchestrator.enabled) {
       const available = Math.max(0, this.store.get().settings.parallelism - this.activeAgents.size - this.activeComposites.size);
-      for (const runId of staleBaseRefreshRunIds.slice(0, available)) {
+      const stillPending = new Set(this.pendingBaseRefreshes(this.store.get()).map((run) => run.id));
+      for (const runId of staleBaseRefreshRunIds.filter((runId) => stillPending.has(runId)).slice(0, available)) {
         void this.refreshAgentBaseAndRetry(runId).catch(async (error) => {
           await this.store.addActivity({ type: "error", message: `Same-PR base refresh failed: ${runId}`, detail: errorMessage(error) });
           this.events.emit("error", { message: errorMessage(error) });

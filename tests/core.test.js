@@ -5749,6 +5749,29 @@ test("direct merges refresh stale reviewed siblings on the same PR without retir
     assert.deepEqual(closed, []);
     assert.deepEqual(refreshed, ["sibling"]);
     assert.match(state.activity[0].detail, /existing branch/);
+
+    // A composite can reserve the retained source while asynchronous PR
+    // reconciliation is finishing. Recheck eligibility before dispatch.
+    refreshed.length = 0;
+    await store.update((draft) => {
+      draft.orchestrator.baseSyncPending = true;
+      draft.agentRuns.find((item) => item.id === "sibling").status = "completed";
+      draft.ideas.find((item) => item.id === "idea-sibling").status = "completed";
+    });
+    orchestrator.ensureLivingComposite = async () => {
+      await store.update((draft) => {
+        draft.composites.push({
+          id: "late-reservation", title: "Retained integration", description: "", status: "queued",
+          branch: "burner/late-reservation", worktree: "", createdAt: timestamp, updatedAt: timestamp,
+          sources: [{ agentRunId: "sibling", prNumber: 11, title: "Reviewed sibling", branch: "branch-sibling", kind: "pull_request" }],
+          deltas: [], reviewRounds: [],
+        });
+      });
+    };
+    await orchestrator.syncPullRequests(true);
+    assert.deepEqual(refreshed, [], "a newly reserved source must not start a concurrent same-PR refresh");
+    assert.deepEqual(closed, []);
+    assert.match(store.get().agentRuns.find((item) => item.id === "sibling").error, /same-PR refresh pending/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
