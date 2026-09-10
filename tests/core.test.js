@@ -5777,6 +5777,85 @@ test("direct merges refresh stale reviewed siblings on the same PR without retir
   }
 });
 
+test("reviewed PRs pending refresh survive repeated base advances without retaining unrelated failures", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-repeated-base-refresh-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const pendingError = "Base advanced to earlier-base; same-PR refresh pending.";
+    const fixtures = [
+      { id: "retained", number: 41, status: "completed" },
+      { id: "unrelated-failure", number: 42, status: "failed", error: "Author process crashed" },
+      { id: "quarantined", number: 43, status: "failed", error: pendingError, quarantinedAt: timestamp },
+      { id: "unapproved", number: 44, status: "failed", error: pendingError, approved: false },
+      { id: "replaced", number: 45, status: "failed", error: pendingError, owner: "replacement-run" },
+    ];
+    const remote = fixtures.map(({ id, number }) => ({ number, state: "OPEN", headRefName: `branch-${id}`, url: "" }));
+    await store.update((state) => {
+      state.orchestrator.enabled = false;
+      for (const fixture of fixtures) {
+        const approved = fixture.approved !== false;
+        state.ideas.push({
+          id: `idea-${fixture.id}`, title: fixture.id, description: "", rationale: "Keep reviewed work",
+          predictedImpact: 1, evaluationIds: [], resources: [], status: fixture.status,
+          createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: fixture.owner ?? fixture.id,
+        });
+        state.agentRuns.push({
+          id: fixture.id, ideaId: `idea-${fixture.id}`, status: fixture.status,
+          branch: `branch-${fixture.id}`, worktree: "", startedAt: timestamp, completedAt: timestamp,
+          authorThreadId: `thread-${fixture.id}`, baseRef: "main", baseCommit: "original-base",
+          prNumber: fixture.number, prState: "open", deltas: [], resources: [],
+          reviewApproved: approved,
+          reviewRounds: [{ id: `review-${fixture.id}`, round: 1, commit: `head-${fixture.id}`, approved, summary: "Reviewed", findings: [], createdAt: timestamp }],
+          error: fixture.error, quarantinedAt: fixture.quarantinedAt,
+          fullMergeValidation: { candidateCommit: `head-${fixture.id}` },
+        });
+      }
+    });
+    const closed = [];
+    const refreshed = [];
+    let baseCommit;
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    orchestrator.git = {
+      remoteExists: async () => true,
+      listPullRequests: async () => remote.map((pr) => ({ ...pr })),
+      markPrDisposition: async () => undefined,
+      syncBase: async () => baseCommit,
+      closePr: async (_cwd, number) => {
+        closed.push(number);
+        remote.find((pr) => pr.number === number).state = "CLOSED";
+      },
+    };
+    orchestrator.ensureLivingComposite = async () => undefined;
+    orchestrator.refreshAgentBaseAndRetry = async (runId) => { refreshed.push(runId); };
+
+    for (const generation of [1, 2, 3]) {
+      baseCommit = `base-${generation}-revision`;
+      await store.update((state) => { state.orchestrator.baseSyncPending = true; });
+      await orchestrator.syncPullRequests(true);
+
+      const state = store.get();
+      const retained = state.agentRuns.find((run) => run.id === "retained");
+      assert.equal(retained.prState, "open", `reviewed work must survive base advance ${generation}`);
+      assert.equal(retained.status, "failed");
+      assert.equal(retained.error, `Base advanced to ${baseCommit.slice(0, 8)}; same-PR refresh pending.`);
+      assert.equal(retained.fullMergeValidation, undefined, "old final-validation caches must remain invalidated");
+      assert.equal(retained.baseCommit, "original-base", "cleanup must not pretend that a refresh ran");
+      assert.equal(retained.authorThreadId, "thread-retained");
+      assert.equal(retained.reviewApproved, true);
+      assert.equal(retained.reviewRounds[0].commit, "head-retained");
+      assert.equal(state.ideas.find((idea) => idea.id === "idea-retained").status, "failed");
+      assert.deepEqual(orchestrator.pendingBaseRefreshes(state).map((run) => run.id), ["retained"]);
+      assert.deepEqual(closed, [42, 43, 44, 45], "unrelated, quarantined, unapproved, and replaced work must not become refresh candidates");
+      assert.deepEqual(refreshed, [], "paused cleanup must not launch a worker");
+      assert.match(state.activity[0].message, /1 stale reviewed leaf PR retained/);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a pending same-PR base refresh claims the next available agent slot", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-pending-base-refresh-test-"));
   try {

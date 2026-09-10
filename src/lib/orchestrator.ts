@@ -3038,11 +3038,16 @@ export class Orchestrator {
         !reserved.has(run.id));
       const reviewedStaleRunsByIdea = new Map(staleLeaves.flatMap((run) => {
         const idea = current.ideas.find((item) => item.id === run.ideaId);
-        return run.status === "completed" &&
+        const completedCheckpoint = run.status === "completed" && idea?.status === "completed";
+        // Queued refreshes use failed run/idea states. Another base advance
+        // must preserve that approved checkpoint until its refresh can run.
+        const pendingCheckpoint = run.status === "failed" &&
+          run.error?.includes("same-PR refresh pending") === true &&
+          idea?.status === "failed";
+        return (completedCheckpoint || pendingCheckpoint) &&
           !run.quarantinedAt &&
           finalReviewApproved(run.reviewApproved, run.reviewRounds) &&
-          idea?.status === "completed" &&
-          idea.agentRunId === run.id
+          idea?.agentRunId === run.id
           ? [[run.ideaId, run.id] as const]
           : [];
       }));
