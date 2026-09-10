@@ -3940,7 +3940,10 @@ export class Orchestrator {
     const implementationCommit = await this.git.head(cwd);
     await this.updateAgent(runId, { status: "revising", reviewApproved: false });
     await this.store.addActivity({ type: "agent", message: `Checking committed candidate evidence: ${title}`, detail: `Implementation ${implementationCommit}; independent review and all evaluation gates still follow.` });
-    const evidence = await this.codex.refreshAgentEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings);
+    const state = this.store.get();
+    const run = state.agentRuns.find((item) => item.id === runId);
+    const taskScope = state.ideas.find((idea) => idea.id === run?.ideaId)?.description;
+    const evidence = await this.codex.refreshAgentEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings, taskScope);
     if (await this.git.head(cwd) !== implementationCommit) throw new Error("The candidate evidence agent changed HEAD; Burner must own the evidence commit.");
     await this.assertCandidateDoesNotOwnProgress(cwd, implementationCommit);
     if (await this.git.hasChanges(cwd)) await this.git.commit(cwd, "burner: refresh committed candidate evidence");
@@ -4017,7 +4020,18 @@ export class Orchestrator {
     const implementationCommit = await this.git.head(cwd);
     await this.updateComposite(compositeId, { status: "revising", reviewApproved: false, updatedAt: now() });
     await this.store.addActivity({ type: "agent", message: `Checking committed composite evidence: ${title}`, detail: `Implementation ${implementationCommit}; independent review and all evaluation gates still follow.` });
-    const evidence = await this.codex.refreshCompositeEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings);
+    const state = this.store.get();
+    const composite = state.composites.find((item) => item.id === compositeId);
+    const taskScope = composite ? [
+      "Authoritative composite scope: only the currently included sources below apply. Do not require omitted, removed, or quarantined changes, even if earlier author context mentions them.",
+      ...composite.sources.map((source) => {
+        const run = state.agentRuns.find((item) => item.id === source.agentRunId);
+        const description = state.ideas.find((idea) => idea.id === run?.ideaId)?.description;
+        return [`${source.prNumber ? `PR #${source.prNumber}: ` : ""}${source.title}`, description].filter(Boolean).join("\n");
+      }),
+      composite.description ? `Integration requirements: ${composite.description}` : "",
+    ].filter(Boolean).join("\n\n") : undefined;
+    const evidence = await this.codex.refreshCompositeEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings, taskScope);
     if (await this.git.head(cwd) !== implementationCommit) throw new Error("The composite evidence agent changed HEAD; Burner must own the evidence commit.");
     await this.assertCandidateDoesNotOwnProgress(cwd, implementationCommit);
     if (await this.git.hasChanges(cwd)) await this.git.commit(cwd, "burner: refresh committed composite evidence");

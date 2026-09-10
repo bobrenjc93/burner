@@ -737,8 +737,8 @@ test("post-commit evidence prompt preserves measurement scope and resumes the au
   assert.equal(call[3], "author");
   assert.equal(call[4], 30 * 60 * 1000);
   assert.match(call[1], /Clean implementation commit: implementation-sha/);
-  assert.match(call[1], /Only refresh measured artifacts introduced or changed by this candidate/);
-  assert.match(call[1], /If none need refreshing, make no changes/);
+  assert.match(call[1], /Refresh measured artifacts introduced or changed by this candidate/);
+  assert.match(call[1], /If neither stale current-candidate artifacts nor outstanding task-required captures exist, make no changes/);
   assert.match(call[1], /Preserve historical baseline measurements/);
   assert.match(call[1], /Do not change implementation, dependencies, tests, benchmark harnesses, evaluation definitions, scoring/);
   assert.match(call[1], /denominator, unsupported outcomes, and slow results/);
@@ -755,6 +755,24 @@ test("post-commit evidence prompt preserves measurement scope and resumes the au
   assert.equal(call[1], compositePrompt.replace("for this composite.", "for this candidate."));
 });
 
+test("post-commit evidence includes task-required first captures without expanding measurement scope", async () => {
+  const codex = new CodexClient();
+  let prompt;
+  codex.unstructuredSession = async (_cwd, input) => { prompt = input; return { message: "Captured", threadId: "author" }; };
+  const taskScope = "Run and preserve the new CUDA semantic diagnostic from the clean committed implementation.";
+  for (const method of ["refreshAgentEvidence", "refreshCompositeEvidence"]) {
+    await codex[method]("/worktree", "main", "CUDA support", "author", "implementation-sha", { agentModel: "gpt-6-astra" }, taskScope);
+    assert.ok(prompt.includes(taskScope), `${method} carries explicit capture requirements`);
+    assert.match(prompt, /Original task scope \(requirements, not proof of completion\)/);
+    assert.match(prompt, /Generate and preserve any new measured artifacts explicitly required by the task/);
+    assert.match(prompt, /even when no report has been checked in yet/);
+    assert.match(prompt, /Do not invent additional measurement requirements/);
+    assert.match(prompt, /Development-only runs from dirty or uncommitted sources do not satisfy required clean-commit captures/);
+    assert.match(prompt, /Do not change implementation, dependencies, tests, benchmark harnesses, evaluation definitions, scoring/);
+    assert.match(prompt, /report the blocker for independent review/);
+  }
+});
+
 async function createAgentEvidenceFixture() {
   const root = await mkdtemp(join(tmpdir(), "burner-agent-evidence-test-"));
   const store = new StateStore(root);
@@ -769,6 +787,40 @@ async function createAgentEvidenceFixture() {
   });
   return { root, store, orchestrator: new Orchestrator(root, store, new EventHub(), { yolo: true }) };
 }
+
+test("evidence handoffs carry leaf requirements and only currently included composite sources", async () => {
+  const { root, store, orchestrator } = await createAgentEvidenceFixture();
+  try {
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      for (const [id, description] of [["idea", "Preserve new clean-commit CUDA captures."], ["removed", "OMITTED SOURCE REQUIREMENTS"]]) {
+        state.ideas.push({ id, title: id, description, rationale: "Scope", predictedImpact: 0, evaluationIds: [], resources: [], status: "completed", source: "manual", createdAt: timestamp, updatedAt: timestamp });
+      }
+      state.agentRuns.push({ ...state.agentRuns[0], id: "removed-agent", ideaId: "removed" });
+      state.composites.push({ id: "composite", title: "Combined", description: "Preserve integrated raw diagnostics.", status: "building", branch: "combined", worktree: root, sources: [
+        { agentRunId: "agent", title: "CUDA support", branch: "candidate", kind: "pull_request", prNumber: 12 },
+        { agentRunId: "legacy-source", title: "Legacy included source", branch: "legacy", kind: "pull_request", prNumber: 13 },
+      ], deltas: [], reviewRounds: [], isLiving: false, createdAt: timestamp, updatedAt: timestamp });
+    });
+    orchestrator.git = { head: async () => "implementation", hasChanges: async () => false };
+    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
+    const handoffs = [];
+    orchestrator.codex = {
+      refreshAgentEvidence: async (...args) => { handoffs.push(args[6]); return { threadId: "author", message: "Captured" }; },
+      refreshCompositeEvidence: async (...args) => { handoffs.push(args[6]); return { threadId: "author", message: "Captured" }; },
+    };
+    await orchestrator.refreshAgentEvidence(root, "agent", "CUDA support", "main", "author", store.get().settings);
+    await orchestrator.refreshCompositeEvidence(root, "composite", "Combined", "main", "author", store.get().settings);
+    assert.equal(handoffs[0], "Preserve new clean-commit CUDA captures.");
+    assert.match(handoffs[1], /Preserve integrated raw diagnostics/);
+    assert.match(handoffs[1], /PR #12: CUDA support/);
+    assert.match(handoffs[1], /Preserve new clean-commit CUDA captures/);
+    assert.match(handoffs[1], /PR #13: Legacy included source/);
+    assert.match(handoffs[1], /Do not require omitted, removed, or quarantined changes/);
+    assert.doesNotMatch(handoffs[1], /OMITTED SOURCE REQUIREMENTS/);
+    assert.equal(store.get().evaluationRuns.length, 0);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test("leaf reviews measure clean code and review separately committed evidence after initial work and repairs", async () => {
   const { root, store, orchestrator } = await createAgentEvidenceFixture();

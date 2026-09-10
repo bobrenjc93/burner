@@ -394,22 +394,23 @@ export class CodexClient {
     return this.unstructuredSession(cwd, prompt, settings.agentModel, threadId);
   }
 
-  async refreshCompositeEvidence(cwd: string, baseBranch: string, title: string, threadId: string, implementationCommit: string, settings: BurnerSettings): Promise<SessionResult> {
-    return this.refreshEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings, "composite");
+  async refreshCompositeEvidence(cwd: string, baseBranch: string, title: string, threadId: string, implementationCommit: string, settings: BurnerSettings, taskScope?: string): Promise<SessionResult> {
+    return this.refreshEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings, "composite", taskScope);
   }
 
-  async refreshAgentEvidence(cwd: string, baseBranch: string, title: string, threadId: string, implementationCommit: string, settings: BurnerSettings): Promise<SessionResult> {
-    return this.refreshEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings, "candidate");
+  async refreshAgentEvidence(cwd: string, baseBranch: string, title: string, threadId: string, implementationCommit: string, settings: BurnerSettings, taskScope?: string): Promise<SessionResult> {
+    return this.refreshEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings, "candidate", taskScope);
   }
 
-  private async refreshEvidence(cwd: string, baseBranch: string, title: string, threadId: string, implementationCommit: string, settings: BurnerSettings, kind: "composite" | "candidate"): Promise<SessionResult> {
+  private async refreshEvidence(cwd: string, baseBranch: string, title: string, threadId: string, implementationCommit: string, settings: BurnerSettings, kind: "composite" | "candidate", taskScope?: string): Promise<SessionResult> {
     const prompt = [
       `Perform the post-commit evidence step for this ${kind}. Burner has now committed the implementation, so final measurements can use a clean code commit before independent review.`,
       `Change: ${title}`,
       `Base branch: ${baseBranch}. Clean implementation commit: ${implementationCommit}.`,
-      "Inspect the complete candidate diff against the base. Only refresh measured artifacts introduced or changed by this candidate that claim to describe its final implementation and are now stale. If none need refreshing, make no changes and report that briefly. Preserve historical baseline measurements and unrelated artifacts unchanged.",
+      taskScope ? `Original task scope (requirements, not proof of completion):\n${taskScope}` : "",
+      "Inspect the original task requirements and the complete candidate diff against the base. Refresh measured artifacts introduced or changed by this candidate that claim to describe its final implementation and are now stale. Generate and preserve any new measured artifacts explicitly required by the task, including captures deferred until the implementation was committed, even when no report has been checked in yet. Development-only runs from dirty or uncommitted sources do not satisfy required clean-commit captures. If neither stale current-candidate artifacts nor outstanding task-required captures exist, make no changes and report that briefly. Do not invent additional measurement requirements. Preserve historical baseline measurements and unrelated artifacts unchanged.",
       MEASURED_ARTIFACT_PROVENANCE,
-      "Use existing repository-supported build and measurement tooling from the committed implementation. Keep the established workload matrix, reference, denominator, unsupported outcomes, and slow results. Changes in this step must be limited to regenerated evidence and its accompanying documentation. Do not change implementation, dependencies, tests, benchmark harnesses, evaluation definitions, scoring, or supported behavior. If those changes are required, leave the evidence untouched and report the blocker for independent review instead of manufacturing a passing report.",
+      "Use existing repository-supported build and measurement tooling from the committed implementation. Keep the established workload matrix, reference, denominator, unsupported outcomes, and slow results. Changes in this step must be limited to new or regenerated evidence and its accompanying documentation. Do not change implementation, dependencies, tests, benchmark harnesses, evaluation definitions, scoring, or supported behavior. If those changes are required, leave the evidence untouched and report the blocker for independent review instead of manufacturing a passing report.",
       "All generated files and edits must stay inside this worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or paths outside this worktree. Do not commit, push, create branches, or open pull requests; Burner owns delivery.",
       PROGRESS_OWNERSHIP,
       "This step does not approve the branch or replace any independent review, tests, evaluations, or merge gates. Do not rerun unrelated full test suites just to repeat validation already completed by the author; run the checks needed to validate the regenerated evidence.",
