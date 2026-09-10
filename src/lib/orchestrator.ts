@@ -4056,6 +4056,12 @@ export class Orchestrator {
       if (roundsUsed >= this.portfolioReviewLimit(liveSettings)) break;
       const evidence = await this.refreshCompositeEvidence(cwd, compositeId, title, baseBranch, currentThreadId, liveSettings);
       currentThreadId = evidence.threadId;
+      const publicationSettings = this.store.get().settings;
+      if (roundsUsed >= this.portfolioReviewLimit(publicationSettings)) break;
+      // Evidence refresh can create a new HEAD. Publish that committed draft
+      // before review so its exact-head CI can start while review is running.
+      await this.publishCompositeDraft(cwd, compositeId, `publishing committed evidence for independent review round ${roundsUsed + 1}`, publicationSettings);
+      // Publication awaits GitHub, so honor settings/budget changes made meanwhile.
       const reviewSettings = this.store.get().settings;
       if (roundsUsed >= this.portfolioReviewLimit(reviewSettings)) break;
       const roundNumber = roundsUsed + 1;

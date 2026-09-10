@@ -956,7 +956,7 @@ test("leaf reviews recheck live model, cumulative budget and cadence after evide
   }
 });
 
-test("composite reviews run on separately committed evidence after both initial integration and a code repair", async () => {
+test("composite reviews run on separately committed and published evidence after initial integration and a code repair", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-evidence-review-test-"));
   try {
     const store = new StateStore(root);
@@ -971,6 +971,7 @@ test("composite reviews run on separately committed evidence after both initial 
     let dirty = false;
     let evidenceCalls = 0;
     let reviewCalls = 0;
+    let publishedHead;
     const order = [];
     orchestrator.git = {
       head: async () => head,
@@ -983,7 +984,11 @@ test("composite reviews run on separately committed evidence after both initial 
       },
     };
     orchestrator.assertCandidateDoesNotOwnProgress = async (_cwd, commit) => { assert.equal(commit, head); };
-    orchestrator.publishCompositeDraft = async () => undefined;
+    orchestrator.publishCompositeDraft = async () => {
+      assert.equal(dirty, false, "only committed evidence may be published");
+      publishedHead = head;
+      order.push(`publish:${head}`);
+    };
     orchestrator.codex = {
       refreshCompositeEvidence: async (_cwd, base, title, thread, commit) => {
         evidenceCalls += 1;
@@ -1001,6 +1006,7 @@ test("composite reviews run on separately committed evidence after both initial 
         reviewCalls += 1;
         assert.equal(dirty, false);
         assert.equal(head, `evidence-${reviewCalls}`);
+        assert.equal(publishedHead, head, "publish the evidence HEAD before independent review can inspect its CI");
         assert.match(scope, /post-commit evidence handoff \(unverified context, not approval\): Evidence refreshed/);
         order.push(`review:${head}`);
         return reviewCalls === 1
@@ -1015,7 +1021,11 @@ test("composite reviews run on separately committed evidence after both initial 
       },
     };
     const result = await orchestrator.reviewComposite(root, "composite", "Combined", "main", "author", store.get().settings);
-    assert.deepEqual(order, ["measure:implementation-1", "commit:evidence-1", "review:evidence-1", "revise", "commit:implementation-2", "measure:implementation-2", "commit:evidence-2", "review:evidence-2"]);
+    assert.deepEqual(order, [
+      "measure:implementation-1", "commit:evidence-1", "publish:evidence-1", "review:evidence-1", "publish:evidence-1",
+      "revise", "commit:implementation-2", "publish:implementation-2",
+      "measure:implementation-2", "commit:evidence-2", "publish:evidence-2", "review:evidence-2", "publish:evidence-2",
+    ]);
     assert.equal(result.threadId, "evidence-author-2");
     assert.equal(store.get().composites[0].authorThreadId, "evidence-author-2");
     assert.deepEqual(store.get().composites[0].reviewRounds.map((round) => [round.commit, round.approved]), [["evidence-1", false], ["evidence-2", true]]);
@@ -1023,6 +1033,37 @@ test("composite reviews run on separately committed evidence after both initial 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("composite evidence publication failure stops independent review before recording an approval", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-review-publication-failure-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    await store.update((state) => {
+      state.settings.portfolioReviewRounds = 3;
+      state.composites.push({ id: "composite", title: "Combined", description: "Scope", status: "building", branch: "candidate", worktree: root, sources: [], deltas: [], reviewRounds: [], reviewApproved: false, isLiving: false, createdAt: timestamp, updatedAt: timestamp });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true });
+    let reviews = 0;
+    orchestrator.git = { head: async () => "evidence-head" };
+    orchestrator.refreshCompositeEvidence = async () => ({ threadId: "author", message: "Committed evidence" });
+    orchestrator.publishCompositeDraft = async () => { throw new Error("GitHub publication unavailable"); };
+    orchestrator.codex = {
+      review: async () => {
+        reviews += 1;
+        return { approved: true, summary: "Approved", findings: [] };
+      },
+    };
+    await assert.rejects(
+      orchestrator.reviewComposite(root, "composite", "Combined", "main", "author", store.get().settings),
+      /GitHub publication unavailable/,
+    );
+    assert.equal(reviews, 0);
+    assert.deepEqual(store.get().composites[0].reviewRounds, []);
+    assert.equal(store.get().composites[0].reviewApproved, false);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("composite evidence no-ops do not commit and dirty, moved-head, failed, or protected edits cannot proceed to review", async () => {
@@ -1065,8 +1106,8 @@ test("composite evidence no-ops do not commit and dirty, moved-head, failed, or 
   }
 });
 
-test("composite review rechecks live budget and model after evidence collection", async () => {
-  for (const exhausted of [false, true]) {
+test("composite review rechecks live budget and model after evidence collection and publication", async () => {
+  for (const [phase, exhausted] of [["evidence", false], ["evidence", true], ["publication", false], ["publication", true]]) {
     const root = await mkdtemp(join(tmpdir(), "burner-evidence-live-settings-test-"));
     try {
       const store = new StateStore(root);
@@ -1080,14 +1121,19 @@ test("composite review rechecks live budget and model after evidence collection"
       const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true });
       orchestrator.git = { head: async () => "implementation", hasChanges: async () => false };
       orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
-      orchestrator.publishCompositeDraft = async () => undefined;
+      const updateReviewSettings = async () => {
+        await store.update((state) => {
+          state.settings.agentModel = "new-model";
+          if (exhausted) state.settings.portfolioReviewRounds = 1;
+        });
+      };
+      orchestrator.publishCompositeDraft = async () => {
+        if (phase === "publication") await updateReviewSettings();
+      };
       let reviews = 0;
       orchestrator.codex = {
         refreshCompositeEvidence: async () => {
-          await store.update((state) => {
-            state.settings.agentModel = "new-model";
-            if (exhausted) state.settings.portfolioReviewRounds = 1;
-          });
+          if (phase === "evidence") await updateReviewSettings();
           return { threadId: "author", message: "No stale evidence" };
         },
         review: async (_cwd, _base, _scope, settings) => {
