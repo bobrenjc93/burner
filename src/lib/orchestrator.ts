@@ -3143,7 +3143,7 @@ export class Orchestrator {
             const baseCommit = await this.git.resolveRef(initial.settings.baseBranch);
             const current = this.store.get();
             if (!current.orchestrator.enabled || this.runningEvaluations > 0 || this.activeAgents.size > 0 || this.activeComposites.size > 0) return;
-            if (!this.missingBaselineEvaluations(baseCommit, current).length) {
+            if (!selectYoloMergeCandidate(current, baseCommit, false) && !this.missingBaselineEvaluations(baseCommit, current).length) {
               await this.scheduleComposites();
               return;
             }

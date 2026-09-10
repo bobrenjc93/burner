@@ -67,6 +67,24 @@ test("idle YOLO retains leaf validation priority when no composite is queued", a
   assert.deepEqual(calls, ["merge"]);
 });
 
+test("qualified composites retain merge priority over queued integrations", async (t) => {
+  for (const kind of ["qualified", "old-base", "unreviewed", "regressed", "incomplete", "closed"]) {
+    const { store, orchestrator, calls } = await fixture(t);
+    await store.update((state) => {
+      state.composites.push({
+        ...state.composites[0], id: "ready", status: kind === "closed" ? "closed" : "open", prNumber: 20,
+        baseCommit: kind === "old-base" ? "old-base" : "base",
+        reviewApproved: kind !== "unreviewed",
+        reviewRounds: [{ round: 1, approved: kind !== "unreviewed", findings: [], summary: "Reviewed" }],
+        impact: kind === "regressed" ? -1 : 1,
+        deltas: kind === "incomplete" ? [] : [{ evaluationId: "quality", before: 90, after: kind === "regressed" ? 89 : 91, delta: kind === "regressed" ? -1 : 1 }],
+      });
+    });
+    await orchestrator.tick();
+    assert.deepEqual(calls, kind === "qualified" ? ["merge"] : [["composites", undefined]], kind);
+  }
+});
+
 test("manual cycles retain their existing order with a queued composite", async (t) => {
   for (const enabled of [false, true]) {
     const { orchestrator, calls } = await fixture(t, { enabled });
