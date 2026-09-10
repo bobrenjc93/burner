@@ -17,6 +17,7 @@ export async function runCommand(
     env?: NodeJS.ProcessEnv;
     timeoutMs?: number;
     signal?: AbortSignal;
+    onStdout?: (chunk: string) => void;
     onStderr?: (line: string) => void;
     /** Test seam for simulating a host suspend without making the suite sleep for 30 seconds. */
     timeoutSuspendGapMs?: number;
@@ -84,7 +85,10 @@ export async function runCommand(
     };
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => (stdout += chunk));
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      options.onStdout?.(chunk);
+    });
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
       for (const line of chunk.split("\n").filter(Boolean)) options.onStderr?.(line);

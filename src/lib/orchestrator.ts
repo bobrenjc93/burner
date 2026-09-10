@@ -1038,7 +1038,21 @@ export class Orchestrator {
     this.codex = new CodexClient((message) => {
       const clean = message.trim().slice(0, 800);
       if (clean) this.events.emit("progress", { message: clean });
-    }, { afterInvocation: () => this.assertProtectedParentUnchanged() });
+    }, {
+      afterInvocation: () => this.assertProtectedParentUnchanged(),
+      onSessionStarted: (cwd, threadId) => this.checkpointAuthorSession(cwd, threadId),
+    });
+  }
+
+  private async checkpointAuthorSession(cwd: string, threadId: string): Promise<void> {
+    const state = this.store.get();
+    const agents = state.agentRuns.filter((run) => run.worktree === cwd);
+    const composites = state.composites.filter((composite) => composite.worktree === cwd);
+    if (agents.length + composites.length !== 1) {
+      throw new Error("Cannot associate the Codex author checkpoint with a unique Burner worktree.");
+    }
+    if (agents[0]) await this.updateAgent(agents[0].id, { authorThreadId: threadId });
+    else await this.updateComposite(composites[0]!.id, { authorThreadId: threadId, updatedAt: now() });
   }
 
   async init(options: { startPaused?: boolean } = {}): Promise<void> {
@@ -1663,7 +1677,7 @@ export class Orchestrator {
         const currentRun = draft.agentRuns.find((item) => item.id === run.id);
         const currentIdea = draft.ideas.find((item) => item.id === idea.id);
         if (currentRun) Object.assign(currentRun, {
-          status: unresolvedReview && !unresolvedReview.approved || mergeGateFeedback ? "revising" : "reviewing",
+          status: run.authoringComplete === false ? "running" : unresolvedReview && !unresolvedReview.approved || mergeGateFeedback ? "revising" : "reviewing",
           error: undefined,
           completedAt: undefined,
           reviewApproved: false,
@@ -1679,6 +1693,15 @@ export class Orchestrator {
       await this.store.addActivity({ type: "agent", message: `Agent retry resumed: ${idea.title}`, detail: "Reusing the existing candidate, pull request, and author session." });
       let authorThreadId = run.authorThreadId;
       let lastMessage = run.lastMessage ?? "";
+      if (run.authoringComplete === false) {
+        const authorStartCommit = await this.git.head(worktree);
+        const author = await this.codex.implement(worktree, idea, enabledEvaluations, state.settings, authorThreadId);
+        await this.assertCandidateDoesNotOwnProgress(worktree, authorStartCommit);
+        authorThreadId = author.threadId;
+        lastMessage = author.message;
+        await this.updateAgent(run.id, { authorThreadId, lastMessage, authoringComplete: true });
+        if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, "burner: complete interrupted implementation");
+      }
       const retryReview = unresolvedReview && !unresolvedReview.approved && unresolvedReview.findings.length
         ? this.normalizeReview({ approved: false, summary: unresolvedReview.summary, findings: unresolvedReview.findings })
         : mergeGateFeedback;
@@ -3453,6 +3476,7 @@ export class Orchestrator {
       deltas: [],
       resources,
       reviewRounds: [],
+      authoringComplete: false,
       baseRef: base.ref,
       baseCommit: base.commit,
       parentCompositeId: base.compositeId,
@@ -3489,7 +3513,7 @@ export class Orchestrator {
       const author = await this.codex.implement(worktree, currentIdea, this.store.get().evaluations, settings);
       await this.assertCandidateDoesNotOwnProgress(worktree, authorStartCommit);
       const lastMessage = author.message;
-      await this.updateAgent(runId, { lastMessage, authorThreadId: author.threadId });
+      await this.updateAgent(runId, { lastMessage, authorThreadId: author.threadId, authoringComplete: true });
       const hasUncommittedChanges = await this.git.hasChanges(worktree);
       if (!hasUncommittedChanges && await this.git.head(worktree) === authorStartCommit) {
         await this.updateAgent(runId, { status: "no_changes", completedAt: now() });

@@ -115,6 +115,8 @@ export type AgentRun = {
   impact?: number;
   resources: string[];
   authorThreadId?: string;
+  /** False until the initial author finishes; absent on legacy completed-author runs. */
+  authoringComplete?: boolean;
   reviewRounds: ReviewRound[];
   reviewApproved?: boolean;
   baseRef?: string;

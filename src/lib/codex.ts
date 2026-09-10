@@ -12,7 +12,7 @@ const AUTOMATION_HOOK_ARGS = ["--disable", "hooks"];
 export const DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS = 4 * 60 * 1000;
 const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation progress artifacts: the managed README section, docs/burner-evaluation-history.json, and docs/burner-evaluation-progress.svg. Burner injects them only after final candidate scores are known. During exact-head validation those Burner-generated artifacts may therefore appear in the candidate diff; ignore those generated changes entirely when scoring every rubric, including Repository polish and Benchmark integrity, and do not treat them as candidate-authored evidence or regressions. Do not create or modify those artifacts, and do not add repository-side progress generators, validators, tests, or workflows.";
 const MEASURED_ARTIFACT_PROVENANCE = "Treat checked-in benchmark and evaluation artifacts as measured evidence, not ordinary merge blobs. Distinguish evidence claiming to measure the current candidate from explicitly historical records. For current-candidate evidence, apply these rules: If an artifact records a git commit, dirty status, or worktree/import/executable/build path, verify that provenance after integration. Never retain a leaf, sibling, parent, or stale-worktree path in a composite artifact. Regenerate stale evidence with repository-supported tooling from a clean checkout rooted inside the current composite worktree; never hand-edit provenance or fabricate measurements. The measured code commit may precede the artifact-only commit at HEAD only when the intervening diff contains reports/evidence and no implementation or benchmark-harness changes. Historical records instead remain pinned to their original source/build identities and may retain clearly labeled original paths after their worktrees are cleaned up. When the task requests missing setup metadata for historical workloads, an explicitly labeled, newly measured same-code setup rerun at that historical revision is valid if its actual commands, timestamps, cache state, source/build hashes, and links to the original workload artifacts are verified. Preserve the original compute measurements; do not require rerunning unchanged historical workloads solely to supply setup metadata. Never attribute later setup measurements to the original capture, use historical evidence to award current-candidate performance credit, or relabel stale current-candidate evidence as historical to evade a required fresh measurement.";
-type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStderr?: (line: string) => void };
+type CodexCommandOptions = { cwd: string; input?: string; timeoutMs?: number; onStdout?: (chunk: string) => void; onStderr?: (line: string) => void };
 export type CompositeIntegrationContext = {
   phase?: "resolve-conflicts" | "integrate";
   description?: string;
@@ -122,13 +122,19 @@ export class CodexClient {
   private readonly abortController = new AbortController();
   private readonly promptEvaluationTimeoutMs: number;
   private readonly afterInvocation?: () => Promise<void>;
+  private readonly onSessionStarted?: (cwd: string, threadId: string) => Promise<void>;
 
   constructor(
     private readonly onProgress?: (message: string) => void,
-    options: { promptEvaluationTimeoutMs?: number; afterInvocation?: () => Promise<void> } = {},
+    options: {
+      promptEvaluationTimeoutMs?: number;
+      afterInvocation?: () => Promise<void>;
+      onSessionStarted?: (cwd: string, threadId: string) => Promise<void>;
+    } = {},
   ) {
     this.promptEvaluationTimeoutMs = Math.max(1, Math.min(15 * 60 * 1000, options.promptEvaluationTimeoutMs ?? DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS));
     this.afterInvocation = options.afterInvocation;
+    this.onSessionStarted = options.onSessionStarted;
   }
 
   close(): void {
@@ -317,6 +323,7 @@ export class CodexClient {
     idea: Idea,
     evaluations: Evaluation[],
     settings: BurnerSettings,
+    resumeThreadId?: string,
   ): Promise<SessionResult> {
     const affected = evaluations.filter((evaluation) => idea.evaluationIds.includes(evaluation.id));
     const prompt = [
@@ -338,7 +345,7 @@ export class CodexClient {
       "Any read-only, no-edit, no-build, no-test, or command restrictions inside the quoted scoring criteria apply only to the later evaluator. They do not constrain this implementation task: edit the worktree and run the relevant tests and checks before finishing.",
       "In your final response, concisely state what changed and which checks passed.",
     ].join("\n\n");
-    return this.unstructuredSession(cwd, prompt, settings.agentModel);
+    return this.unstructuredSession(cwd, prompt, settings.agentModel, resumeThreadId);
   }
 
   async integrateComposite(cwd: string, title: string, sourceTitles: string[], settings: BurnerSettings, context: CompositeIntegrationContext = {}): Promise<SessionResult> {
@@ -513,6 +520,35 @@ export class CodexClient {
   ): Promise<SessionResult> {
     const tempDir = await mkdtemp(join(tmpdir(), "burner-agent-"));
     const outputPath = join(tempDir, "output.md");
+    let threadId: string | undefined;
+    let pendingLine = "";
+    let checkpoint = Promise.resolve();
+    let checkpointFailed = false;
+    let checkpointError: unknown;
+    const rememberThread = (value: unknown) => {
+      if (threadId || typeof value !== "string" || !value.trim()) return;
+      threadId = value;
+      // Attach the rejection handler immediately: persistence happens while
+      // Codex is still running, not only after a successful process exit.
+      checkpoint = Promise.resolve().then(() => this.onSessionStarted?.(cwd, value)).catch((error) => {
+        checkpointFailed = true;
+        checkpointError = error;
+      });
+    };
+    const consumeStdout = (chunk: string) => {
+      if (threadId) return;
+      pendingLine += chunk;
+      let newline: number;
+      while (!threadId && (newline = pendingLine.indexOf("\n")) !== -1) {
+        const line = pendingLine.slice(0, newline);
+        pendingLine = pendingLine.slice(newline + 1);
+        try {
+          const event = JSON.parse(line) as { type?: string; thread_id?: unknown } | null;
+          if (event?.type === "thread.started") rememberThread(event.thread_id);
+        } catch { /* Ignore non-JSON CLI diagnostics and unrelated events. */ }
+      }
+      if (threadId) pendingLine = "";
+    };
     try {
       const args = resumeThreadId
         ? ["exec", "resume", "--json"]
@@ -525,16 +561,26 @@ export class CodexClient {
         cwd,
         input: prompt,
         timeoutMs,
+        onStdout: consumeStdout,
         onStderr: (line) => this.onProgress?.(line),
       });
+      consumeStdout("\n");
+      if (!threadId) {
+        // Also support command adapters that return buffered output without
+        // streaming it, and resumed sessions that omit thread.started.
+        pendingLine = "";
+        consumeStdout(result.stdout + "\n");
+        rememberThread(resumeThreadId);
+      }
+      await checkpoint;
+      if (checkpointFailed) throw new Error(`Could not persist Codex author checkpoint: ${errorMessage(checkpointError)}`);
       if (result.exitCode !== 0) throw new Error(commandFailure(result, `codex exec exited with ${result.exitCode}`));
-      const threadEvent = result.stdout.split("\n").map((line) => {
-        try { return JSON.parse(line) as { type?: string; thread_id?: string }; } catch { return undefined; }
-      }).find((event) => event?.type === "thread.started" && event.thread_id);
-      const threadId = threadEvent?.thread_id ?? resumeThreadId;
       if (!threadId) throw new Error("Codex did not return a resumable author thread id.");
       return { message: (await readFile(outputPath, "utf8").catch(() => result.stdout)).trim(), threadId };
     } finally {
+      // A command or parent-worktree guard can throw after emitting the event.
+      // Do not let the failure race the durable checkpoint write.
+      await checkpoint;
       await rm(tempDir, { recursive: true, force: true });
     }
   }
