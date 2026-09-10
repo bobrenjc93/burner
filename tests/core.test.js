@@ -3619,6 +3619,117 @@ test("queue prioritization reserves at most one slot for foundational milestones
   assert.deepEqual(prioritizeQueuedIdeas(ideas, 3, true).map(({ id }) => id), ["incremental-high", "incremental-low"]);
 });
 
+test("scheduler admission scans past blocked resources while preserving capacity and the foundational slot", async (t) => {
+  const timestamp = new Date().toISOString();
+  const idea = (id, predictedImpact, overrides = {}) => ({
+    id, title: id, description: "Narrow implementation task", rationale: "Improve", predictedImpact,
+    lane: "incremental", milestone: "", milestoneCredit: 0,
+    evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "manual",
+    ...overrides,
+  });
+  const foundation = (id, overrides = {}) => idea(id, 0, {
+    lane: "foundational", milestone: "Deliver the next prerequisite", milestoneCredit: 90, ...overrides,
+  });
+  const incremental = () => [
+    idea("blocked-high", 90, { resources: ["gpu"] }),
+    idea("blocked-low", 80, { resources: ["gpu"] }),
+    idea("ready-high", 60), idea("ready-low", 40), idea("ready-tail", 20),
+  ];
+  const cases = [
+    {
+      name: "an active foundation does not let GPU waiters hide runnable CPU ideas",
+      parallelism: 3,
+      ideas: [foundation("active-foundation", { status: "running", resources: ["gpu"] }), foundation("next-foundation"), ...incremental()],
+      expected: ["ready-high", "ready-low"],
+    },
+    {
+      name: "a purely incremental queue scans until successful admissions fill capacity",
+      parallelism: 2, ideas: incremental(), expected: ["ready-high", "ready-low"],
+    },
+    {
+      name: "resources acquired earlier in the same dispatch also allow CPU backfill",
+      parallelism: 2, held: [], ideas: incremental(), expected: ["blocked-high", "ready-high"],
+    },
+    {
+      name: "a blocked foundation retains one slot but does not block the other slots",
+      parallelism: 3,
+      ideas: [foundation("reserved", { resources: ["gpu"] }), foundation("lower-foundation", { milestoneCredit: 80 }), ...incremental()],
+      expected: ["ready-high", "ready-low"],
+    },
+    {
+      name: "a foundation whose base cannot resolve also retains its reserved slot",
+      parallelism: 3, unresolved: "reserved",
+      ideas: [foundation("reserved"), ...incremental()], expected: ["ready-high", "ready-low"],
+    },
+    {
+      name: "an admitted foundation leaves the remaining slots for runnable incrementals",
+      parallelism: 3,
+      ideas: [foundation("reserved"), foundation("lower-foundation", { milestoneCredit: 80 }), ...incremental()],
+      expected: ["reserved", "ready-high", "ready-low"],
+    },
+    {
+      name: "capacity one cannot spend a blocked foundation's reservation",
+      parallelism: 1, ideas: [foundation("reserved", { resources: ["gpu"] }), idea("ready", 60)], expected: [],
+    },
+    {
+      name: "existing composites still count against agent capacity",
+      parallelism: 3, activeComposites: 1, ideas: incremental(), expected: ["ready-high", "ready-low"],
+    },
+    {
+      name: "an entirely blocked queue starts nothing",
+      parallelism: 2, ideas: incremental().slice(0, 2), expected: [],
+    },
+    {
+      name: "paused scheduling never attempts resource admission",
+      parallelism: 3, enabled: false, ideas: incremental(), expected: [], noAttempts: true,
+    },
+    {
+      name: "full capacity never attempts resource admission",
+      parallelism: 1, ideas: [foundation("active-foundation", { status: "running" }), ...incremental()], expected: [], noAttempts: true,
+    },
+  ];
+  for (const scenario of cases) await t.test(scenario.name, async () => {
+    const root = await mkdtemp(join(tmpdir(), "burner-admission-test-"));
+    try {
+      const store = new StateStore(root);
+      await store.init();
+      await store.update((state) => {
+        state.settings.parallelism = scenario.parallelism;
+        state.settings.defaultResources = [];
+        state.settings.preferLivingComposite = false;
+        state.orchestrator.enabled = scenario.enabled ?? true;
+        state.orchestrator.mergeWindowStartedAt = timestamp;
+        state.ideas = scenario.ideas;
+      });
+      const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+      orchestrator.git = { resolveRef: async () => "base" };
+      const resolveBase = orchestrator.resolveAgentBase.bind(orchestrator);
+      orchestrator.resolveAgentBase = async (candidate, state) => {
+        if (candidate.id === scenario.unresolved) throw new Error("Base unavailable");
+        return resolveBase(candidate, state);
+      };
+      for (const candidate of scenario.ideas) if (candidate.status === "running") orchestrator.activeAgents.add(candidate.id);
+      for (let index = 0; index < (scenario.activeComposites ?? 0); index += 1) orchestrator.activeComposites.add(`composite-${index}`);
+      const held = new Set(scenario.held ?? ["gpu"]);
+      const attempts = [];
+      const dispatched = [];
+      orchestrator.locks = { tryAcquireAll: async (resources, owner) => {
+        attempts.push(owner);
+        if (resources.some((resource) => held.has(resource))) return undefined;
+        for (const resource of resources) held.add(resource);
+        return { locks: [], release: async () => {} };
+      } };
+      orchestrator.runIdea = async (candidate) => { dispatched.push(candidate.id); };
+      await orchestrator.schedule();
+      assert.deepEqual(dispatched, scenario.expected);
+      assert.ok(orchestrator.activeAgents.size + orchestrator.activeComposites.size <= scenario.parallelism);
+      if (scenario.noAttempts) assert.deepEqual(attempts, []);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 test("milestone credit reserves foundational delivery without changing measured impact", () => {
   const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: new Date().toISOString() };
   const leaf = (id, ideaId, impact, prNumber) => ({

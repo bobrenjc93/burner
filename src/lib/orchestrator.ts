@@ -3324,10 +3324,16 @@ export class Orchestrator {
     if (!capacity) return;
     const foundationalActive = state.ideas.some((idea) =>
       idea.lane === "foundational" && idea.status === "running" && this.activeAgents.has(idea.id));
-    const queue = prioritizeQueuedIdeas(state.ideas, capacity, foundationalActive);
+    // Resource-blocked ideas do not consume slots: scan the full priority queue
+    // and bound successful admissions instead. Keep a pending foundation's slot
+    // reserved even when its base or resource lease is currently unavailable.
+    const queue = prioritizeQueuedIdeas(state.ideas, state.ideas.length, foundationalActive);
+    const incrementalCapacity = capacity - (queue.some((idea) => idea.lane === "foundational") ? 1 : 0);
     let started = 0;
+    let incrementalStarted = 0;
     for (const idea of queue) {
       if (started >= capacity) break;
+      if (idea.lane !== "foundational" && incrementalStarted >= incrementalCapacity) continue;
       let base: AgentBase;
       try { base = await this.resolveAgentBase(idea, state); } catch { continue; }
       if (this.portfolioMode()) {
@@ -3359,6 +3365,7 @@ export class Orchestrator {
       const lease = await this.locks.tryAcquireAll(resources, idea.id);
       if (!lease) continue;
       started += 1;
+      if (idea.lane !== "foundational") incrementalStarted += 1;
       this.activeAgents.add(idea.id);
       const mergeWindowStartedAt = state.orchestrator.mergeWindowStartedAt
         ? new Date(state.orchestrator.mergeWindowStartedAt).getTime()

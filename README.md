@@ -178,7 +178,7 @@ Stopping Burner aborts active Codex process groups and their descendants and clo
 
 Burner also treats the target worktree as the mutation boundary. Author, revision, and composite prompts explicitly forbid edits to parent or sibling repositories, the Burner installation, external tools, and home-directory files. When the target lives inside another Git repository, Burner fingerprints that protected parent (excluding the target itself) before starting and checks it after every Codex invocation. Any drift pauses the orchestrator immediately and leaves the external changes untouched for human inspection; Burner never guesses that it is safe to revert them.
 
-Each idea may declare resource locks. Locks are acquired atomically under `.burner/locks`, in sorted order, and held for the full agent run. If any requested resource is busy, the idea stays queued. Git worktree mutations use a separate short-lived metadata lock.
+Each idea may declare resource locks. Locks are acquired atomically under `.burner/locks`, in sorted order, and held for the full agent run. If any requested resource is busy, the idea stays queued. Scheduling scans past blocked ideas to fill free incremental slots with runnable lower-priority work; a pending foundational idea keeps its reserved slot even while blocked. Git worktree mutations use a separate short-lived metadata lock.
 
 Within one Burner process, blocking requests (including queued command evaluations) receive FIFO priority over new job leases. This does not change held-lock lifetimes or cross-process exclusion.
 
