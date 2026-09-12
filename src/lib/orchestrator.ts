@@ -59,7 +59,7 @@ class CandidateEvaluationError extends Error {
   }
 }
 
-const CANDIDATE_EVALUATION_PROTOCOL = "baseline-anchored-v3-validity";
+const CANDIDATE_EVALUATION_PROTOCOL = "baseline-anchored-v4-independent-baseline";
 const BASE_REFRESH_ERRORS = {
   review: "The experiment base moved during the review loop. Retry this idea from the latest living line.",
   evaluation: "The base branch moved during evaluation. Retry this idea to recalculate against the new main.",

@@ -48,6 +48,49 @@ test("baseline runs receive the scope-validity rule without a prior-score anchor
   assert.equal((await client.evaluate(".", definition, settings, "baseline")).score, 0);
 });
 
+test("fresh baseline contexts independently replace inflated historical scores without changing the rubric", async () => {
+  const anchoredDefinition = { ...definition, prompt: "Use historical progress as numeric calibration and preserve unchanged credit. Fixed category weights: 60 and 40." };
+  for (const context of ["baseline", "manual", "screening_baseline"]) {
+    const client = new CodexClient();
+    client.structured = async (_cwd, prompt) => {
+      assert.match(prompt, /Fixed category weights: 60 and 40/);
+      assert.match(prompt, /independent current baseline; no candidate baseline has been supplied/);
+      assert.match(prompt, /Historical progress scores are not numeric calibration/);
+      assert.match(prompt, /semantic criteria, weights, denominator and measurement requirements unchanged/);
+      assert.match(prompt, /set baselineInvalid=false when the current rubric can be measured validly/);
+      assert.match(prompt, /Still set baselineInvalid=true and fail closed/);
+      assert.match(prompt, /leave historical artifacts untouched/);
+      assert.doesNotMatch(prompt, /Prior baseline measurement for this rubric/);
+      return { ...result, score: 31, baselineInvalid: false, summary: "Current fixed-denominator coverage is 31; historical 100 was inflated." };
+    };
+    const measured = await client.evaluate(".", anchoredDefinition, settings, context, baseline);
+    assert.equal(measured.score, 31);
+    assert.match(measured.summary, /historical 100 was inflated/);
+  }
+});
+
+test("fresh baseline measurements still reject an invalid current contract", async () => {
+  for (const context of ["baseline", "manual"]) {
+    const client = new CodexClient();
+    client.structured = async () => ({ ...result, score: 31, baselineInvalid: true, summary: "Current rubric substitutes eager for required default Inductor" });
+    await assert.rejects(client.evaluate(".", definition, settings, context), /Evaluation baseline invalid:.*Current rubric substitutes eager/);
+  }
+});
+
+test("candidates use their supplied current baseline instead of obsolete history", async () => {
+  for (const context of ["agent", "composite"]) {
+    const client = new CodexClient();
+    client.structured = async (_cwd, prompt) => {
+      assert.match(prompt, /Prior baseline measurement for this rubric, subject to validity verification: 31\/100/);
+      assert.match(prompt, /takes precedence over older numeric scores in committed progress history/);
+      assert.match(prompt, /A proven invalid baseline must fail the validity gate/);
+      assert.doesNotMatch(prompt, /This run establishes an independent current baseline/);
+      return { ...result, score: 32, baselineInvalid: false };
+    };
+    assert.equal((await client.evaluate(".", definition, settings, context, { ...baseline, score: 31 })).score, 32);
+  }
+});
+
 test("command evaluators can invalidate the measurement contract without accepting a numeric score", async () => {
   const client = new CodexClient();
   const payload = JSON.stringify({ ...result, baselineInvalid: true, summary: "Wrong compiler backend" });

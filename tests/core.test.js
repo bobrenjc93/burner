@@ -1576,7 +1576,7 @@ test("cached leaf merge validation bypasses the full evaluation suite", async ()
       state.agentRuns = [{
         id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp,
         prNumber: 1, prState: "open", baseCommit: "base", deltas: [], resources: [], reviewRounds: [],
-        fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v3-validity", threshold: 0, evaluations: [] }), qualified: false, completedAt: timestamp },
+        fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v4-independent-baseline", threshold: 0, evaluations: [] }), qualified: false, completedAt: timestamp },
       }];
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
@@ -1588,7 +1588,7 @@ test("cached leaf merge validation bypasses the full evaluation suite", async ()
     assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), true);
     assert.equal(evaluationSuites, 0, "neither cached result should rerun all evaluations");
     await store.update((state) => {
-      state.agentRuns[0].fullMergeValidation.evaluationFingerprint = JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v2", threshold: 0, evaluations: [] });
+      state.agentRuns[0].fullMergeValidation.evaluationFingerprint = JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v3-validity", threshold: 0, evaluations: [] });
     });
     orchestrator.git.createExistingWorktree = async () => { throw new Error("fresh validation required"); };
     await assert.rejects(orchestrator.fullyValidateLeafForMerge("leaf", "base"), /fresh validation required/,
@@ -1610,7 +1610,7 @@ test("a definition-version change invalidates cached full leaf qualification", a
       state.agentRuns = [{
         id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp,
         prNumber: 1, prState: "open", baseCommit: "base", deltas: [], resources: [], reviewRounds: [],
-        fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v3-validity", threshold: 0, evaluations: [{ id: rubric.id, name: rubric.name, definitionVersion: "old", prompt: rubric.prompt, weight: rubric.weight }] }), qualified: true, completedAt: timestamp },
+        fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v4-independent-baseline", threshold: 0, evaluations: [{ id: rubric.id, name: rubric.name, definitionVersion: "old", prompt: rubric.prompt, weight: rubric.weight }] }), qualified: true, completedAt: timestamp },
       }];
     });
     const orchestrator = new Orchestrator(root, store, new EventHub());
@@ -4810,7 +4810,7 @@ test("cadence fallback skips an unchanged rejected leaf and validates the next c
     await store.init();
     const timestamp = new Date().toISOString();
     const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
-    const fingerprint = JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v3-validity", threshold: 0, evaluations: [{ id: "quality", name: "Quality", prompt: "Score", weight: 1 }] });
+    const fingerprint = JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v4-independent-baseline", threshold: 0, evaluations: [{ id: "quality", name: "Quality", prompt: "Score", weight: 1 }] });
     const leaf = (id, number, commit, impact) => ({
       id, ideaId: `idea-${id}`, status: "completed", branch: `burner/${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp,
       prNumber: number, prUrl: `https://example.test/pull/${number}`, prState: "open", baseCommit: "base",
