@@ -59,7 +59,7 @@ class CandidateEvaluationError extends Error {
   }
 }
 
-const CANDIDATE_EVALUATION_PROTOCOL = "baseline-anchored-v2";
+const CANDIDATE_EVALUATION_PROTOCOL = "baseline-anchored-v4-independent-baseline";
 const BASE_REFRESH_ERRORS = {
   review: "The experiment base moved during the review loop. Retry this idea from the latest living line.",
   evaluation: "The base branch moved during evaluation. Retry this idea to recalculate against the new main.",
@@ -544,6 +544,7 @@ function fullMergeValidationFingerprint(state: BurnerState): string {
     evaluations: state.evaluations.filter((evaluation) => evaluation.enabled).map((evaluation) => ({
       id: evaluation.id,
       name: evaluation.name,
+      definitionVersion: evaluation.definitionVersion,
       prompt: evaluation.prompt,
       command: evaluation.command,
       weight: evaluation.weight,
