@@ -33,6 +33,12 @@ test("CLI version matches the package version", async () => {
 test("GitHub transport classification recognizes gh connection errors", () => {
   assert.equal(isTransientGitHubFailure("error connecting to api.github.com\ncheck your internet connection"), true);
   assert.equal(isTransientGitHubFailure(new Error("failed to connect to api.github.com")), true);
+  const malformed = 'Post "https://api.github.com/graphql": malformed HTTP status code "connection"';
+  assert.equal(isTransientGitHubFailure(malformed), true);
+  assert.equal(isTransientGitHubFailure(new Error(malformed)), true);
+  assert.equal(isTransientGitHubFailure("connection requires authorization"), false);
+  assert.equal(isTransientGitHubFailure("malformed request: invalid pull request number"), false);
+  assert.equal(isTransientGitHubFailure("Could not parse GitHub response: Unexpected token"), false);
   assert.equal(isTransientGitHubFailure("GraphQL: Pull Request is not mergeable"), false);
 });
 
@@ -54,7 +60,7 @@ test("GitHub throttling is transient without treating authorization failures as 
   ]) assert.equal(isTransientGitHubFailure(message), false, message);
 });
 
-test("GitHub reads retry proxy throttling with a bounded budget and fail closed on authorization", async () => {
+test("GitHub reads retry proxy transport failures with a bounded budget and fail closed on authorization", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-rate-limit-test-"));
   const bin = join(root, "bin");
   const statePath = join(root, "gh-state.json");
@@ -75,15 +81,19 @@ test("GitHub reads retry proxy throttling with a bounded budget and fail closed 
     await chmod(executable, 0o755);
     process.env.PATH = `${bin}:${previousPath ?? ""}`;
     const git = new GitService(root, join(root, ".burner"), { transportAttempts: 3, intervalMs: 0 });
-    const throttled = "[Raindrop] Ratelimit by OnRequestRateLimitFilter, on_request_ratelimiter_handle_global_apex_domain_rps_override";
-    await writeFile(statePath, JSON.stringify({ attempts: 0, failures: 2, message: throttled }));
-    assert.equal(await git.isPrDraft(root, 42), true);
-    assert.equal(JSON.parse(await readFile(statePath, "utf8")).attempts, 3);
+    for (const message of [
+      "[Raindrop] Ratelimit by OnRequestRateLimitFilter, on_request_ratelimiter_handle_global_apex_domain_rps_override",
+      'Post "https://api.github.com/graphql": malformed HTTP status code "connection"',
+    ]) {
+      await writeFile(statePath, JSON.stringify({ attempts: 0, failures: 2, message }));
+      assert.equal(await git.isPrDraft(root, 42), true);
+      assert.equal(JSON.parse(await readFile(statePath, "utf8")).attempts, 3);
 
-    await writeFile(statePath, JSON.stringify({ attempts: 0, failures: 10, message: throttled }));
-    await assert.rejects(() => git.isPrDraft(root, 42), (error) =>
-      error instanceof TransientMergeGateError && error.message === throttled);
-    assert.equal(JSON.parse(await readFile(statePath, "utf8")).attempts, 3, "persistent throttling must leave the bounded retry loop");
+      await writeFile(statePath, JSON.stringify({ attempts: 0, failures: 10, message }));
+      await assert.rejects(() => git.isPrDraft(root, 42), (error) =>
+        error instanceof TransientMergeGateError && error.message === message);
+      assert.equal(JSON.parse(await readFile(statePath, "utf8")).attempts, 3, "persistent transport failure must leave the bounded retry loop");
+    }
 
     const forbidden = "HTTP 403: Resource not accessible by integration";
     await writeFile(statePath, JSON.stringify({ attempts: 0, failures: 10, message: forbidden }));
@@ -3386,27 +3396,37 @@ test("explicit merging publishes only an exact checked draft and pins the final 
   const root = await mkdtemp(join(tmpdir(), "burner-draft-publication-test-"));
   const bin = join(root, "bin");
   const argsLog = join(root, "gh-args.jsonl");
+  const mergeStatePath = join(root, "merge-state.json");
   await import("node:fs/promises").then((fs) => fs.mkdir(bin));
   const executable = join(bin, "gh");
   await writeFile(executable, [
     "#!/usr/bin/env node",
     'const fs=require("fs");',
     'fs.appendFileSync(process.env.BURNER_TEST_DRAFT_MERGE_ARGS,JSON.stringify(process.argv.slice(2))+"\\n");',
+    'const path=process.env.BURNER_TEST_DRAFT_MERGE_STATE;',
+    'const state=JSON.parse(fs.readFileSync(path,"utf8"));',
+    'state.attempts+=1;fs.writeFileSync(path,JSON.stringify(state));',
+    'if(state.attempts<=state.failures){console.error(state.message);process.exit(1);}',
   ].join("\n"));
   await chmod(executable, 0o755);
   const previousPath = process.env.PATH;
   const previousLog = process.env.BURNER_TEST_DRAFT_MERGE_ARGS;
+  const previousState = process.env.BURNER_TEST_DRAFT_MERGE_STATE;
   process.env.PATH = bin + ":" + previousPath;
   process.env.BURNER_TEST_DRAFT_MERGE_ARGS = argsLog;
+  process.env.BURNER_TEST_DRAFT_MERGE_STATE = mergeStatePath;
   const head = "0123456789abcdef0123456789abcdef01234567";
   const exercise = async (options = {}) => {
     await writeFile(argsLog, "");
+    await writeFile(mergeStatePath, JSON.stringify({ attempts: 0, failures: options.mergeFailures ?? 0, message: options.mergeError ?? "" }));
     const events = [];
     let checks = 0;
-    const git = new GitService(root, join(root, ".burner"), { mergeAttempts: 1, intervalMs: 0 });
+    let mergeabilityChecks = 0;
+    let publications = 0;
+    const git = new GitService(root, join(root, ".burner"), { mergeAttempts: options.mergeAttempts ?? 1, intervalMs: 0 });
     git.waitForPrMergeability = async () => {
       events.push("mergeability");
-      return { state: "OPEN", headRefOid: head, mergeable: "MERGEABLE" };
+      return { state: ++mergeabilityChecks === options.mergedAt ? "MERGED" : "OPEN", headRefOid: head, mergeable: "MERGEABLE" };
     };
     git.waitForPrChecks = async () => {
       events.push("checks");
@@ -3416,7 +3436,7 @@ test("explicit merging publishes only an exact checked draft and pins the final 
       assert.equal(cwd, root);
       assert.deepEqual(args, ["pr", "view", "42", "--json", "state,headRefOid,isDraft"]);
       events.push("publication");
-      return { state: options.state ?? "OPEN", headRefOid: options.head ?? head, isDraft: options.draft ?? true };
+      return { state: options.state ?? "OPEN", headRefOid: ++publications === options.changedAt ? "changed" : options.head ?? head, isDraft: options.draft ?? true };
     };
     git.markPrReady = async () => {
       events.push("ready");
@@ -3464,10 +3484,45 @@ test("explicit merging publishes only an exact checked draft and pins the final 
     assert.equal(merged.error, undefined);
     assert.deepEqual(merged.events, ["mergeability", "checks", "publication", "disposition"]);
     assert.deepEqual(merged.calls, []);
+
+    const protocolFailure = { draft: false, mergeAttempts: 3, mergeFailures: 2,
+      mergeError: 'Post "https://api.github.com/graphql": malformed HTTP status code "connection"' };
+    const recovered = await exercise(protocolFailure);
+    assert.equal(recovered.error, undefined);
+    assert.deepEqual(recovered.events, [
+      "mergeability", "checks", "publication", "mergeability", "checks", "publication",
+      "mergeability", "checks", "publication", "disposition",
+    ]);
+    assert.deepEqual(recovered.calls, Array.from({ length: 3 }, () => ["pr", "merge", "42", "--merge", "--match-head-commit", head]));
+
+    const exhausted = await exercise({ ...protocolFailure, mergeFailures: 10 });
+    assert.ok(exhausted.error instanceof TransientMergeGateError);
+    assert.equal(exhausted.error.message, protocolFailure.mergeError);
+    assert.equal(exhausted.calls.length, 3, "protocol failure must exhaust the existing bounded merge budget");
+    assert.equal(exhausted.events.includes("disposition"), false);
+
+    const forbidden = await exercise({ ...protocolFailure, mergeError: "HTTP 403: Resource not accessible by integration" });
+    assert.ok(forbidden.error instanceof Error && !(forbidden.error instanceof TransientMergeGateError));
+    assert.equal(forbidden.calls.length, 1, "authorization failure must not retry a merge mutation");
+
+    const changedDuringRetry = await exercise({ ...protocolFailure, changedAt: 2 });
+    assert.ok(changedDuringRetry.error instanceof TransientMergeGateError);
+    assert.equal(changedDuringRetry.calls.length, 1, "a changed head must block another mutation");
+
+    const failedDuringRetry = await exercise({ ...protocolFailure, failChecksAt: 2 });
+    assert.match(failedDuringRetry.error.message, /required CI failed/);
+    assert.equal(failedDuringRetry.calls.length, 1, "newly failing CI must block another mutation");
+
+    const ambiguousMerge = await exercise({ ...protocolFailure, mergedAt: 2 });
+    assert.equal(ambiguousMerge.error, undefined);
+    assert.deepEqual(ambiguousMerge.events, ["mergeability", "checks", "publication", "mergeability", "disposition"]);
+    assert.equal(ambiguousMerge.calls.length, 1, "a remotely successful ambiguous attempt must not be merged twice");
   } finally {
     process.env.PATH = previousPath;
     if (previousLog === undefined) delete process.env.BURNER_TEST_DRAFT_MERGE_ARGS;
     else process.env.BURNER_TEST_DRAFT_MERGE_ARGS = previousLog;
+    if (previousState === undefined) delete process.env.BURNER_TEST_DRAFT_MERGE_STATE;
+    else process.env.BURNER_TEST_DRAFT_MERGE_STATE = previousState;
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -4410,6 +4465,42 @@ test("transient merge-gate failures defer the same validated head without retiri
     assert.equal(store.get().activity.filter((item) => item.message === "Merge gate deferred PR #235").length, 1);
     assert.equal(await orchestrator.autoMergeNext(), false);
     assert.equal(attempts, 1, "the transient head must observe a retry cooldown instead of hot-looping");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("raw protocol failures defer the same reviewed leaf without quarantine or closure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-protocol-merge-gate-test-"));
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    const timestamp = new Date().toISOString();
+    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp };
+    await store.update((state) => {
+      state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
+      state.agentRuns.push({
+        id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp,
+        prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base",
+        deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 81, delta: 1 }], impact: 1, resources: [], reviewRounds: [approvedRound], reviewApproved: true,
+      });
+    });
+    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 1 });
+    const closed = [];
+    orchestrator.git = { resolveRef: async () => "base", closePr: async (_cwd, number) => closed.push(number) };
+    let attempts = 0;
+    orchestrator.mergeAgent = async () => {
+      attempts += 1;
+      throw new Error('Post "https://api.github.com/graphql": malformed HTTP status code "connection"');
+    };
+    const originalLeaf = structuredClone(store.get().agentRuns[0]);
+
+    assert.equal(await orchestrator.autoMergeNext(), true);
+    assert.deepEqual(store.get().agentRuns[0], originalLeaf, "transport failure must preserve the same open, reviewed candidate");
+    assert.deepEqual(closed, []);
+    assert.equal(store.get().activity.filter((item) => item.message === "Merge gate deferred PR #10").length, 1);
+    assert.equal(await orchestrator.autoMergeNext(), false);
+    assert.equal(attempts, 1, "the same leaf must observe the existing retry cooldown");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
