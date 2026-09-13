@@ -148,6 +148,10 @@ export class StateStore {
           if (run.status === "running") {
             run.status = "failed";
             run.error = "Burner stopped before this evaluation completed.";
+            if (run.commandEvidence?.status === "capturing") {
+              run.commandEvidence.status = "incomplete";
+              run.commandEvidence.issues = ["Burner stopped before command evidence was finalized."];
+            }
           }
         }
       } else {

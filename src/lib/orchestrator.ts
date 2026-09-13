@@ -3,6 +3,7 @@ import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import type { AgentRun, BurnerState, CompositePr, CompositeSource, Evaluation, EvaluationRun, Idea, ReviewRound, RuntimeStatus, ScoreDelta } from "../types.js";
 import { CodexClient, type CompositeIntegrationContext, type ReviewResult, type SessionResult } from "./codex.js";
 import { EventHub } from "./events.js";
+import { CommandEvidenceArchive } from "./command-evidence.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, isTransientGitHubFailure } from "./git.js";
 import type { PullRequestSummary } from "./git.js";
 import type { HeldLock } from "./locks.js";
@@ -2028,6 +2029,16 @@ export class Orchestrator {
         let cpuLock: HeldLock | undefined;
         let commandLock: HeldLock | undefined;
         let releasePromptSlot: (() => void) | undefined;
+        let commandEvidence: CommandEvidenceArchive | undefined;
+        const persistRun = () => this.store.update((draft) => {
+          const current = draft.evaluationRuns.find((item) => item.id === run.id);
+          if (current) Object.assign(current, run);
+          if (run.commandEvidence?.status === "incomplete") draft.activity.unshift({
+            id: id("activity"), createdAt: now(), type: "error", message: "Command evidence retention incomplete",
+            detail: `${run.id}: ${run.commandEvidence.issues?.join(" ") ?? "Capture did not finish."}` +
+              (run.commandEvidence.recoveryDirectory ? ` Original exports retained at ${run.commandEvidence.recoveryDirectory}.` : ""),
+          });
+        });
         try {
           if (commandBacked) {
             if (!callerOwnsCpuLock) cpuLock = await this.locks.acquire("cpu-heavy", `${run.id}-cpu`, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
@@ -2039,19 +2050,24 @@ export class Orchestrator {
             ? { ...evaluation, screeningCommand: undefined }
             : evaluation;
           run.attempts = 1;
-          const output = await this.codex.evaluate(cwd, evaluated, state.settings, context, candidateBaselines?.get(evaluation.id));
+          if (evaluated.command) {
+            const screening = (context === "agent" || context === "screening_baseline") && Boolean(evaluated.screeningCommand);
+            commandEvidence = await CommandEvidenceArchive.create(this.store.dataDir, run, evaluation.name, cwd, screening ? "screening" : "full");
+            run.commandEvidence = structuredClone(commandEvidence.reference);
+            await this.store.update((draft) => {
+              const current = draft.evaluationRuns.find((item) => item.id === run.id);
+              if (current) current.commandEvidence = run.commandEvidence;
+            });
+          }
+          const output = await this.codex.evaluate(cwd, evaluated, state.settings, context, candidateBaselines?.get(evaluation.id), commandEvidence);
+          if (commandEvidence) run.commandEvidence = await commandEvidence.finalize({ status: "completed" });
           Object.assign(run, output, { status: "completed" as const, durationMs: Date.now() - started });
-          await this.store.update((draft) => {
-            const current = draft.evaluationRuns.find((item) => item.id === run.id);
-            if (current) Object.assign(current, run);
-          });
+          await persistRun();
           this.events.emit("evaluation", { id: run.id, status: "completed", score: run.score });
         } catch (error) {
+          if (commandEvidence) run.commandEvidence = await commandEvidence.finalize({ status: "failed", error: errorMessage(error) });
           Object.assign(run, { status: "failed" as const, error: errorMessage(error), durationMs: Date.now() - started });
-          await this.store.update((draft) => {
-            const current = draft.evaluationRuns.find((item) => item.id === run.id);
-            if (current) Object.assign(current, run);
-          });
+          await persistRun();
           this.events.emit("evaluation", { id: run.id, status: "failed", error: run.error });
         } finally {
           releasePromptSlot?.();

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BurnerSettings, Evaluation, EvaluationRun, Idea, ReviewFinding } from "../types.js";
 import { CODEX_REASONING_EFFORT, DEFAULT_CODEX_MODEL } from "./codex-config.js";
+import type { CommandEvidenceArchive } from "./command-evidence.js";
 import { runCommand, type CommandResult } from "./process.js";
 import { clampScore, errorMessage, parseJsonObject, truncateText } from "./utils.js";
 
@@ -163,8 +164,9 @@ export class CodexClient {
     settings: BurnerSettings,
     context: EvaluationRun["context"],
     baseline?: Pick<EvaluationRun, "score" | "summary" | "evidence" | "commit">,
+    commandEvidence?: CommandEvidenceArchive,
   ): Promise<EvaluationOutput> {
-    if (evaluation.command) return this.commandEvaluation(cwd, evaluation, context);
+    if (evaluation.command) return this.commandEvaluation(cwd, evaluation, context, commandEvidence);
     const baselineCalibration = (context === "agent" || context === "composite") && baseline?.score !== undefined
       ? [
           `Prior baseline measurement for this rubric, subject to validity verification: ${baseline.score}/100.`,
@@ -206,20 +208,31 @@ export class CodexClient {
     return this.normalizeEvaluation(output);
   }
 
-  private async commandEvaluation(cwd: string, evaluation: Evaluation, context: EvaluationRun["context"]): Promise<EvaluationOutput> {
+  private async commandEvaluation(cwd: string, evaluation: Evaluation, context: EvaluationRun["context"], evidence?: CommandEvidenceArchive): Promise<EvaluationOutput> {
     const command = context === "agent" || context === "screening_baseline"
       ? evaluation.screeningCommand ?? evaluation.command
       : evaluation.command;
     if (!command) throw new Error(`Evaluation '${evaluation.name}' has no command for ${context}.`);
-    const result = await runCommand("/bin/sh", ["-lc", command], {
-      cwd,
-      env: { BURNER_EVALUATION_CONTEXT: context, BURNER_EVALUATION_NAME: evaluation.name },
-      timeoutMs: 60 * 60 * 1000,
-      signal: this.abortController.signal,
-      onStderr: (line) => this.onProgress?.(line),
-    });
+    evidence?.startCommand();
+    let result: CommandResult;
+    try {
+      result = await runCommand("/bin/sh", ["-lc", command], {
+        cwd,
+        env: { BURNER_EVALUATION_CONTEXT: context, BURNER_EVALUATION_NAME: evaluation.name, BURNER_EVALUATION_ARTIFACT_DIR: evidence?.artifactDir },
+        timeoutMs: 60 * 60 * 1000,
+        signal: this.abortController.signal,
+        onStdout: (chunk) => evidence?.append("stdout", chunk),
+        onStderrChunk: (chunk) => evidence?.append("stderr", chunk),
+        onStderr: (line) => this.onProgress?.(line),
+      });
+    } catch (error) {
+      await evidence?.recordCommand(undefined, error);
+      throw error;
+    }
+    await evidence?.recordCommand(result);
     if (result.exitCode !== 0) throw new Error(commandFailure(result, `Evaluation command exited with ${result.exitCode}`));
     const output = this.normalizeEvaluation(parseJsonObject<EvaluationOutput>(result.stdout));
+    await evidence?.recordNormalized(output);
     if (isInconclusiveCommandOutput(output)) {
       const detail = output.evidence[0] ? ` ${output.evidence[0]}` : "";
       throw new Error(`Evaluation command reported an inconclusive measurement: ${output.summary}.${detail}`.slice(0, 2_000));

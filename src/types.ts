@@ -11,6 +11,18 @@ export type Evaluation = {
   definitionVersion?: string;
 };
 
+export type CommandEvidenceReference = {
+  /** Original measurement ID, including when its scores are later promoted to a baseline. */
+  runId: string;
+  /** Paths relative to the canonical repository, never the evaluated worktree. */
+  directory?: string;
+  manifest?: string;
+  /** Owned temporary export sink, retained for recovery until collection and cleanup succeed. */
+  recoveryDirectory?: string;
+  status: "capturing" | "complete" | "incomplete";
+  issues?: string[];
+};
+
 export type EvaluationRun = {
   id: string;
   evaluationId: string;
@@ -31,6 +43,8 @@ export type EvaluationRun = {
   evaluationDefinitionVersion?: string;
   /** Number of independent prompt samples represented by this persisted median. */
   promptSampleCount?: number;
+  /** Best-effort raw command capture; retention status does not change scoring or eligibility. */
+  commandEvidence?: CommandEvidenceReference;
 };
 
 export type Idea = {
