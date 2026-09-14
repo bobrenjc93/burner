@@ -1057,10 +1057,15 @@ export class Orchestrator {
     else await this.updateComposite(composites[0]!.id, { authorThreadId: threadId, updatedAt: now() });
   }
 
-  async init(options: { startPaused?: boolean } = {}): Promise<void> {
+  /**
+   * Manual initialization retains readiness checks but starts paused without a
+   * scheduler timer or auto-resume. This option is not persisted; explicit
+   * operations such as setEnabled(true) and runCycle can still schedule work.
+   */
+  async init(options: { startPaused?: boolean; manual?: boolean } = {}): Promise<void> {
     // A maintenance restart must not dispatch work before the operator can
     // inspect recovered state, even when auto-run or YOLO normally starts it.
-    if (options.startPaused) await this.setEnabled(false);
+    if (options.startPaused || options.manual) await this.setEnabled(false);
     await this.initializeProtectedParentRepository();
     await this.locks.init();
     const orphanedLocks = await this.locks.reapOrphans();
@@ -1077,9 +1082,11 @@ export class Orchestrator {
       }
     }
     if (this.yolo) await this.preflightYolo();
-    this.timer = setInterval(() => void this.tick(), 5_000);
-    this.timer.unref();
-    if (!options.startPaused && (this.store.get().settings.autoRun || this.yolo)) await this.setEnabled(true);
+    if (!options.manual) {
+      this.timer = setInterval(() => void this.tick(), 5_000);
+      this.timer.unref();
+      if (!options.startPaused && (this.store.get().settings.autoRun || this.yolo)) await this.setEnabled(true);
+    }
   }
 
   async close(): Promise<void> {
@@ -1299,7 +1306,13 @@ export class Orchestrator {
     });
   }
 
-  private async fullyValidateLeafForMerge(runId: string, baseCommit: string): Promise<boolean> {
+  /**
+   * Full evaluation qualification for an open leaf and expected current base.
+   * May reuse cached results or update this leaf's PR body; never merges.
+   * Does not establish reviewer approval, CI, remote-head identity, or atomic
+   * base/merge authorization. Callers must enforce those merge gates separately.
+   */
+  async fullyValidateLeafForMerge(runId: string, baseCommit: string): Promise<boolean> {
     const state = this.store.get();
     const run = state.agentRuns.find((item) => item.id === runId);
     const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;

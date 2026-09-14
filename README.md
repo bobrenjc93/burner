@@ -210,6 +210,12 @@ npm test
 npm run build
 ```
 
+### Programmatic sessions
+
+Use `createBurnerServer({ ..., manual: true })` or `orchestrator.init({ manual: true })` for caller-driven sessions. Manual initialization pauses before normal protection, lock recovery, repository readiness, and any YOLO preflight. It preserves `autoRun` but skips automatic resume and the orchestrator's scheduler/PR-reconciliation timer; ordinary base-branch repair can still update settings. Unlike `startPaused`, no scheduler interval is installed. The server's HTTP API and event heartbeat remain available.
+
+`manual` is not persisted or a permanent isolation boundary: explicit operations, including `setEnabled(true)` and `runCycle()`, can still schedule work. It does not enforce single-idea isolation: `runNextIdea()` can also start queued composites on completion. `fullyValidateLeafForMerge(runId, expectedBaseCommit)` exposes existing full evaluation qualification without merging. It may reuse cached results and update that candidate's PR body; it does not establish review approval, CI, remote-head identity, or atomic base/merge authorization.
+
 ## License
 
 MIT

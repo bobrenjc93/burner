@@ -6,6 +6,7 @@ import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
@@ -220,6 +221,143 @@ test("default startup still honors auto-run and YOLO", async () => {
       await rm(root, { recursive: true, force: true });
     }
   }
+});
+
+test("manual startup pauses before readiness without scheduling or changing auto-run", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  for (const enabled of [false, true]) {
+    for (const autoRun of [false, true]) {
+      for (const yolo of [false, true]) {
+        const root = await mkdtemp(join(tmpdir(), "burner-manual-init-"));
+        let orchestrator;
+        try {
+          const store = new StateStore(root);
+          await store.init();
+          await store.update((state) => {
+            state.orchestrator.enabled = enabled;
+            state.settings.autoRun = autoRun;
+            state.settings.baseBranch = "missing-base";
+          });
+          await mkdir(join(store.dataDir, "locks"));
+          await writeFile(join(store.dataDir, "locks", "orphan.lock"), JSON.stringify({ owner: "departed", createdAt: new Date().toISOString() }));
+          orchestrator = new Orchestrator(root, store, new EventHub(), { yolo });
+          const readiness = [];
+          orchestrator.initializeProtectedParentRepository = async () => {
+            assert.equal(store.get().orchestrator.enabled, false, "manual pause must precede protection readiness");
+            readiness.push("protection");
+          };
+          orchestrator.git.status = async () => {
+            assert.deepEqual(await orchestrator.locks.list(), [], "startup must recover orphaned resource locks");
+            readiness.push("repository");
+            return { available: true, branch: "current-base" };
+          };
+          orchestrator.git.hasRef = async (ref) => {
+            assert.equal(ref, "missing-base");
+            return false;
+          };
+          orchestrator.preflightYolo = async () => {
+            assert.equal(store.get().orchestrator.enabled, false, "manual pause must precede YOLO preflight");
+            readiness.push("preflight");
+          };
+          // Never launch real automation if the manual override regresses.
+          const ticks = t.mock.method(orchestrator, "tick", async () => undefined);
+
+          await orchestrator.init({ manual: true });
+          assert.equal(store.get().orchestrator.enabled, false);
+          assert.equal(store.get().settings.autoRun, autoRun);
+          assert.equal(store.get().settings.baseBranch, "current-base", "existing base-branch repair remains active");
+          assert.deepEqual(readiness, yolo ? ["protection", "repository", "preflight"] : ["protection", "repository"]);
+          assert.ok(store.get().activity.some(({ message }) => message === "Recovered stale resource locks"));
+          assert.equal(orchestrator.timer, undefined);
+          t.mock.timers.tick(20_000);
+          assert.equal(ticks.mock.callCount(), 0);
+
+          await orchestrator.runCycle();
+          await orchestrator.setEnabled(true);
+          assert.deepEqual(ticks.mock.calls.map(({ arguments: args }) => args), [[true], [false]], "explicit operations remain available");
+          assert.equal(store.get().orchestrator.enabled, true);
+          assert.equal(orchestrator.codex.abortController.signal.aborted, false);
+          await orchestrator.close();
+          assert.equal(store.get().orchestrator.enabled, false);
+          assert.equal(orchestrator.codex.abortController.signal.aborted, true);
+        } finally {
+          await orchestrator?.close();
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+    }
+  }
+});
+
+test("manual startup omits background reconciliation while ordinary paused startup retains it", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  for (const options of [{ manual: true }, { startPaused: true }, { manual: false, startPaused: true }]) {
+    const root = await mkdtemp(join(tmpdir(), "burner-startup-timer-"));
+    let orchestrator;
+    try {
+      const store = new StateStore(root);
+      await store.init();
+      orchestrator = new Orchestrator(root, store, new EventHub());
+      orchestrator.initializeProtectedParentRepository = async () => undefined;
+      orchestrator.git.status = async () => ({ available: false });
+      const refreshes = t.mock.method(store, "refresh", async () => false);
+      const reconciliations = t.mock.method(orchestrator, "syncPullRequests", async () => undefined);
+      const ticks = t.mock.method(orchestrator, "tick");
+
+      await orchestrator.init(options);
+      t.mock.timers.tick(5_000);
+      await Promise.all(ticks.mock.calls.map(({ result }) => result));
+      assert.equal(ticks.mock.callCount(), options.manual ? 0 : 1);
+      assert.equal(refreshes.mock.callCount(), options.manual ? 0 : 1);
+      assert.equal(reconciliations.mock.callCount(), options.manual ? 0 : 1);
+      assert.equal(store.get().orchestrator.enabled, false);
+    } finally {
+      await orchestrator?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("manual startup still fails closed when YOLO preflight fails", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "burner-manual-preflight-"));
+  let orchestrator;
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    await store.update((state) => { state.orchestrator.enabled = true; state.settings.autoRun = true; });
+    orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true });
+    orchestrator.initializeProtectedParentRepository = async () => undefined;
+    orchestrator.git.status = async () => ({ available: false });
+    orchestrator.preflightYolo = async () => { throw new Error("runtime not ready"); };
+    const ticks = t.mock.method(orchestrator, "tick", async () => undefined);
+    await assert.rejects(orchestrator.init({ manual: true }), /runtime not ready/);
+    assert.equal(store.get().orchestrator.enabled, false);
+    assert.equal(store.get().settings.autoRun, true);
+    assert.equal(orchestrator.timer, undefined);
+    assert.equal(ticks.mock.callCount(), 0);
+  } finally {
+    await orchestrator?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("manual session operations are public TypeScript APIs", async () => {
+  const { default: ts } = await import("typescript");
+  const filename = fileURLToPath(new URL("./manual-session-types.ts", import.meta.url));
+  const source = [
+    'import type { Orchestrator } from "../src/lib/orchestrator.js";',
+    'import { createBurnerServer } from "../src/server.js";',
+    'declare const orchestrator: Orchestrator;',
+    'const ready: Promise<void> = orchestrator.init({ manual: true });',
+    'const qualified: Promise<boolean> = orchestrator.fullyValidateLeafForMerge("candidate", "base");',
+    'void createBurnerServer({ root: ".", host: "127.0.0.1", port: 0, manual: true });',
+  ].join("\n");
+  const options = { noEmit: true, strict: true, skipLibCheck: true, target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext, types: ["node"] };
+  const host = ts.createCompilerHost(options);
+  const getSourceFile = host.getSourceFile.bind(host);
+  host.getSourceFile = (path, ...args) => path === filename ? ts.createSourceFile(path, source, options.target, true) : getSourceFile(path, ...args);
+  const program = ts.createProgram([filename], options, host);
+  assert.deepEqual(ts.getPreEmitDiagnostics(program).map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n")), []);
 });
 
 test("Codex external edits pause Burner without reverting the protected parent repository", async () => {
@@ -2941,6 +3079,35 @@ test("paused server startup retains auto-run settings and supports API resume", 
   }
 });
 
+test("manual server startup forwards the override without disabling the event heartbeat", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "burner-manual-server-"));
+  let burner;
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  t.mock.method(Orchestrator.prototype, "initializeProtectedParentRepository", async () => undefined);
+  t.mock.method(GitService.prototype, "status", async () => ({ available: false }));
+  const ticks = t.mock.method(Orchestrator.prototype, "tick", async () => undefined);
+  const heartbeats = t.mock.method(EventHub.prototype, "heartbeat");
+  try {
+    const store = new StateStore(root);
+    await store.init();
+    await store.update((state) => { state.settings.autoRun = true; });
+    burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0, manual: true });
+    assert.equal(burner.store.get().orchestrator.enabled, false);
+    assert.equal(burner.store.get().settings.autoRun, true);
+    assert.equal(burner.orchestrator.timer, undefined);
+    t.mock.timers.tick(20_000);
+    assert.equal(ticks.mock.callCount(), 0);
+    assert.equal(heartbeats.mock.callCount(), 1);
+    await burner.close();
+    burner = undefined;
+    t.mock.timers.tick(20_000);
+    assert.equal(heartbeats.mock.callCount(), 1, "server shutdown still clears its heartbeat");
+  } finally {
+    await burner?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("manual ideas preserve foundational scheduling and legacy incremental defaults", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-manual-lanes-"));
   const burner = await createBurnerServer({ root, host: "127.0.0.1", port: 0, startPaused: true });
@@ -4601,41 +4768,66 @@ test("direct YOLO fully validates relaxed fallback leaves before merge", async (
   }
 });
 
-test("cadence-driven single leaves receive full evaluation validation before merge", async () => {
-  const root = await mkdtemp(join(tmpdir(), "burner-full-leaf-validation-test-"));
-  try {
-    const store = new StateStore(root);
-    await store.init();
-    const timestamp = new Date().toISOString();
-    const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
-    await store.update((state) => {
-      state.evaluations = [{ id: "bench", name: "Benchmark", prompt: "Measure", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp }];
-      state.evaluationRuns.push({ id: "baseline", evaluationId: "bench", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" });
-      state.ideas.push({ id: "idea", title: "Fast leaf", description: "Improve", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "leaf" });
-      state.agentRuns.push({ id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp, prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base", deltas: [{ evaluationId: "bench", name: "Benchmark", before: 80, after: 100, delta: 20, screening: true }], impact: 20, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
-    });
-    const edited = [];
-    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
-    orchestrator.git = {
-      createExistingWorktree: async () => root,
-      removeWorktree: async () => undefined,
-      resolveRef: async () => "base",
-      editPr: async (...args) => edited.push(args),
-    };
-    orchestrator.runCandidateEvaluations = async (context) => {
-      assert.equal(context, "composite");
-      return [{ id: "full", evaluationId: "bench", score: 95, summary: "full", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" }];
-    };
-    await orchestrator.locks.init();
-    assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), true);
-    const run = store.get().agentRuns[0];
-    assert.deepEqual(run.deltas.map(({ before, after, delta, screening }) => ({ before, after, delta, screening })), [{ before: 90, after: 95, delta: 5, screening: false }]);
-    assert.equal(edited.length, 1);
-    assert.doesNotMatch(edited[0][3], /leaf screen/);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
+for (const [name, moveBase] of [
+  ["cadence-driven single leaves receive full evaluation validation before merge", false],
+  ["fresh full leaf validation rejects a moved base and cleans its worktree and lock", true],
+]) {
+  test(name, async () => {
+    const root = await mkdtemp(join(tmpdir(), "burner-full-leaf-validation-test-"));
+    try {
+      const store = new StateStore(root);
+      await store.init();
+      const timestamp = new Date().toISOString();
+      const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp };
+      await store.update((state) => {
+        state.evaluations = [{ id: "bench", name: "Benchmark", prompt: "Measure", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp }];
+        state.evaluationRuns.push({ id: "baseline", evaluationId: "bench", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" });
+        state.ideas.push({ id: "idea", title: "Fast leaf", description: "Improve", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "leaf" });
+        state.agentRuns.push({ id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp, prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base", deltas: [{ evaluationId: "bench", name: "Benchmark", before: 80, after: 100, delta: 20, screening: true }], impact: 20, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
+      });
+      const originalRun = structuredClone(store.get().agentRuns[0]);
+      const worktree = join(root, "full-leaf-worktree");
+      const edited = [];
+      const removed = [];
+      let currentBase = "base";
+      const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+      orchestrator.git = {
+        createExistingWorktree: async () => { await mkdir(worktree); return worktree; },
+        removeWorktree: async (path) => {
+          assert.equal(path, worktree);
+          assert.deepEqual(await orchestrator.locks.list(), ["git-metadata"]);
+          removed.push(path);
+          await rm(path, { recursive: true });
+        },
+        resolveRef: async (ref) => ref === "main" ? currentBase : "candidate",
+        editPr: async (...args) => edited.push(args),
+      };
+      orchestrator.runCandidateEvaluations = async (context, cwd) => {
+        assert.equal(context, "composite");
+        assert.equal(cwd, worktree);
+        if (moveBase) currentBase = "new-base";
+        return [{ id: "full", evaluationId: "bench", score: 95, summary: "full", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" }];
+      };
+      await orchestrator.locks.init();
+      assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), !moveBase);
+      const run = store.get().agentRuns[0];
+      if (moveBase) {
+        assert.equal(run.fullMergeValidation, undefined);
+        assert.deepEqual(run, originalRun, "a moved base must not replace the candidate's existing measurements");
+        assert.deepEqual(edited, []);
+      } else {
+        assert.deepEqual(run.deltas.map(({ before, after, delta, screening }) => ({ before, after, delta, screening })), [{ before: 90, after: 95, delta: 5, screening: false }]);
+        assert.equal(edited.length, 1);
+        assert.doesNotMatch(edited[0][3], /leaf screen/);
+      }
+      assert.deepEqual(removed, [worktree]);
+      await assert.rejects(readdir(worktree), { code: "ENOENT" });
+      assert.deepEqual(await orchestrator.locks.list(), []);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("cadence-driven leaf validation symmetrically confirms prompt changes without rerunning commands", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-prompt-confirmation-test-"));
