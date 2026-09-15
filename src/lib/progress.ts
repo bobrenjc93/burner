@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { Evaluation } from "../types.js";
+import { runCommand } from "./process.js";
 
 export type ProgressPoint = {
   key: string;
@@ -30,6 +31,7 @@ const HISTORY_PATH = "docs/burner-evaluation-history.json";
 const GRAPH_PATH = "docs/burner-evaluation-progress.svg";
 const START = "<!-- burner-progress:start -->";
 const END = "<!-- burner-progress:end -->";
+export const MANAGED_PROGRESS_FILES = [HISTORY_PATH, GRAPH_PATH, "README.md"] as const;
 const COLORS = ["#ff6b35", "#7c5cff", "#00a7a5", "#e6a700", "#d94f8a", "#2589bd", "#5b8c36", "#9c6644", "#6c757d", "#ef476f"];
 
 const updatePolicy = (): ProgressHistory["updatePolicy"] => ({
@@ -222,6 +224,54 @@ function readmeBlock(): string {
   return `${START}\n## Burner evaluation progress\n\n![Burner evaluation progress](${GRAPH_PATH})\n\nBurner updates this graph atomically after each successful merge. It validates a complete finite 0–100 score map for every enabled evaluation, then upserts the canonical baseline-commit or \`pr:<number>\` key; retrying a merge replaces the existing point instead of duplicating it. Missing or malformed scores abort artifact generation before any file is written. The [raw versioned history](${HISTORY_PATH}) records this merge-coupled policy.\n${END}`;
 }
 
+/** A malformed or duplicated marker is not permission to replace authored text. */
+export function progressReadmeBlock(readme: string): { start: number; end: number; text: string } | undefined {
+  const start = readme.indexOf(START);
+  const end = readme.indexOf(END);
+  if (start < 0 && end < 0) return undefined;
+  if (start < 0 || end < start || readme.indexOf(START, start + START.length) >= 0 || readme.indexOf(END, end + END.length) >= 0) {
+    throw new Error("Malformed Burner progress markers in README.md; authored text was left untouched.");
+  }
+  return { start, end: end + END.length, text: readme.slice(start, end + END.length) };
+}
+
+export function replaceProgressReadmeBlock(readme: string, block: string | undefined): string {
+  const existing = progressReadmeBlock(readme);
+  if (existing) return `${readme.slice(0, existing.start)}${block ?? ""}${readme.slice(existing.end)}`;
+  if (!block) return readme;
+  const separator = readme.length === 0 ? "" : readme.endsWith("\n") ? "\n" : "\n\n";
+  return `${readme}${separator}${block}\n`;
+}
+
+async function readOptionalText(path: string): Promise<string | null> {
+  return readFile(path, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+}
+
+/** Read a pinned base without changing the checkout or discarding other README bytes. */
+export async function planProgressRestore(cwd: string, canonicalCommit: string): Promise<Record<string, string | null>> {
+  const resolved = await runCommand("git", ["rev-parse", "--verify", `${canonicalCommit}^{commit}`], { cwd });
+  if (resolved.exitCode !== 0 || resolved.stdout.trim() !== canonicalCommit) {
+    throw new Error("Progress restoration requires an exact pinned base commit.");
+  }
+  const canonical: Record<string, string | null> = {};
+  for (const path of MANAGED_PROGRESS_FILES) {
+    const entry = await runCommand("git", ["ls-tree", "-z", canonicalCommit, "--", path], { cwd });
+    if (entry.exitCode !== 0) throw new Error(entry.stderr.trim() || `Could not inspect canonical ${path}`);
+    if (!entry.stdout) { canonical[path] = null; continue; }
+    if (!/^100(?:644|755) blob [a-f0-9]+\t/.test(entry.stdout)) throw new Error(`Canonical ${path} is not a regular file.`);
+    const contents = await runCommand("git", ["show", `${canonicalCommit}:${path}`], { cwd });
+    if (contents.exitCode !== 0) throw new Error(contents.stderr.trim() || `Could not read canonical ${path}`);
+    canonical[path] = contents.stdout;
+  }
+  const currentReadme = await readOptionalText(join(cwd, "README.md"));
+  const block = progressReadmeBlock(canonical["README.md"] ?? "");
+  const readme = replaceProgressReadmeBlock(currentReadme ?? "", block?.text);
+  return { ...canonical, "README.md": currentReadme === null && !readme ? null : readme };
+}
+
 async function atomicWrite(path: string, contents: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.tmp-${process.pid}`;
@@ -229,12 +279,12 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
   await rename(temporary, path);
 }
 
-export async function updateProgressArtifacts(
+export async function planProgressArtifacts(
   cwd: string,
   evaluations: Evaluation[],
   newPoints: ProgressPoint[],
   candidateBaseCommits: Record<number, string> = {},
-): Promise<ProgressHistory> {
+): Promise<{ history: ProgressHistory; files: Record<string, string | null> }> {
   const history = await readHistory(cwd);
   const requiredEvaluationIds = new Set(evaluations.filter((item) => item.enabled).map((item) => item.id));
   try {
@@ -265,16 +315,28 @@ export async function updateProgressArtifacts(
     else history.points.push(point);
   }
   history.points = collapseRedundantBaselinePoints(history.points, candidateBaseCommits);
-  await atomicWrite(join(cwd, HISTORY_PATH), `${JSON.stringify(history, null, 2)}\n`);
-  await atomicWrite(join(cwd, GRAPH_PATH), renderSvg(history));
-  const readmePath = join(cwd, "README.md");
-  let readme = "";
-  try { readme = await readFile(readmePath, "utf8"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  const block = readmeBlock();
-  const start = readme.indexOf(START);
-  const end = readme.indexOf(END);
-  if (start >= 0 && end >= start) readme = `${readme.slice(0, start)}${block}${readme.slice(end + END.length)}`;
-  else readme = `${readme.trimEnd()}${readme.trim() ? "\n\n" : ""}${block}\n`;
-  await atomicWrite(readmePath, readme);
+  const readme = await readOptionalText(join(cwd, "README.md"));
+  return {
+    history,
+    files: {
+      [HISTORY_PATH]: `${JSON.stringify(history, null, 2)}\n`,
+      [GRAPH_PATH]: renderSvg(history),
+      "README.md": replaceProgressReadmeBlock(readme ?? "", readmeBlock()),
+    },
+  };
+}
+
+export async function updateProgressArtifacts(
+  cwd: string,
+  evaluations: Evaluation[],
+  newPoints: ProgressPoint[],
+  candidateBaseCommits: Record<number, string> = {},
+): Promise<ProgressHistory> {
+  const { history, files } = await planProgressArtifacts(cwd, evaluations, newPoints, candidateBaseCommits);
+  for (const [path, contents] of Object.entries(files)) {
+    // The renderer creates these three files; deletions belong to the separate
+    // pinned-base restore plan and its leaf Git receipt.
+    if (contents !== null) await atomicWrite(join(cwd, path), contents);
+  }
   return history;
 }

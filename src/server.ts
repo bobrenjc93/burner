@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EventHub } from "./lib/events.js";
-import { Orchestrator } from "./lib/orchestrator.js";
+import { canRetryAgent, Orchestrator, validateAgentRetryOptions, validateLeafAdmissionOptions, type AgentRetryOptions, type LeafAdmissionOptions } from "./lib/orchestrator.js";
 import { StateStore, validateEvaluation } from "./lib/store.js";
 import type { BurnerSettings, Idea } from "./types.js";
 import { errorMessage, id, now } from "./lib/utils.js";
@@ -220,21 +220,31 @@ export async function createBurnerServer(options: BurnerServerOptions) {
       events.emit("state", store.get());
       json(response, 200, { ok: true });
     }),
-    route("POST", "/api/agents/:runId/retry", (_request, response, params) => {
+    route("POST", "/api/agents/:runId/retry", (_request, response, params, body) => {
       const run = store.get().agentRuns.find((item) => item.id === params.runId);
       if (!run) return json(response, 404, { error: "Agent run not found." });
-      if (run.status !== "failed") return json(response, 409, { error: "Only a failed agent run can be retried." });
+      if (!canRetryAgent(run)) return json(response, 409, { error: "Only a failed run or an approved full-evaluation-rejected leaf can be retried." });
+      const options = { repairNotes: body.repairNotes,
+        ...(body.legacyPrProof !== undefined ? { legacyPrProof: body.legacyPrProof } : {}),
+        ...(body.retainWorktree !== undefined ? { retainWorktree: body.retainWorktree } : {}) } as AgentRetryOptions;
+      try { validateAgentRetryOptions(run, options); }
+      catch (error) { return json(response, 400, { error: errorMessage(error) }); }
       json(response, 202, { accepted: true });
-      void orchestrator.retryAgent(params.runId).catch(async (error) => {
+      void orchestrator.retryAgent(params.runId, options).catch(async (error) => {
         await store.addActivity({ type: "error", message: `Agent retry failed: ${params.runId}`, detail: errorMessage(error) });
         events.emit("error", { message: errorMessage(error) });
       });
     }),
-    route("POST", "/api/agents/:runId/rebase-retry", (_request, response, params) => {
+    route("POST", "/api/agents/:runId/rebase-retry", (_request, response, params, body) => {
       const run = store.get().agentRuns.find((item) => item.id === params.runId);
       if (!run) return json(response, 404, { error: "Agent run not found." });
+      const options = {
+        ...(body.legacyPrProof !== undefined ? { legacyPrProof: body.legacyPrProof } : {}),
+        ...(body.retainWorktree !== undefined ? { retainWorktree: body.retainWorktree } : {}) } as LeafAdmissionOptions;
+      try { validateLeafAdmissionOptions(run, options); }
+      catch (error) { return json(response, 400, { error: errorMessage(error) }); }
       json(response, 202, { accepted: true });
-      void orchestrator.refreshAgentBaseAndRetry(params.runId).catch(async (error) => {
+      void orchestrator.refreshAgentBaseAndRetry(params.runId, options).catch(async (error) => {
         await store.addActivity({ type: "error", message: `Same-PR base refresh failed: ${params.runId}`, detail: errorMessage(error) });
         events.emit("error", { message: errorMessage(error) });
       });

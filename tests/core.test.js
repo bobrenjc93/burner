@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { get } from "node:http";
 import { createConnection } from "node:net";
 import { execFile } from "node:child_process";
@@ -10,19 +11,63 @@ import { fileURLToPath } from "node:url";
 import { LockManager } from "../dist/lib/locks.js";
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
-import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeEvaluationFloor, compositeExperimentBaseline, compositeRevisionHeadroom, compositeSourceRegressions, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldAwaitFoundationalDelivery, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
+import { agentDispatchCadenceHeadroom, agentReviewCadenceHeadroom, assertCompositeEvaluationRevisionChanged, cachedFullMergeValidationResult, compositeEvaluationFloor, compositeExperimentBaseline, compositeRevisionHeadroom, compositeSourceRegressions, fullMergeValidationFingerprint, inferIdeaResources, isAuthoritativeFullBaseline, leafPromptRecoveryHeadroom, leafValidationHeadroom, latestFullAssessment, fullAssessmentForIdentity, Orchestrator, partitionReviewFallbacks, portfolioMergeTailHeadroom, prioritizeQueuedIdeas, recoveryCompositeTitle, reusableFullAgentCommandRuns, selectYoloLeafBatch, selectYoloMergeCandidate, shouldAwaitFoundationalDelivery, shouldRefillIdeaQueue } from "../dist/lib/orchestrator.js";
 import { updateProgressArtifacts } from "../dist/lib/progress.js";
 import { runCommand } from "../dist/lib/process.js";
 import { buildCompositeDraftPrBody, buildCompositePrBody, buildPrBody, GitService, isTransientGitHubFailure, TransientMergeGateError } from "../dist/lib/git.js";
 import { createBurnerServer } from "../dist/server.js";
 import { StateStore, validateEvaluation } from "../dist/lib/store.js";
 import { clampScore, parseJsonObject, slugify, weightedScore } from "../dist/lib/utils.js";
+import { finishLeafDeliveryForTest, leafGitEffects, reviewLeaf } from "./leaf-test-helpers.js";
+import { fixtureGit, leafRefreshRepository } from "./leaf-refresh-test-helpers.js";
+import { fixtureLeafPr, fixtureLeafRepository, installLeafPrFixtureTransport } from "./leaf-pr-test-helpers.js";
+
+// An obsolete aggregate stub must never fall through to an installed model
+// CLI. The few CLI integration tests explicitly create their own executable
+// at cwd/bin/codex; every other test must replace the actual backend seam.
+for (const method of ["detectUnrestrictedArgs", "runCodex"]) {
+  const original = CodexClient.prototype[method];
+  CodexClient.prototype[method] = async function (...args) {
+    const cwd = method === "runCodex" ? args[1].cwd : args[0];
+    const bin = join(cwd, "bin");
+    const executable = join(bin, "codex");
+    if (!cwd.startsWith(join(tmpdir(), "burner-")) || process.env.PATH?.split(":")[0] !== bin ||
+      await realpath(cwd).catch(() => undefined) !== cwd || await realpath(bin).catch(() => undefined) !== bin ||
+      !(await lstat(executable).catch(() => undefined))?.isFile() ||
+      !(await access(executable, fsConstants.X_OK).then(() => true, () => false))) {
+      throw new Error("Tests must install an isolated fake Codex executable or stub the evaluator backend.");
+    }
+    return original.apply(this, args);
+  };
+}
 
 const exec = (cwd, command, args) => new Promise((resolve, reject) => {
   execFile(command, args, { cwd }, (error, stdout, stderr) => {
     if (error) reject(new Error(stderr || error.message));
     else resolve(stdout);
   });
+});
+
+test("test fixtures fail closed before an unstubbed installed Codex invocation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-no-model-test-"));
+  const previousPath = process.env.PATH;
+  try {
+    await assert.rejects(new CodexClient().preflight(root), /isolated fake Codex/);
+    await assert.rejects(new CodexClient().runCodex(["exec"], { cwd: root }), /isolated fake Codex/);
+    const bin = join(root, "bin");
+    await mkdir(bin);
+    process.env.PATH = `${bin}:${previousPath ?? ""}`;
+    await writeFile(join(bin, "codex"), "#!/bin/sh\nexit 91\n", { mode: 0o644 });
+    await assert.rejects(new CodexClient().preflight(root), /isolated fake Codex/, "a non-executable file must not permit PATH fallthrough");
+    await assert.rejects(new CodexClient().runCodex(["exec"], { cwd: root }), /isolated fake Codex/);
+    await rm(join(bin, "codex"));
+    await symlink(process.execPath, join(bin, "codex"));
+    await assert.rejects(new CodexClient().runCodex(["exec"], { cwd: root }), /isolated fake Codex/, "symlinked executable is not an owned fixture file");
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("CLI version matches the package version", async () => {
@@ -578,6 +623,7 @@ function compositeRegressionFixture() {
   return {
     sources: [{ agentRunId: "leaf", prNumber: 7, title: "CUDA storage", branch: "leaf", kind: "pull_request" }],
     state: {
+      settings: { compositeAbsorbThreshold: 0 },
       evaluations: [{ id: "quality", name: "Architecture", enabled: true, definitionVersion: "v1" }],
       evaluationRuns: [baseline, candidate],
       agentRuns: [{
@@ -694,19 +740,40 @@ test("integrator prompt carries repair context without changing delivery or scor
   assert.doesNotMatch(prompt, /Integration context:/);
 });
 
-test("fresh and resumed composite builds forward scope and verified source feedback", async () => {
-  for (const resume of [false, true]) {
+test("fresh and resumed composite builds forward scope and verified source feedback", async (t) => {
+  for (const resume of [false, true]) for (const missingOther of [false, true]) await t.test(`${resume ? "resumed" : "fresh"}: ${missingOther ? "missing source refuses integration" : "both owned sources"}`, async () => {
     const root = await mkdtemp(join(tmpdir(), "burner-integration-handoff-test-"));
     try {
       const { state: fixture, sources } = compositeRegressionFixture();
       const store = new StateStore(root);
       await store.init();
       const timestamp = new Date().toISOString();
-      const allSources = [...sources, { agentRunId: "other", title: "Other change", branch: "other", kind: "pull_request" }];
+      const allSources = [...sources, { agentRunId: "other", prNumber: 8, title: "Other change", branch: "other", kind: "pull_request" }];
+      const heads = new Map(allSources.map((source) => [source.branch, `${source.branch}-head`]));
+      const worktrees = new Map(allSources.map((source) => [source.agentRunId, join(root, source.agentRunId)]));
+      for (const worktree of worktrees.values()) await mkdir(worktree);
+      const remotes = new Map();
+      const orchestrator = new Orchestrator(root, store, new EventHub());
       await store.update((state) => {
         state.evaluations = fixture.evaluations.map((evaluation) => ({ ...evaluation, prompt: "Score architecture", weight: 1, createdAt: timestamp }));
-        state.evaluationRuns = fixture.evaluationRuns;
-        state.agentRuns = fixture.agentRuns;
+        state.evaluationRuns = [fixture.evaluationRuns[0]];
+        state.agentRuns = allSources.map((source) => {
+          const fields = { title: source.title, body: "Reviewed source", isDraft: true, state: "OPEN" };
+          const remote = { ...fields, number: source.prNumber, url: `https://example.test/pull/${source.prNumber}`,
+            headRefName: source.branch, headRefOid: heads.get(source.branch), mergeable: "MERGEABLE", statusCheckRollup: [] };
+          remotes.set(source.prNumber, remote);
+          const run = { id: source.agentRunId, ideaId: `idea-${source.agentRunId}`, status: "completed", branch: source.branch,
+            worktree: worktrees.get(source.agentRunId), startedAt: timestamp, completedAt: timestamp,
+            baseRef: "main", baseCommit: "base", prNumber: source.prNumber, prUrl: remote.url, prState: "open",
+            deltas: [], resources: [], reviewApproved: true,
+            reviewRounds: [{ id: `review-${source.agentRunId}`, round: 1, commit: remote.headRefOid, baseCommit: "base",
+              evaluationFingerprint: fullMergeValidationFingerprint(state), approved: true, findings: [], summary: "Reviewed",
+              createdAt: timestamp, completedAt: timestamp }] };
+          run.leafPr = fixtureLeafPr(run, fields);
+          run.continuation = { id: `delivery-${run.id}`, step: "delivery", head: remote.headRefOid,
+            approvalRoundId: run.reviewRounds[0].id, identity: orchestrator.continuationIdentity(run, state, remote) };
+          return run;
+        });
         state.composites.push({
           id: "combined", title: "Combined", description: "Repair native ownership", status: resume ? "rebuilding" : "queued",
           branch: "combined", worktree: root, sources: allSources, baseCommit: "base",
@@ -714,30 +781,83 @@ test("fresh and resumed composite builds forward scope and verified source feedb
           createdAt: timestamp, updatedAt: timestamp,
         });
       });
-      const orchestrator = new Orchestrator(root, store, new EventHub());
       const lock = { release: async () => undefined };
       orchestrator.locks = { tryAcquireAll: async () => lock, acquire: async () => lock };
+      const merged = [];
+      const included = new Set(resume ? heads.values() : []);
       orchestrator.git = {
-        status: async () => ({ available: true, dirty: false }), resolveRef: async () => "base",
+        status: async () => ({ available: true, dirty: false }),
+        resolveRef: async (ref) => ref === "main" ? "base" : ref === "combined" ? "combined-head" : heads.get(ref) ?? assert.fail(`Unexpected ref ${ref}`),
+        tree: async (ref) => `${ref}-tree`,
         createWorktree: async () => root, createExistingWorktree: async () => root,
-        fetchBranch: async (_remote, branch) => branch,
-        mergeBranch: async (_cwd, branch) => ({ conflict: branch === "leaf" }),
-        hasChanges: async () => false, head: async () => "head", removeWorktree: async () => undefined,
+        mergeBranch: async (cwd, head) => {
+          assert.equal(cwd, root);
+          assert.ok([...heads.values()].includes(head), "consume the immutable receipt head, never the mutable source branch");
+          merged.push(head); included.add(head);
+          return { conflict: head === heads.get("leaf") };
+        },
+        isCommitAncestor: async (ancestor, descendant) => { assert.equal(descendant, "combined-head"); return included.has(ancestor); },
+        assertWorktree: async (cwd, branch) => assert.equal(cwd, worktrees.get(branch)),
+        hasChanges: async () => false,
+        head: async (cwd) => cwd === root ? "combined-head" : heads.get([...worktrees].find(([, path]) => path === cwd)?.[0]) ?? assert.fail(`Unexpected checkout ${cwd}`),
+        removeWorktree: async () => undefined,
       };
+      installLeafPrFixtureTransport(orchestrator.git, {
+        observe: async (_cwd, number) => { assert.ok(remotes.has(number)); return structuredClone(remotes.get(number)); },
+        fetch: async ({ remote, repository, branch, head }) => {
+          assert.equal(remote, "origin"); assert.deepEqual(repository, fixtureLeafRepository); assert.equal(head, heads.get(branch));
+          assert.ok(orchestrator.agentClaims.has(branch), "the source claim covers the exact-head fetch");
+        },
+      });
       orchestrator.restoreBurnerProgressFromCommit = async () => false;
       orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
       orchestrator.publishCompositeDraft = async () => undefined;
       orchestrator.ensureLivingComposite = async () => undefined;
       const calls = [];
       orchestrator.codex = {
+        preflight: async (cwd) => assert.ok([...worktrees.values()].includes(cwd)),
+        evaluate: async (cwd) => ({ score: cwd === worktrees.get("leaf") ? 90 : 95,
+          summary: fixture.evaluationRuns[1].summary, evidence: fixture.evaluationRuns[1].evidence,
+          suggestions: fixture.evaluationRuns[1].suggestions }),
         integrateComposite: async (_cwd, _title, titles, _settings, context) => {
           calls.push({ titles, context });
           return { threadId: "integration-thread", message: "Integrated" };
         },
       };
+      // Arrange real completed delivery receipts through the production sampler
+      // and reducer. The composite's ownership/evidence validator stays intact.
+      for (const source of allSources) {
+        await store.update((state) => {
+          const run = state.agentRuns.find((item) => item.id === source.agentRunId);
+          run.continuation.evaluation = orchestrator.newLeafEvaluation(run, "delivery", heads.get(run.branch), `${heads.get(run.branch)}-tree`, store.latestRuns(), state);
+        });
+        const run = store.get().agentRuns.find((item) => item.id === source.agentRunId);
+        const claim = orchestrator.claimAgents([run.id]);
+        let receipt;
+        try { receipt = await orchestrator.runLeafEvaluation(run, run.continuation.evaluation.id, run.worktree, claim); }
+        finally { claim.release(); }
+        await store.update((state) => {
+          const current = state.agentRuns.find((item) => item.id === run.id);
+          current.continuation = { id: current.continuation.id, identity: current.continuation.identity, head: current.continuation.head,
+            step: "done", outcome: "completed", completedAt: receipt.result.completedAt, evaluation: receipt };
+          current.deltas = receipt.result.deltas;
+          current.impact = receipt.result.impact;
+        });
+      }
+      if (missingOther) await store.update((state) => { state.agentRuns = state.agentRuns.filter((run) => run.id !== "other"); });
+      const beforeSources = structuredClone(store.get().agentRuns);
       orchestrator.reviewComposite = async () => { throw new Error("test stops after integration handoff"); };
       await orchestrator.buildComposite("combined", resume);
+      assert.deepEqual(store.get().agentRuns, beforeSources, "consumption neither adopts nor rewrites source owners");
+      assert.equal(orchestrator.agentClaims.size, 0);
+      if (missingOther) {
+        assert.match(store.get().composites[0].error, /source lost its exact leaf owner\/membership/);
+        assert.ok(calls.every((call) => call.context.phase === "resolve-conflicts"), "full integration cannot start with an unowned source");
+        assert.deepEqual(merged, resume ? [] : [heads.get("leaf")]);
+        return;
+      }
       assert.equal(calls.length, resume ? 1 : 2);
+      assert.deepEqual(merged, resume ? [] : [...heads.values()]);
       if (!resume) assert.equal(calls[0].context.phase, "resolve-conflicts", "source conflicts use the bounded resolution phase");
       assert.equal(calls.at(-1).context.phase, undefined, "full integration still runs after all source merges, including resumed builds");
       assert.deepEqual(calls.at(-1).titles, ["CUDA storage", "Other change"], "resumed builds retain the complete included scope");
@@ -750,7 +870,7 @@ test("fresh and resumed composite builds forward scope and verified source feedb
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  }
+  });
 });
 
 test("conflict resolution defers broad validation without weakening final integration", async () => {
@@ -957,7 +1077,8 @@ test("evidence handoffs carry leaf requirements and only currently included comp
       refreshAgentEvidence: async (...args) => { handoffs.push(args[6]); return { threadId: "author", message: "Captured" }; },
       refreshCompositeEvidence: async (...args) => { handoffs.push(args[6]); return { threadId: "author", message: "Captured" }; },
     };
-    await orchestrator.refreshAgentEvidence(root, "agent", "CUDA support", "main", "author", store.get().settings);
+    orchestrator.codex.review = async () => ({ approved: true, summary: "Approved", findings: [] });
+    await reviewLeaf(orchestrator, root, "agent", "CUDA support", "main", "author", store.get().settings);
     await orchestrator.refreshCompositeEvidence(root, "composite", "Combined", "main", "author", store.get().settings);
     assert.equal(handoffs[0], "Preserve new clean-commit CUDA captures.");
     assert.match(handoffs[1], /Preserve integrated raw diagnostics/);
@@ -1025,7 +1146,7 @@ test("leaf reviews measure clean code and review separately committed evidence a
         return { message: "Code repaired", threadId: "revised-author" };
       },
     };
-    const result = await orchestrator.reviewAgent(root, "agent", "Leaf", "main", "author", store.get().settings);
+    const result = await reviewLeaf(orchestrator, root, "agent", "Leaf", "main", "author", store.get().settings);
     assert.deepEqual(order, ["measure:implementation-1", "commit:evidence-1", "review:evidence-1", "revise", "commit:implementation-2", "measure:implementation-2", "commit:evidence-2", "review:evidence-2"]);
     assert.equal(result.threadId, "evidence-author-2");
     assert.equal(result.message, "Code repaired");
@@ -1054,9 +1175,9 @@ test("leaf evidence preserves no-ops and blocks dirty inputs, moved heads, faile
         },
         review: async () => { reviews += 1; return { approved: true, summary: "Approved", findings: [] }; },
       };
-      const promise = orchestrator.reviewAgent(root, "agent", "Leaf", "main", "author", store.get().settings);
+      const promise = reviewLeaf(orchestrator, root, "agent", "Leaf", "main", "author", store.get().settings);
       if (scenario === "no-op") await promise;
-      else await assert.rejects(promise, /clean, committed|changed HEAD|measurement failed|protected progress changed/);
+      else await assert.rejects(promise, /branch\/head or worktree changed|measurement failed|protected progress changed/);
       assert.equal(calls, scenario === "dirty-start" ? 0 : 1, scenario);
       assert.equal(commits, 0, scenario);
       assert.equal(reviews, scenario === "no-op" ? 1 : 0, scenario);
@@ -1095,7 +1216,7 @@ test("leaf reviews recheck live model, cumulative budget and cadence after evide
           return { approved: true, summary: "Approved", findings: [] };
         },
       };
-      const promise = orchestrator.reviewAgent(root, "agent", "Leaf", "main", "author", store.get().settings);
+      const promise = reviewLeaf(orchestrator, root, "agent", "Leaf", "main", "author", store.get().settings);
       if (scenario === "model") await promise;
       else await assert.rejects(promise, /bounded review budget|cadence expired during evidence/);
       assert.equal(reviews, scenario === "model" ? 1 : 0, scenario);
@@ -1629,7 +1750,7 @@ test("unchanged leaves reuse both accepted and rejected full merge validation", 
   }, baseCommit, candidateCommit, evaluationFingerprint), false, "a rejected unchanged leaf must not launch the full suite again");
   assert.equal(cachedFullMergeValidationResult({
     fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: false, completedAt },
-  }, baseCommit, candidateCommit, evaluationFingerprint, true), true, "cached scores are reinterpreted when qualification semantics change");
+  }, baseCommit, candidateCommit, evaluationFingerprint, true), false, "presentation values cannot reinterpret a completed full verdict; policy changes need a new fingerprint");
   assert.equal(cachedFullMergeValidationResult({
     fullMergeValidation: { baseCommit, candidateCommit, evaluationFingerprint, qualified: true, completedAt },
   }, baseCommit, candidateCommit, evaluationFingerprint), true);
@@ -1719,18 +1840,27 @@ test("cached leaf merge validation bypasses the full evaluation suite", async ()
     const store = new StateStore(root);
     await store.init();
     const timestamp = new Date().toISOString();
+    const fields = { title: "Cached leaf", body: "Prior qualification", isDraft: true, state: "OPEN" };
+    const remote = { ...fields, number: 1, url: "https://example.test/pull/1", headRefName: "burner/leaf", headRefOid: "candidate",
+      mergeable: "MERGEABLE", statusCheckRollup: [] };
     await store.update((state) => {
       state.evaluations = [];
       state.agentRuns = [{
         id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp,
-        prNumber: 1, prState: "open", baseCommit: "base", deltas: [], resources: [], reviewRounds: [],
+        prNumber: 1, prUrl: remote.url, prState: "open", baseRef: "main", baseCommit: "base", deltas: [], resources: [], reviewRounds: [],
         fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v4-independent-baseline", threshold: 0, evaluations: [] }), qualified: false, completedAt: timestamp },
       }];
+      const run = state.agentRuns[0];
+      run.leafPr = fixtureLeafPr(run, fields);
+      run.continuation = { id: "prior-delivery", step: "done", outcome: "completed", head: "candidate", completedAt: timestamp,
+        identity: { baseRef: "main", baseCommit: "base", branch: run.branch, evaluationFingerprint: run.fullMergeValidation.evaluationFingerprint,
+          remote: state.settings.remote, baseBranch: state.settings.baseBranch, pullRequest: { number: 1, head: "candidate", url: remote.url } } };
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
-    orchestrator.git = { resolveRef: async () => "candidate" };
+    orchestrator.git = { resolveRef: async (ref) => ref === "main" ? "base" : "candidate", tree: async (ref) => `${ref}-tree` };
+    installLeafPrFixtureTransport(orchestrator.git, { observe: async (_cwd, number) => { assert.equal(number, 1); return structuredClone(remote); } });
     let evaluationSuites = 0;
-    orchestrator.runCandidateEvaluations = async () => { evaluationSuites += 1; throw new Error("cache miss"); };
+    orchestrator.codex = { preflight: async () => { evaluationSuites += 1; throw new Error("cache miss"); }, evaluate: async () => { assert.fail("cached validation must not invoke an evaluator"); } };
     assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), false);
     await store.update((state) => { state.agentRuns[0].fullMergeValidation.qualified = true; });
     assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), true);
@@ -1753,16 +1883,25 @@ test("a definition-version change invalidates cached full leaf qualification", a
     await store.init();
     const timestamp = new Date().toISOString();
     const rubric = { id: "compile", name: "Compile", prompt: "Score", weight: 1 };
+    const fields = { title: "Cached leaf", body: "Prior qualification", isDraft: true, state: "OPEN" };
+    const remote = { ...fields, number: 1, url: "https://example.test/pull/1", headRefName: "burner/leaf", headRefOid: "candidate",
+      mergeable: "MERGEABLE", statusCheckRollup: [] };
     await store.update((state) => {
       state.evaluations = [{ ...rubric, definitionVersion: "new", enabled: true, createdAt: timestamp }];
       state.agentRuns = [{
         id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp,
-        prNumber: 1, prState: "open", baseCommit: "base", deltas: [], resources: [], reviewRounds: [],
+        prNumber: 1, prUrl: remote.url, prState: "open", baseRef: "main", baseCommit: "base", deltas: [], resources: [], reviewRounds: [],
         fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: JSON.stringify({ candidateEvaluationProtocol: "baseline-anchored-v4-independent-baseline", threshold: 0, evaluations: [{ id: rubric.id, name: rubric.name, definitionVersion: "old", prompt: rubric.prompt, weight: rubric.weight }] }), qualified: true, completedAt: timestamp },
       }];
+      const run = state.agentRuns[0];
+      run.leafPr = fixtureLeafPr(run, fields);
+      run.continuation = { id: "prior-delivery", step: "done", outcome: "completed", head: "candidate", completedAt: timestamp,
+        identity: { baseRef: "main", baseCommit: "base", branch: run.branch, evaluationFingerprint: run.fullMergeValidation.evaluationFingerprint,
+          remote: state.settings.remote, baseBranch: state.settings.baseBranch, pullRequest: { number: 1, head: "candidate", url: remote.url } } };
     });
     const orchestrator = new Orchestrator(root, store, new EventHub());
-    orchestrator.git = { resolveRef: async () => "candidate", createExistingWorktree: async () => { throw new Error("fresh validation required"); } };
+    orchestrator.git = { resolveRef: async (ref) => ref === "main" ? "base" : "candidate", createExistingWorktree: async () => { throw new Error("fresh validation required"); } };
+    installLeafPrFixtureTransport(orchestrator.git, { observe: async (_cwd, number) => { assert.equal(number, 1); return structuredClone(remote); } });
     await assert.rejects(orchestrator.fullyValidateLeafForMerge("leaf", "base"), /fresh validation required/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1841,10 +1980,10 @@ test("YOLO yields a long review loop while an approved fallback can still use th
 
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     let reviewed = false;
-    orchestrator.refreshAgentEvidence = async () => ({ threadId: "thread", message: "No measured artifacts" });
+    orchestrator.git = { head: async () => "candidate", hasChanges: async () => false };
     orchestrator.codex = { review: async () => { reviewed = true; throw new Error("review should not start"); } };
     await assert.rejects(
-      () => orchestrator.reviewAgent(root, "current", "Current", "main", "thread", store.get().settings),
+      () => reviewLeaf(orchestrator, root, "current", "Current", "main", "thread", store.get().settings),
       /yielded its slot to preserve the merge cadence reserve/,
     );
     assert.equal(reviewed, false, "cadence yield must happen before another expensive review starts");
@@ -1852,7 +1991,7 @@ test("YOLO yields a long review loop while an approved fallback can still use th
     orchestrator.git = { isPrDraft: async () => true };
     orchestrator.codex = { review: async () => { reviewed = true; throw new Error("draft-gated review reached"); } };
     await assert.rejects(
-      () => orchestrator.reviewAgent(root, "current", "Current", "main", "thread", store.get().settings),
+      () => reviewLeaf(orchestrator, root, "current", "Current", "main", "thread", store.get().settings),
       /draft-gated review reached/,
     );
     assert.equal(reviewed, true, "an owner-gated draft fallback cannot justify cadence-yielding new work");
@@ -1861,7 +2000,7 @@ test("YOLO yields a long review loop while an approved fallback can still use th
     await store.update((state) => { state.orchestrator.enabled = false; });
     orchestrator.codex = { review: async () => { reviewed = true; throw new Error("paused review reached"); } };
     await assert.rejects(
-      () => orchestrator.reviewAgent(root, "current", "Current", "main", "thread", store.get().settings),
+      () => reviewLeaf(orchestrator, root, "current", "Current", "main", "thread", store.get().settings),
       /paused review reached/,
     );
     assert.equal(reviewed, true, "pausing must let an in-flight or explicitly resumed review finish instead of cadence-yielding it");
@@ -2137,7 +2276,7 @@ test("living-composite experiments reserve cadence against the mergeable main-ba
     let reviewed = false;
     orchestrator.codex = { review: async () => { reviewed = true; throw new Error("review should not start"); } };
     await assert.rejects(
-      () => orchestrator.reviewAgent(root, "experiment", "Experiment", "burner/living", "thread", store.get().settings),
+      () => reviewLeaf(orchestrator, root, "experiment", "Experiment", "burner/living", "thread", store.get().settings),
       /yielded its slot to preserve the merge cadence reserve/,
     );
     assert.equal(reviewed, false, "a living experiment must yield review time to its main-based composite fallback");
@@ -2687,22 +2826,24 @@ test("agent retry preserves review history and applies unresolved feedback befor
     orchestrator.git = {
       resolveRef: async () => "base",
       head: async () => "candidate",
-      hasChanges: (() => { let calls = 0; return async () => ++calls > 1; })(),
+      hasChanges: async () => false,
       commit: async () => "fixed",
     };
+    leafGitEffects(orchestrator, root, "main", "base", "burner/durability");
     let revised;
-    orchestrator.codex = { revise: async (_cwd, threadId, review) => { revised = { threadId, review }; return { threadId: "thread-2", message: "Fixed fsync" }; } };
-    let delivered;
-    orchestrator.reviewAndDeliverAgent = async (_idea, _base, runId, _worktree, _branch, _settings, threadId, message) => {
-      delivered = { threadId, message };
-      await store.update((state) => { const run = state.agentRuns.find((item) => item.id === runId); if (run) run.status = "completed"; });
+    orchestrator.codex = {
+      revise: async (_cwd, threadId, review) => { revised = { threadId, review }; return { threadId: "thread-2", message: "Fixed fsync" }; },
+      refreshAgentEvidence: async () => ({ threadId: "thread-2", message: "Evidence" }),
+      review: async () => ({ approved: true, summary: "Approved", findings: [] }),
     };
+    let delivered;
+    finishLeafDeliveryForTest(orchestrator, async (_idea, _base, run) => { delivered = { threadId: run.authorThreadId, message: run.lastMessage }; });
     await orchestrator.retryAgent("agent");
     const run = store.get().agentRuns.find((item) => item.id === "agent");
     assert.equal(revised.threadId, "thread-1");
     assert.equal(revised.review.findings[0].title, "Data loss");
     assert.deepEqual(delivered, { threadId: "thread-2", message: "Fixed fsync" });
-    assert.equal(run.reviewRounds.length, 1);
+    assert.equal(run.reviewRounds.length, 2);
     assert.equal(run.reviewRounds[0].authorResponse, "Fixed fsync");
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -2714,37 +2855,31 @@ test("latest-base refresh reuses the reviewed run, branch, and pull request", as
   try {
     const store = new StateStore(root);
     await store.init();
+    const f = await leafRefreshRepository(root, { branch: "burner/keep-pr", published: true });
+    await f.git.removeWorktree(f.worktree);
     const timestamp = new Date().toISOString();
+    const fields = { title: "Keep the PR", body: "Reviewed checkpoint", isDraft: true, state: "OPEN" };
     await store.update((state) => {
       state.evaluations = [];
       state.ideas.push({ id: "idea", title: "Keep the PR", description: "Refresh it", rationale: "No replacements", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "replacement" });
       state.agentRuns.push({
         id: "original", ideaId: "idea", status: "completed", branch: "burner/keep-pr", worktree: join(root, "removed"),
         startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1", lastMessage: "done",
-        baseRef: "main", baseCommit: "old-base", prNumber: 42, prUrl: "https://example.test/pull/42", prState: "closed",
+        baseRef: "main", baseCommit: f.base, prNumber: 42, prUrl: "https://example.test/pull/42", prState: "open",
         reviewApproved: true,
-        reviewRounds: [{ id: "review-1", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
+        reviewRounds: [{ id: "review-1", round: 1, commit: f.head, approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
       });
+      state.agentRuns[0].leafPr = fixtureLeafPr(state.agentRuns[0], fields, { historical: true });
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
-    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
-    orchestrator.restoreBurnerProgressFromCommit = async () => false;
-    const merged = [];
-    const pushed = [];
-    orchestrator.git = {
-      resolveRef: async () => "new-base",
-      head: async (cwd) => { if (cwd.endsWith("removed")) throw new Error("missing"); return "refreshed-head"; },
-      createExistingWorktree: async () => root,
-      hasChanges: async () => false,
-      mergeBranch: async (_cwd, branch) => { merged.push(branch); return { merged: true, conflict: false }; },
-      push: async (_cwd, remote, branch) => { pushed.push(["plain", remote, branch]); },
-      forcePush: async (_cwd, remote, branch) => { pushed.push(["force", remote, branch]); },
-    };
+    orchestrator.git = f.git;
+    installLeafPrFixtureTransport(f.git, { observe: async () => ({ ...fields, number: 42, headRefName: "burner/keep-pr",
+      headRefOid: await f.git.remoteBranchHead(root, "origin", "burner/keep-pr"), url: "https://example.test/pull/42", mergeable: "MERGEABLE", statusCheckRollup: [] }) });
     const retried = [];
-    orchestrator.retryAgent = async (runId) => {
+    orchestrator.retryAgentWithClaim = async (runId, _options, claim, lease) => {
       retried.push(runId);
       orchestrator.activeAgents.delete("idea");
-      orchestrator.retryingAgentIds.delete(runId);
+      claim.release(); await lease.release();
       return store.get().agentRuns.find((run) => run.id === runId);
     };
 
@@ -2752,14 +2887,16 @@ test("latest-base refresh reuses the reviewed run, branch, and pull request", as
 
     const run = store.get().agentRuns.find((item) => item.id === "original");
     const idea = store.get().ideas.find((item) => item.id === "idea");
-    assert.deepEqual(merged, ["main"]);
-    assert.deepEqual(pushed, [["force", "origin", "burner/keep-pr"]]);
+    assert.deepEqual(f.calls.merges, [f.target]);
+    assert.deepEqual(f.calls.pushes.map((args) => [args[1], args[2], args[4]]), [["origin", "burner/keep-pr", f.head]]);
     assert.deepEqual(retried, ["original"]);
-    assert.equal(run.baseCommit, "new-base");
+    assert.equal(run.baseCommit, f.target);
     assert.equal(run.baseRef, "main");
     assert.equal(run.prNumber, 42);
     assert.equal(run.branch, "burner/keep-pr");
     assert.equal(idea.agentRunId, "original");
+    assert.equal(await fixtureGit(root, "rev-list", "--parents", "-n", "1", run.continuation.head), `${run.continuation.head} ${f.head} ${f.target}`);
+    assert.equal(run.reviewRounds.length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -2770,37 +2907,37 @@ test("latest-base refresh resumes a cadence-yielded checkpoint before re-review"
   try {
     const store = new StateStore(root);
     await store.init();
+    const f = await leafRefreshRepository(root, { branch: "burner/checkpoint", published: true });
     const timestamp = new Date().toISOString();
+    const fields = { title: "Keep the checkpoint", body: "Review yielded", isDraft: true, state: "OPEN" };
     await store.update((state) => {
       state.evaluations = [];
       state.ideas.push({ id: "idea", title: "Keep the checkpoint", description: "Refresh it", rationale: "No replacements", predictedImpact: 1, evaluationIds: [], resources: [], status: "failed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "run" });
       state.agentRuns.push({
-        id: "run", ideaId: "idea", status: "failed", branch: "burner/checkpoint", worktree: root,
+        id: "run", ideaId: "idea", status: "failed", branch: "burner/checkpoint", worktree: f.worktree,
         startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1", lastMessage: "fixed before yielding",
-        baseRef: "main", baseCommit: "old-base", prNumber: 42, prUrl: "https://example.test/pull/42", prState: "closed",
+        baseRef: "main", baseCommit: f.base, prNumber: 42, prUrl: "https://example.test/pull/42", prState: "open",
         reviewApproved: false,
-        reviewRounds: [{ id: "review-1", round: 1, commit: "older-head", approved: true, summary: "Approved before the final fix", findings: [], createdAt: timestamp, completedAt: timestamp }],
+        reviewRounds: [{ id: "review-1", round: 1, commit: f.base, approved: true, summary: "Approved before the final fix", findings: [], createdAt: timestamp, completedAt: timestamp }],
         error: "Portfolio agent yielded its slot to preserve the merge cadence reserve.",
         quarantinedAt: timestamp,
         quarantineReason: "Review yielded with 5 minutes left so fallback work can use the merge reserve.",
       });
+      state.agentRuns[0].leafPr = fixtureLeafPr(state.agentRuns[0], fields);
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
-    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
-    orchestrator.restoreBurnerProgressFromCommit = async () => false;
-    orchestrator.git = {
-      resolveRef: async () => "new-base",
-      head: async () => "checkpoint-head",
-      hasChanges: async () => false,
-      mergeBranch: async () => ({ merged: true, conflict: false }),
-      push: async () => undefined,
-      forcePush: async () => undefined,
-    };
+    orchestrator.git = f.git;
+    installLeafPrFixtureTransport(f.git, { observe: async () => ({ ...fields, number: 42, headRefName: "burner/checkpoint",
+      headRefOid: await f.git.remoteBranchHead(root, "origin", "burner/checkpoint"), url: "https://example.test/pull/42", mergeable: "MERGEABLE", statusCheckRollup: [] }) });
+    await store.update((state) => {
+      const run = state.agentRuns[0];
+      run.continuation = { id: "yielded", step: "evidence", head: f.head, identity: orchestrator.continuationIdentity(run, state, { number: 42, headRefOid: f.head }) };
+    });
     const retried = [];
-    orchestrator.retryAgent = async (runId) => {
+    orchestrator.retryAgentWithClaim = async (runId, _options, claim, lease) => {
       retried.push(runId);
       orchestrator.activeAgents.delete("idea");
-      orchestrator.retryingAgentIds.delete(runId);
+      claim.release(); await lease.release();
       return store.get().agentRuns.find((run) => run.id === runId);
     };
 
@@ -2808,7 +2945,7 @@ test("latest-base refresh resumes a cadence-yielded checkpoint before re-review"
 
     const run = store.get().agentRuns.find((item) => item.id === "run");
     assert.deepEqual(retried, ["run"]);
-    assert.equal(run.baseCommit, "new-base");
+    assert.equal(run.baseCommit, f.target);
     assert.equal(run.prNumber, 42);
     assert.equal(run.reviewApproved, false, "the refreshed checkpoint must be reviewed again");
     assert.equal(run.quarantinedAt, undefined);
@@ -2822,15 +2959,17 @@ test("latest-base refresh keeps a living-composite candidate on its parent branc
   try {
     const store = new StateStore(root);
     await store.init();
+    const f = await leafRefreshRepository(root, { branch: "burner/experiment", parentBranch: "burner/composite", published: true });
     const timestamp = new Date().toISOString();
+    const fields = { title: "Keep the experiment", body: "Parent checkpoint", isDraft: true, state: "OPEN" };
     await store.update((state) => {
       state.evaluations = [];
       state.ideas.push({ id: "idea", title: "Keep the experiment", description: "Refresh it", rationale: "No replacements", predictedImpact: 1, evaluationIds: [], resources: [], status: "failed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "run", baseCompositeId: "living" });
       state.agentRuns.push({
-        id: "run", ideaId: "idea", status: "failed", branch: "burner/experiment", worktree: root,
+        id: "run", ideaId: "idea", status: "failed", branch: "burner/experiment", worktree: f.worktree,
         startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1",
-        baseRef: "origin/burner/composite", baseCommit: "old-composite", parentCompositeId: "living",
-        prNumber: 42, prUrl: "https://example.test/pull/42", prState: "closed", reviewApproved: false,
+        baseRef: "origin/burner/composite", baseCommit: f.base, parentCompositeId: "living",
+        prNumber: 42, prUrl: "https://example.test/pull/42", prState: "open", reviewApproved: false,
         reviewRounds: [], error: "Portfolio agent yielded its slot to preserve the merge cadence reserve.",
         quarantinedAt: timestamp, quarantineReason: "Review yielded with 5 minutes left so fallback work can use the merge reserve.",
       });
@@ -2839,36 +2978,31 @@ test("latest-base refresh keeps a living-composite candidate on its parent branc
         sources: [], deltas: [], reviewRounds: [], reviewApproved: true, prNumber: 99, prUrl: "https://example.test/pull/99",
         createdAt: timestamp, updatedAt: timestamp, isLiving: true,
       });
+      state.agentRuns[0].leafPr = fixtureLeafPr(state.agentRuns[0], fields);
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
-    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
-    orchestrator.restoreBurnerProgressFromCommit = async () => false;
-    const fetched = [];
-    const merged = [];
-    orchestrator.git = {
-      fetchBranch: async (remote, branch) => { fetched.push([remote, branch]); return `${remote}/${branch}`; },
-      resolveRef: async (ref) => ref === "origin/burner/composite" ? "new-composite" : ref,
-      head: async () => "candidate-head",
-      hasChanges: async () => false,
-      mergeBranch: async (_cwd, branch) => { merged.push(branch); return { merged: true, conflict: false }; },
-      push: async () => undefined,
-      forcePush: async () => undefined,
-    };
-    orchestrator.retryAgent = async (runId) => {
+    orchestrator.git = f.git;
+    installLeafPrFixtureTransport(f.git, { observe: async () => ({ ...fields, number: 42, headRefName: "burner/experiment",
+      headRefOid: await f.git.remoteBranchHead(root, "origin", "burner/experiment"), url: "https://example.test/pull/42", mergeable: "MERGEABLE", statusCheckRollup: [] }) });
+    await store.update((state) => {
+      const run = state.agentRuns[0];
+      run.continuation = { id: "yielded", step: "evidence", head: f.head, identity: orchestrator.continuationIdentity(run, state, { number: 42, headRefOid: f.head }) };
+    });
+    orchestrator.retryAgentWithClaim = async (runId, _options, claim, lease) => {
       orchestrator.activeAgents.delete("idea");
-      orchestrator.retryingAgentIds.delete(runId);
+      claim.release(); await lease.release();
       return store.get().agentRuns.find((run) => run.id === runId);
     };
 
     await orchestrator.refreshAgentBaseAndRetry("run");
 
     const run = store.get().agentRuns.find((item) => item.id === "run");
-    assert.deepEqual(fetched, [["origin", "burner/composite"]]);
-    assert.deepEqual(merged, ["origin/burner/composite"]);
+    assert.deepEqual(f.calls.fetched, [["origin", "burner/composite"]]);
+    assert.deepEqual(f.calls.merges, [f.target]);
     assert.equal(run.baseRef, "origin/burner/composite");
-    assert.equal(run.baseCommit, "new-composite");
+    assert.equal(run.baseCommit, f.target);
     assert.equal(run.parentCompositeId, "living");
-    assert.match(store.get().activity[0].message, /composite PR #99/);
+    assert.equal(run.continuation.identity.baseCommit, f.target);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -2879,6 +3013,7 @@ test("latest-base refresh promotes an unpublished candidate after its parent com
   try {
     const store = new StateStore(root);
     await store.init();
+    const f = await leafRefreshRepository(root, { branch: "burner/experiment" });
     const timestamp = new Date().toISOString();
     await store.update((state) => {
       state.evaluations = [];
@@ -2888,11 +3023,11 @@ test("latest-base refresh promotes an unpublished candidate after its parent com
         createdAt: timestamp, updatedAt: timestamp, agentRunId: "run", baseCompositeId: "merged",
       });
       state.agentRuns.push({
-        id: "run", ideaId: "idea", status: "failed", branch: "burner/experiment", worktree: root,
+        id: "run", ideaId: "idea", status: "failed", branch: "burner/experiment", worktree: f.worktree,
         startedAt: timestamp, completedAt: timestamp, deltas: [], resources: ["living-merged"],
-        authorThreadId: "thread-1", baseRef: "origin/burner/composite", baseCommit: "old-composite",
+        authorThreadId: "thread-1", baseRef: "origin/burner/composite", baseCommit: f.base,
         parentCompositeId: "merged", reviewApproved: true,
-        reviewRounds: [{ id: "review-1", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
+        reviewRounds: [{ id: "review-1", round: 1, commit: f.head, approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
       });
       state.composites.push({
         id: "merged", title: "Merged", description: "", status: "merged", branch: "burner/composite", worktree: "",
@@ -2901,26 +3036,16 @@ test("latest-base refresh promotes an unpublished candidate after its parent com
       });
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
-    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
-    orchestrator.restoreBurnerProgressFromCommit = async () => false;
-    const merged = [];
-    const pushed = [];
     const requestedResources = [];
     const acquireResources = orchestrator.locks.tryAcquireAll.bind(orchestrator.locks);
     orchestrator.locks.tryAcquireAll = async (resources, owner) => {
       requestedResources.push([...resources]);
       return acquireResources(resources, owner);
     };
-    orchestrator.git = {
-      resolveRef: async (ref) => ref === "main" ? "new-main" : ref,
-      head: async () => "candidate-head",
-      hasChanges: async () => false,
-      mergeBranch: async (_cwd, branch) => { merged.push(branch); return { merged: true, conflict: false }; },
-      push: async (_cwd, remote, branch) => { pushed.push([remote, branch]); },
-    };
-    orchestrator.retryAgent = async (runId) => {
+    orchestrator.git = f.git;
+    orchestrator.retryAgentWithClaim = async (runId, _options, claim, lease) => {
       orchestrator.activeAgents.delete("idea");
-      orchestrator.retryingAgentIds.delete(runId);
+      claim.release(); await lease.release();
       return store.get().agentRuns.find((run) => run.id === runId);
     };
 
@@ -2928,10 +3053,10 @@ test("latest-base refresh promotes an unpublished candidate after its parent com
 
     const run = store.get().agentRuns.find((item) => item.id === "run");
     const idea = store.get().ideas.find((item) => item.id === "idea");
-    assert.deepEqual(merged, ["main"]);
-    assert.deepEqual(pushed, [["origin", "burner/experiment"]]);
+    assert.deepEqual(f.calls.merges, [f.target]);
+    assert.deepEqual(f.calls.pushes.map((args) => [args[1], args[2], args[4]]), [["origin", "burner/experiment", null]]);
     assert.equal(run.baseRef, "main");
-    assert.equal(run.baseCommit, "new-main");
+    assert.equal(run.baseCommit, f.target);
     assert.equal(run.parentCompositeId, undefined);
     assert.deepEqual(run.resources, []);
     assert.deepEqual(requestedResources, [[]], "do not reacquire an obsolete merged-parent lock");
@@ -2946,14 +3071,15 @@ test("latest-base refresh reuses an interrupted unpublished experiment before re
   try {
     const store = new StateStore(root);
     await store.init();
+    const f = await leafRefreshRepository(root, { branch: "burner/unpublished", parentBranch: "burner/composite" });
     const timestamp = new Date().toISOString();
     await store.update((state) => {
       state.evaluations = [];
       state.ideas.push({ id: "idea", title: "Keep unpublished work", description: "Refresh it", rationale: "No replacement", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", source: "manual", createdAt: timestamp, updatedAt: timestamp, agentRunId: "run" });
       state.agentRuns.push({
-        id: "run", ideaId: "idea", status: "failed", branch: "burner/unpublished", worktree: root,
+        id: "run", ideaId: "idea", status: "failed", branch: "burner/unpublished", worktree: f.worktree,
         startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1",
-        baseRef: "origin/burner/composite", baseCommit: "old-composite", parentCompositeId: "living",
+        baseRef: "origin/burner/composite", baseCommit: f.base, parentCompositeId: "living",
         reviewApproved: false, reviewRounds: [], error: "Burner stopped before this run completed.",
       });
       state.composites.push({
@@ -2963,22 +3089,12 @@ test("latest-base refresh reuses an interrupted unpublished experiment before re
       });
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
-    orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
-    orchestrator.restoreBurnerProgressFromCommit = async () => false;
-    const pushed = [];
-    orchestrator.git = {
-      fetchBranch: async (remote, branch) => `${remote}/${branch}`,
-      resolveRef: async () => "new-composite",
-      head: async () => "candidate-head",
-      hasChanges: async () => false,
-      mergeBranch: async () => ({ merged: true, conflict: false }),
-      push: async (_cwd, remote, branch) => { pushed.push([remote, branch]); },
-    };
+    orchestrator.git = f.git;
     const retried = [];
-    orchestrator.retryAgent = async (runId) => {
+    orchestrator.retryAgentWithClaim = async (runId, _options, claim, lease) => {
       retried.push(runId);
       orchestrator.activeAgents.delete("idea");
-      orchestrator.retryingAgentIds.delete(runId);
+      claim.release(); await lease.release();
       return store.get().agentRuns.find((run) => run.id === runId);
     };
 
@@ -2986,11 +3102,11 @@ test("latest-base refresh reuses an interrupted unpublished experiment before re
 
     const run = store.get().agentRuns.find((item) => item.id === "run");
     assert.equal(run.prNumber, undefined);
-    assert.equal(run.baseCommit, "new-composite");
-    assert.deepEqual(pushed, [["origin", "burner/unpublished"]]);
+    assert.equal(run.baseCommit, f.target);
+    assert.deepEqual(f.calls.pushes.map((args) => [args[1], args[2], args[4]]), [["origin", "burner/unpublished", null]]);
     assert.deepEqual(retried, ["run"]);
-    assert.match(store.get().activity[0].message, /Candidate branch refreshed/);
-    assert.match(store.get().activity[0].detail, /without creating a replacement pull request/);
+    assert.equal(run.continuation.step, "evidence");
+    assert.equal(run.continuation.identity.pullRequest, undefined, "refresh does not create a replacement PR");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -3002,50 +3118,54 @@ test("merge-gate retry recreates a delivered worktree and sends the failure to t
     const store = new StateStore(root);
     await store.init();
     const timestamp = new Date().toISOString();
+    const fields = { title: "Stable CLI", body: "Failed checks", isDraft: true, state: "OPEN" };
     await store.update((state) => {
       state.evaluations = [];
       state.ideas.push({ id: "idea", title: "Stable CLI", description: "Fix CLI", rationale: "CI", predictedImpact: 80, evaluationIds: [], resources: [], status: "failed", source: "manual", createdAt: timestamp, updatedAt: timestamp });
       state.agentRuns.push({
         id: "agent", ideaId: "idea", status: "failed", branch: "burner/stable-cli", worktree: join(root, "removed"),
         startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], authorThreadId: "thread-1",
-        baseRef: "main", baseCommit: "base", prNumber: 7, prUrl: "https://example.test/pr/7", prState: "closed",
+        baseRef: "main", baseCommit: "base", prNumber: 7, prUrl: "https://example.test/pr/7", prState: "open",
         error: "PR #7 required check failed: Rust quality gate", quarantinedAt: timestamp,
         quarantineReason: "Merge gate rejected PR #7: Rust quality gate failed.",
         reviewApproved: true,
         reviewRounds: [{ id: "review-1", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp }],
         fullMergeValidation: { baseCommit: "base", candidateCommit: "candidate", evaluationFingerprint: "old", qualified: true, completedAt: timestamp },
       });
+      state.agentRuns[0].leafPr = fixtureLeafPr(state.agentRuns[0], fields, { historical: true });
     });
     const orchestrator = new Orchestrator(root, store, new EventHub());
     orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
     let recreated = 0;
-    let changeChecks = 0;
     const reopened = [];
     orchestrator.git = {
       resolveRef: async () => "base",
       head: async (cwd) => { if (cwd.endsWith("removed")) throw new Error("missing"); return "candidate"; },
       createExistingWorktree: async () => { recreated += 1; return root; },
-      hasChanges: async () => ++changeChecks > 1,
+      hasChanges: async () => false,
       commit: async () => "fixed",
-      reopenPr: async (_cwd, number) => reopened.push(number),
+      reopenPr: async (_cwd, number) => { reopened.push(number); assert.fail("Leaf retry must never reopen a PR"); },
     };
+    leafGitEffects(orchestrator, root, "main", "base", "burner/stable-cli");
+    installLeafPrFixtureTransport(orchestrator.git, { observe: async () => ({ ...fields, number: 7, headRefName: "burner/stable-cli",
+      headRefOid: "candidate", url: "https://example.test/pr/7", mergeable: "MERGEABLE",
+      statusCheckRollup: [{ name: "Rust quality gate", status: "COMPLETED", conclusion: "FAILURE" }] }) });
     let retryReview;
     orchestrator.codex = {
       revise: async (_cwd, _threadId, review) => { retryReview = review; return { threadId: "thread-2", message: "Tolerated the expected broken pipe" }; },
+      refreshAgentEvidence: async () => ({ threadId: "thread-2", message: "Evidence" }),
+      review: async () => ({ approved: true, summary: "Approved", findings: [] }),
     };
-    orchestrator.reviewAndDeliverAgent = async (_idea, _base, runId, worktree) => {
-      assert.equal(worktree, root);
-      await store.update((state) => { const run = state.agentRuns.find((item) => item.id === runId); if (run) run.status = "completed"; });
-    };
+    finishLeafDeliveryForTest(orchestrator, async (_idea, _base, run) => { assert.equal(run.worktree, root); });
     await orchestrator.retryAgent("agent");
     const run = store.get().agentRuns.find((item) => item.id === "agent");
     assert.equal(recreated, 1);
-    assert.deepEqual(reopened, [7]);
+    assert.deepEqual(reopened, [], "retry retains the owned open PR rather than granting reopen authority");
     assert.equal(retryReview.findings[0].title, "Repair the failed merge gate");
     assert.match(retryReview.findings[0].detail, /Rust quality gate/);
     assert.equal(run.worktree, root);
     assert.equal(run.quarantinedAt, undefined);
-    assert.equal(run.fullMergeValidation, undefined);
+    assert.equal(latestFullAssessment(run).candidateCommit, "candidate", "historical full assessments are retained");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -3813,7 +3933,7 @@ test("longer GitHub check polling never accepts a different or failing head", as
     !(error instanceof TransientMergeGateError) && /Burner will not merge a failing head/.test(error.message));
 });
 
-test("leaf and composite merges poll the exact post-stamp candidate head", async () => {
+test("composite merges poll the stamped head while unreceipted legacy leaves cannot reach merge", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-merge-head-plumbing-test-"));
   try {
     const store = new StateStore(root);
@@ -3833,13 +3953,15 @@ test("leaf and composite merges poll the exact post-stamp candidate head", async
     const orchestrator = new Orchestrator(root, store, new EventHub());
     const merged = [];
     orchestrator.stampProgressBeforeMerge = async (kind) => `${kind}-post-stamp-head`;
-    orchestrator.git = { mergePr: async (...args) => merged.push(args) };
+    orchestrator.git = { resolveRef: async () => "candidate", mergePr: async (...args) => merged.push(args) };
     orchestrator.syncPullRequests = async () => undefined;
     await orchestrator.mergeComposite("composite");
-    await orchestrator.mergeAgent("leaf");
+    const beforeLeaf = structuredClone(store.get().agentRuns[0]);
+    await assert.rejects(orchestrator.mergeAgent("leaf"), /exact established leaf PR owner; legacy observations cannot supply authority/);
+    assert.deepEqual(store.get().agentRuns[0], beforeLeaf);
+    assert.equal(orchestrator.agentClaims.size, 0);
     assert.deepEqual(merged, [
       [root, 42, "composite-post-stamp-head"],
-      [root, 43, "agent-post-stamp-head"],
     ]);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -4648,7 +4770,7 @@ test("raw protocol failures defer the same reviewed leaf without quarantine or c
       state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
       state.agentRuns.push({
         id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp,
-        prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base",
+        prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base", leafQualificationPolicy: "ordinary",
         deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 81, delta: 1 }], impact: 1, resources: [], reviewRounds: [approvedRound], reviewApproved: true,
       });
     });
@@ -4673,34 +4795,46 @@ test("raw protocol failures defer the same reviewed leaf without quarantine or c
   }
 });
 
-test("hard direct-leaf merge-gate failures quarantine the leaf instead of retrying in a loop", async () => {
+test("hard direct-leaf merge-gate failures retain an owned quarantined draft without a close/reopen loop", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-leaf-merge-gate-test-"));
   try {
     const store = new StateStore(root);
     await store.init();
     const timestamp = new Date().toISOString();
     const approvedRound = { id: "review", round: 1, commit: "candidate", approved: true, summary: "Approved", findings: [], createdAt: timestamp, completedAt: timestamp };
+    const pr = { number: 10, url: "https://example.test/pull/10", headRefName: "burner/leaf", headRefOid: "candidate",
+      title: "Reviewed leaf", body: "Exact prior presentation", isDraft: false, state: "OPEN", mergeable: "MERGEABLE", statusCheckRollup: [] };
     await store.update((state) => {
       state.evaluations = [{ id: "quality", name: "Quality", prompt: "Score", weight: 1, enabled: true, createdAt: timestamp }];
       state.agentRuns.push({
         id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp,
-        prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base",
+        prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseRef: "main", baseCommit: "base", leafQualificationPolicy: "ordinary", authorThreadId: "thread",
         deltas: [{ evaluationId: "quality", name: "Quality", before: 80, after: 81, delta: 1 }], impact: 1, resources: [], reviewRounds: [approvedRound], reviewApproved: true,
       });
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 1 });
     const closed = [];
-    orchestrator.git = { resolveRef: async () => "base", closePr: async (_cwd, number, comment) => closed.push([number, comment]) };
+    const drafted = [];
+    orchestrator.git = { resolveRef: async (ref) => ref === "main" ? "base" : "candidate", closePr: async (_cwd, number) => closed.push(number) };
+    await store.update((state) => {
+      const run = state.agentRuns[0];
+      run.leafPr = fixtureLeafPr(run, { title: pr.title, body: pr.body, isDraft: false, state: "OPEN" });
+      run.continuation = { id: "done", head: "candidate", step: "done", outcome: "completed",
+        identity: orchestrator.continuationIdentity(run, state, { number: 10, headRefOid: "candidate", url: pr.url }) };
+    });
+    installLeafPrFixtureTransport(orchestrator.git, { observe: async () => ({ ...pr }),
+      draft: async (_cwd, number, isDraft) => { drafted.push([number, isDraft]); pr.isDraft = isDraft; } });
     let attempts = 0;
     orchestrator.mergeAgent = async () => { attempts += 1; throw new Error("required check failed at stamped-head"); };
 
     assert.equal(await orchestrator.autoMergeNext(), true);
     assert.equal(store.get().agentRuns[0].status, "failed");
-    assert.equal(store.get().agentRuns[0].prState, "closed");
+    assert.equal(store.get().agentRuns[0].prState, "open");
     assert.ok(store.get().agentRuns[0].quarantinedAt);
     assert.match(store.get().agentRuns[0].quarantineReason, /Merge gate rejected PR #10/);
-    assert.deepEqual(closed.map(([number]) => number), [10]);
-    assert.match(closed[0][1], /retry the failed run to repair the same PR/i);
+    assert.deepEqual(closed, []);
+    assert.deepEqual(drafted, [[10, true]]);
+    assert.equal(store.get().agentRuns[0].leafPr.known.fields.isDraft, true);
     assert.equal(await orchestrator.autoMergeNext(), false);
     assert.equal(attempts, 1, "the same failed leaf head must not be retried automatically");
   } finally {
@@ -4770,7 +4904,7 @@ test("direct YOLO fully validates relaxed fallback leaves before merge", async (
 
 for (const [name, moveBase] of [
   ["cadence-driven single leaves receive full evaluation validation before merge", false],
-  ["fresh full leaf validation rejects a moved base and cleans its worktree and lock", true],
+  ["fresh full leaf validation rejects a moved base and retains completed evidence while releasing locks", true],
 ]) {
   test(name, async () => {
     const root = await mkdtemp(join(tmpdir(), "burner-full-leaf-validation-test-"));
@@ -4783,16 +4917,19 @@ for (const [name, moveBase] of [
         state.evaluations = [{ id: "bench", name: "Benchmark", prompt: "Measure", command: "full", screeningCommand: "quick", weight: 1, enabled: true, createdAt: timestamp }];
         state.evaluationRuns.push({ id: "baseline", evaluationId: "bench", score: 90, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" });
         state.ideas.push({ id: "idea", title: "Fast leaf", description: "Improve", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "leaf" });
-        state.agentRuns.push({ id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp, prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base", deltas: [{ evaluationId: "bench", name: "Benchmark", before: 80, after: 100, delta: 20, screening: true }], impact: 20, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
+        state.agentRuns.push({ id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp, prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseRef: "main", baseCommit: "base", leafQualificationPolicy: "separate-full", deltas: [{ evaluationId: "bench", name: "Benchmark", before: 80, after: 100, delta: 20, screening: true }], impact: 20, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
+        state.agentRuns[0].leafPr = fixtureLeafPr(state.agentRuns[0], { title: "Old", body: "Old", isDraft: true, state: "OPEN" }, { historical: true });
       });
       const originalRun = structuredClone(store.get().agentRuns[0]);
       const worktree = join(root, "full-leaf-worktree");
       const edited = [];
       const removed = [];
+      const pr = { number: 10, state: "OPEN", headRefName: "burner/leaf", headRefOid: "candidate", title: "Old", body: "Old", isDraft: true,
+        url: "https://example.test/pull/10", mergeable: "MERGEABLE", statusCheckRollup: [] };
       let currentBase = "base";
       const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
       orchestrator.git = {
-        createExistingWorktree: async () => { await mkdir(worktree); return worktree; },
+        createExistingWorktree: async () => { await mkdir(worktree, { recursive: true }); return worktree; },
         removeWorktree: async (path) => {
           assert.equal(path, worktree);
           assert.deepEqual(await orchestrator.locks.list(), ["git-metadata"]);
@@ -4800,28 +4937,38 @@ for (const [name, moveBase] of [
           await rm(path, { recursive: true });
         },
         resolveRef: async (ref) => ref === "main" ? currentBase : "candidate",
-        editPr: async (...args) => edited.push(args),
+        head: async () => "candidate", hasChanges: async () => false, tree: async () => "candidate-tree", assertWorktree: async () => undefined,
       };
-      orchestrator.runCandidateEvaluations = async (context, cwd) => {
-        assert.equal(context, "composite");
-        assert.equal(cwd, worktree);
-        if (moveBase) currentBase = "new-base";
-        return [{ id: "full", evaluationId: "bench", score: 95, summary: "full", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" }];
+      installLeafPrFixtureTransport(orchestrator.git, { observe: async () => ({ ...pr }),
+        edit: async (_cwd, number, field, value) => { edited.push([number, field, value]); pr[field] = value; } });
+      orchestrator.codex = {
+        preflight: async () => undefined,
+        evaluate: async (cwd, _evaluation, _settings, context) => {
+          assert.equal(context, "composite");
+          assert.equal(cwd, worktree);
+          if (moveBase) currentBase = "new-base";
+          return { score: 95, summary: "full", evidence: [], suggestions: [] };
+        },
       };
       await orchestrator.locks.init();
-      assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), !moveBase);
+      if (moveBase) await assert.rejects(orchestrator.fullyValidateLeafForMerge("leaf", "base"), /clean pinned Git identity/);
+      else assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), true);
       const run = store.get().agentRuns[0];
       if (moveBase) {
         assert.equal(run.fullMergeValidation, undefined);
-        assert.deepEqual(run, originalRun, "a moved base must not replace the candidate's existing measurements");
+        assert.equal(run.worktree, worktree, "the retained full owner checkout is durably bound for refresh");
+        assert.deepEqual({ ...run, fullEvaluation: undefined }, { ...originalRun, worktree, fullEvaluation: undefined }, "a moved base must not replace the candidate's existing measurements");
+        assert.equal(run.fullEvaluation.step, "sampling");
+        assert.ok(run.fullEvaluation.evaluation.evaluations[0].candidate[0].success);
         assert.deepEqual(edited, []);
       } else {
         assert.deepEqual(run.deltas.map(({ before, after, delta, screening }) => ({ before, after, delta, screening })), [{ before: 90, after: 95, delta: 5, screening: false }]);
-        assert.equal(edited.length, 1);
-        assert.doesNotMatch(edited[0][3], /leaf screen/);
+        assert.deepEqual(edited.map(([, field]) => field), ["title", "body"]);
+        assert.doesNotMatch(edited.find(([, field]) => field === "body")[2], /leaf screen/);
       }
-      assert.deepEqual(removed, [worktree]);
-      await assert.rejects(readdir(worktree), { code: "ENOENT" });
+      assert.deepEqual(removed, moveBase ? [] : [worktree]);
+      if (!moveBase) await assert.rejects(readdir(worktree), { code: "ENOENT" });
+      else assert.ok(await readdir(worktree));
       assert.deepEqual(await orchestrator.locks.list(), []);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -4846,49 +4993,46 @@ test("cadence-driven leaf validation symmetrically confirms prompt changes witho
         { id: "baseline-quality", evaluationId: "quality", score: 50, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" },
       );
       state.ideas.push({ id: "idea", title: "Stable leaf", description: "Improve", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "leaf" });
-      state.agentRuns.push({ id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp, prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseCommit: "base", deltas: [], impact: 1, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
+      state.agentRuns.push({ id: "leaf", ideaId: "idea", status: "completed", branch: "burner/leaf", worktree: "", startedAt: timestamp, completedAt: timestamp, prNumber: 10, prUrl: "https://example.test/pull/10", prState: "open", baseRef: "main", baseCommit: "base", deltas: [], impact: 1, resources: [], reviewRounds: [approvedRound], reviewApproved: true });
+      state.agentRuns[0].leafPr = fixtureLeafPr(state.agentRuns[0], { title: "Old", body: "Old", isDraft: true, state: "OPEN" }, { historical: true });
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    const worktree = join(root, "candidate");
+    await mkdir(worktree);
+    const pr = { number: 10, state: "OPEN", headRefName: "burner/leaf", headRefOid: "candidate", title: "Old", body: "Old", isDraft: true,
+      url: "https://example.test/pull/10", mergeable: "MERGEABLE", statusCheckRollup: [] };
     orchestrator.git = {
-      createExistingWorktree: async () => root,
+      createExistingWorktree: async () => worktree,
       removeWorktree: async () => undefined,
-      resolveRef: async () => "base",
-      editPr: async () => undefined,
+      resolveRef: async (ref) => ref === "main" ? "base" : "candidate",
+      head: async (cwd) => cwd === root ? "base" : "candidate", hasChanges: async () => false, tree: async () => "candidate-tree", assertWorktree: async () => undefined,
     };
-    orchestrator.runCandidateEvaluations = async () => [
-      { id: "full-bench", evaluationId: "bench", score: 95, summary: "full", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" },
-      { id: "quality-first", evaluationId: "quality", score: 45, summary: "noisy low", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" },
-    ];
-    const candidateScores = [50, 55];
+    installLeafPrFixtureTransport(orchestrator.git, { observe: async () => ({ ...pr }), edit: async (_cwd, _number, field, value) => { pr[field] = value; } });
+    const candidateScores = [45, 50, 55];
     const baselineScores = [50, 45];
-    const confirmationCalls = [];
-    orchestrator.runEvaluations = async (context, _cwd, agentRunId, compositeId, evaluationIds) => {
-      assert.deepEqual(evaluationIds, ["quality"], "the command-backed benchmark must not be rerun or averaged");
-      confirmationCalls.push({ context, agentRunId, compositeId });
-      if (context === "baseline") {
-        assert.equal(agentRunId, undefined);
-        assert.equal(compositeId, undefined);
-        const score = baselineScores.shift();
-        return [{ id: `baseline-quality-${confirmationCalls.length}`, evaluationId: "quality", score, summary: "baseline confirmation", commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "baseline" }];
-      }
-      assert.equal(context, "composite");
-      assert.equal(agentRunId, "leaf");
-      assert.equal(compositeId, undefined);
-      const score = candidateScores.shift();
-      return [{ id: `quality-${confirmationCalls.length}`, evaluationId: "quality", score, summary: "candidate confirmation", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", agentRunId: "leaf" }];
+    const calls = [];
+    orchestrator.codex = {
+      preflight: async () => undefined,
+      evaluate: async (_cwd, evaluation, _settings, context) => {
+        calls.push({ evaluationId: evaluation.id, context });
+        const score = evaluation.id === "bench" ? 95 : context === "baseline" ? baselineScores.shift() : candidateScores.shift();
+        return { score, summary: context === "baseline" ? "baseline confirmation" : "candidate measurement", evidence: [], suggestions: [] };
+      },
     };
     await orchestrator.locks.init();
     assert.equal(await orchestrator.fullyValidateLeafForMerge("leaf", "base"), true);
-    assert.equal(confirmationCalls.filter((call) => call.context === "composite").length, 2);
-    assert.equal(confirmationCalls.filter((call) => call.context === "baseline").length, 2);
+    assert.equal(calls.filter((call) => call.evaluationId === "bench").length, 1, "commands are neither rerun nor averaged");
+    assert.equal(calls.filter((call) => call.evaluationId === "quality" && call.context === "composite").length, 3);
+    assert.equal(calls.filter((call) => call.context === "baseline").length, 2);
     assert.deepEqual(store.get().agentRuns[0].deltas.map(({ evaluationId, delta }) => ({ evaluationId, delta })), [
       { evaluationId: "bench", delta: 5 },
       { evaluationId: "quality", delta: 0 },
     ]);
     assert.equal(store.latestRuns().get("quality").score, 50);
     assert.equal(store.latestRuns().get("quality").promptSampleCount, 3);
-    assert.ok(store.get().activity.some((item) => item.message === "Confirming 1 prompt change for PR #10"));
-    assert.ok(store.get().activity.some((item) => item.detail.includes("both the baseline and candidate")));
+    const receipt = latestFullAssessment(store.get().agentRuns[0]).evaluation;
+    assert.equal(receipt.evaluations.find((entry) => entry.evaluationId === "quality").candidate.length, 3);
+    assert.equal(receipt.evaluations.find((entry) => entry.evaluationId === "quality").baselineConfirmations.length, 2);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -5260,7 +5404,7 @@ test("YOLO portfolio caps reviews, quarantines the implicated leaf, and queues s
     const store = new StateStore(root);
     await store.init();
     const timestamp = new Date().toISOString();
-    const run = (id, number, impact) => ({ id, ideaId: `idea-${id}`, status: "completed", branch: `branch-${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp, prUrl: `https://example.test/pull/${number}`, prNumber: number, prState: "open", baseCommit: "base", deltas: [], impact, resources: [], reviewRounds: [], reviewApproved: true });
+    const run = (id, number, impact) => ({ id, ideaId: `idea-${id}`, status: "completed", branch: `branch-${id}`, worktree: "", startedAt: timestamp, completedAt: timestamp, prUrl: `https://example.test/pull/${number}`, prNumber: number, prState: "open", baseRef: "main", baseCommit: "base", deltas: [], impact, resources: [], reviewRounds: [], reviewApproved: true });
     await store.update((state) => {
       state.settings.portfolioReviewRounds = 3;
       state.agentRuns.push(run("a", 1, 8), run("b", 2, 7), run("c", 3, 6), run("d", 4, 5), run("e", 5, 4), run("f", 6, 3), run("g", 7, 2), run("h", 8, 1));
@@ -5282,12 +5426,25 @@ test("YOLO portfolio caps reviews, quarantines the implicated leaf, and queues s
     const quarantined = [];
     const closed = [];
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    const remotes = new Map();
+    await store.update((state) => {
+      for (const run of state.agentRuns) {
+        const fields = { title: run.id, body: "Owned reviewed source", isDraft: true, state: "OPEN" };
+        const remote = { ...fields, number: run.prNumber, url: run.prUrl, headRefName: run.branch, headRefOid: `head-${run.id}`,
+          mergeable: "MERGEABLE", statusCheckRollup: [] };
+        remotes.set(run.prNumber, remote);
+        run.leafPr = fixtureLeafPr(run, fields);
+        run.continuation = { id: `done-${run.id}`, step: "done", outcome: "completed", head: remote.headRefOid, completedAt: timestamp,
+          identity: orchestrator.continuationIdentity(run, state, remote) };
+      }
+    });
     orchestrator.git = {
       resolveRef: async () => "base",
       changedFiles: async (_cwd, _base, head) => head.endsWith("branch-b") ? ["src/parser.ts"] : ["README.md"],
       markPrQuarantined: async (_cwd, number) => quarantined.push(number),
       closePr: async (_cwd, number) => closed.push(number),
     };
+    installLeafPrFixtureTransport(orchestrator.git, { observe: async (_cwd, number) => { assert.ok(remotes.has(number)); return structuredClone(remotes.get(number)); } });
     const fallbacks = [];
     orchestrator.createComposite = async (ids, title, description) => {
       const fallback = { ids, title, description, id: `fallback-${fallbacks.length + 1}` };
@@ -5302,6 +5459,9 @@ test("YOLO portfolio caps reviews, quarantines the implicated leaf, and queues s
     assert.deepEqual(fallbacks.map((fallback) => fallback.ids), [["a", "c", "d", "e"], ["f", "g", "h"]]);
     assert.deepEqual(quarantined, [2]);
     assert.deepEqual(closed, [100]);
+    assert.equal(state.agentRuns.find((item) => item.id === "b").leafPr.pending, undefined);
+    assert.equal(state.agentRuns.find((item) => item.id === "b").prState, "open", "quarantine retains the owned draft for a bounded retry");
+    assert.equal(orchestrator.agentClaims.size, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -5365,7 +5525,6 @@ test("YOLO portfolio opens a draft composite before review and bounds review rou
     });
     const opened = [];
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
-    orchestrator.refreshAgentEvidence = async () => ({ threadId: "thread", message: "No measured artifacts" });
     orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
     orchestrator.git = {
       push: async () => undefined,
@@ -5382,7 +5541,7 @@ test("YOLO portfolio opens a draft composite before review and bounds review rou
       review: async () => { reviewCalls += 1; return { approved: false, summary: "Not yet", findings: [{ severity: "high", title: "Bug", detail: "Fix", file: "src/app.ts" }] }; },
       revise: async () => ({ threadId: "thread", message: "revised" }),
     };
-    await assert.rejects(() => orchestrator.reviewAgent(root, "agent", "Agent", "main", "thread", store.get().settings), /bounded review budget/);
+    await assert.rejects(() => reviewLeaf(orchestrator, root, "agent", "Agent", "main", "thread", store.get().settings), /bounded review budget/);
     assert.equal(reviewCalls, 3);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -5405,7 +5564,6 @@ test("review budgets are live and cumulative for agents and composites", async (
     let reviewCalls = 0;
     let revisionCalls = 0;
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
-    orchestrator.refreshAgentEvidence = async () => ({ threadId: "thread", message: "No measured artifacts" });
     orchestrator.git = { head: async () => "head", hasChanges: async () => false };
     orchestrator.codex = {
       review: async () => {
@@ -5416,7 +5574,7 @@ test("review budgets are live and cumulative for agents and composites", async (
       revise: async () => { revisionCalls += 1; return { threadId: "thread", message: "revised" }; },
     };
 
-    await assert.rejects(() => orchestrator.reviewAgent(root, "agent", "Agent", "main", "thread", capturedSettings), /bounded review budget/);
+    await assert.rejects(() => reviewLeaf(orchestrator, root, "agent", "Agent", "main", "thread", capturedSettings), /bounded review budget/);
     assert.equal(reviewCalls, 1);
     assert.equal(revisionCalls, 0);
     assert.equal(store.get().agentRuns[0].reviewRounds.length, 2);
@@ -5428,40 +5586,68 @@ test("review budgets are live and cumulative for agents and composites", async (
   }
 });
 
-test("retrying a failed composite preserves its cumulative review history", async () => {
-  const root = await mkdtemp(join(tmpdir(), "burner-composite-retry-budget-test-"));
-  try {
-    const store = new StateStore(root);
-    await store.init();
-    const timestamp = new Date().toISOString();
-    await store.update((state) => {
-      state.agentRuns.push({
-        id: "closed-source", ideaId: "idea", status: "failed", branch: "source", worktree: "", startedAt: timestamp,
-        completedAt: timestamp, prNumber: 9, prState: "closed", deltas: [], resources: [], reviewRounds: [],
+test("retrying a failed composite preserves its cumulative review history", async (t) => {
+  for (const closedSource of [false, true]) await t.test(closedSource ? "CLOSED source is not reopened or scheduled" : "owned OPEN sources retain review history", async () => {
+    const root = await mkdtemp(join(tmpdir(), "burner-composite-retry-budget-test-"));
+    try {
+      const store = new StateStore(root);
+      await store.init();
+      const timestamp = new Date().toISOString();
+      const remotes = new Map();
+      const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
+      await store.update((state) => {
+        for (const [id, number] of [["source", 9], ["other", 11]]) {
+          const fields = { title: id, body: "Owned completed source", isDraft: true, state: closedSource && id === "source" ? "CLOSED" : "OPEN" };
+          const remote = { ...fields, number, url: `https://example.test/pull/${number}`, headRefName: id, headRefOid: `${id}-head`,
+            mergeable: "MERGEABLE", statusCheckRollup: [] };
+          remotes.set(number, remote);
+          const run = { id, ideaId: `idea-${id}`, status: "completed", branch: id, worktree: "", startedAt: timestamp,
+            completedAt: timestamp, prNumber: number, prUrl: remote.url, prState: fields.state.toLowerCase(),
+            baseRef: "main", baseCommit: "base", deltas: [], resources: [], reviewRounds: [] };
+          run.leafPr = fixtureLeafPr(run, fields);
+          run.continuation = { id: `done-${id}`, step: "done", outcome: "completed", head: remote.headRefOid, completedAt: timestamp,
+            identity: orchestrator.continuationIdentity(run, state, remote) };
+          state.agentRuns.push(run);
+        }
+        state.composites.push({
+          id: "failed", title: "Failed", description: "Combined", status: "failed", branch: "composite", worktree: root,
+          sources: [
+            { agentRunId: "source", prNumber: 9, title: "Owned source", branch: "source", kind: "pull_request" },
+            { agentRunId: "other", prNumber: 11, title: "Other source", branch: "other", kind: "pull_request" },
+          ],
+          deltas: [], reviewRounds: [{ id: "review-1", round: 1, commit: "head", approved: false, summary: "Blocked", findings: [], createdAt: timestamp }],
+          prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: false,
+        });
       });
-      state.composites.push({
-        id: "failed", title: "Failed", description: "Combined", status: "failed", branch: "composite", worktree: root,
-        sources: [
-          { agentRunId: "closed-source", prNumber: 9, title: "Closed source", branch: "source", kind: "pull_request" },
-          { agentRunId: "experiment", title: "Absorbed experiment", branch: "experiment", kind: "experiment" },
-        ],
-        deltas: [], reviewRounds: [{ id: "review-1", round: 1, commit: "head", approved: false, summary: "Blocked", findings: [], createdAt: timestamp }],
-        prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: false,
-      });
-    });
-    const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
-    const reopened = [];
-    orchestrator.git = { reopenPr: async (_cwd, number) => reopened.push(number) };
-    orchestrator.scheduleComposites = async () => undefined;
-    await orchestrator.retryComposite("failed");
-    assert.deepEqual(reopened, [9, 10]);
-    assert.equal(store.get().composites[0].status, "rebuilding");
-    assert.equal(store.get().composites[0].rebuildMode, "resume");
-    assert.equal(store.get().composites[0].reviewRounds.length, 1);
-    assert.equal(store.get().agentRuns[0].prState, "open", "retrying the composite restores its tracked source draft before reconciliation");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+      const reopened = [];
+      let scheduled = 0;
+      orchestrator.git = { reopenPr: async (_cwd, number) => reopened.push(number),
+        resolveRef: async (ref) => ref === "main" ? "base" : ["source", "other"].includes(ref) ? `${ref}-head` : assert.fail(`Unexpected ref ${ref}`) };
+      installLeafPrFixtureTransport(orchestrator.git, { observe: async (_cwd, number) => { assert.ok(remotes.has(number)); return structuredClone(remotes.get(number)); } });
+      orchestrator.scheduleComposites = async () => { scheduled += 1; };
+      const beforeSources = structuredClone(store.get().agentRuns);
+      const beforeComposite = structuredClone(store.get().composites[0]);
+      if (closedSource) {
+        await assert.rejects(orchestrator.retryComposite("failed"), /already OPEN owned leaf sources; it cannot reopen or adopt them/);
+        assert.deepEqual(reopened, []);
+        assert.equal(scheduled, 0);
+        assert.deepEqual(store.get().composites[0], beforeComposite);
+        assert.deepEqual(store.get().agentRuns, beforeSources);
+        assert.equal(orchestrator.agentClaims.size, 0);
+        return;
+      }
+      await orchestrator.retryComposite("failed");
+      assert.deepEqual(reopened, [10], "only the failed composite may be reopened");
+      assert.equal(scheduled, 1);
+      assert.equal(store.get().composites[0].status, "rebuilding");
+      assert.equal(store.get().composites[0].rebuildMode, "resume");
+      assert.deepEqual(store.get().composites[0].reviewRounds, beforeComposite.reviewRounds);
+      assert.deepEqual(store.get().agentRuns, beforeSources, "retrying the composite preserves both established OPEN sources");
+      assert.equal(orchestrator.agentClaims.size, 0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 test("retrying an interrupted incremental composite preserves its pending experiment", async () => {
@@ -5498,7 +5684,7 @@ test("retrying an interrupted incremental composite preserves its pending experi
   }
 });
 
-test("PR synchronization retires untracked Burner PRs and failed composites", async () => {
+test("PR synchronization preserves unknown leaf and orphan ownership while retiring tracked failed composites", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-orphan-pr-test-"));
   try {
     const store = new StateStore(root);
@@ -5596,32 +5782,22 @@ test("PR synchronization retires untracked Burner PRs and failed composites", as
       markPrDisposition: async () => undefined,
     };
 
+    const before = structuredClone(store.get().agentRuns);
     await orchestrator.syncPullRequests(true);
 
-    assert.deepEqual(closed.map(([number]) => number), [200, 201, 9, 10, 100, 3, 4, 5, 6]);
-    assert.match(closed.find(([number]) => number === 200)[1], /no longer represented/);
+    assert.deepEqual(closed.map(([number]) => number), [100], "only the already tracked composite has cleanup authority");
     assert.match(closed.find(([number]) => number === 100)[1], /failed composite/);
     assert.equal(store.get().composites[0].prNumber, 100, "an interrupted publication must be recovered by its exact branch before cleanup");
     assert.equal(store.get().composites[0].status, "failed", "retirement must preserve explicit retry state");
-    assert.equal(store.get().agentRuns.find((item) => item.id === "a").prState, "open", "tracked source leaves remain available for fallback");
-    assert.equal(store.get().agentRuns.find((item) => item.id === "b").prState, "open", "tracked source leaves remain available for fallback");
-    assert.equal(store.get().agentRuns.find((item) => item.id === "gate").prState, "closed", "hard-gate failures are retired on reconciliation");
-    assert.equal(store.get().agentRuns.find((item) => item.id === "yielded").prState, "closed", "cadence-yielded drafts are retired on reconciliation");
-    assert.equal(store.get().agentRuns.find((item) => item.id === "ci-failed").status, "failed", "completed leaves with terminal CI failures are failed during reconciliation");
-    assert.equal(store.get().agentRuns.find((item) => item.id === "ci-failed").prState, "closed", "completed leaves with terminal CI failures are retired during reconciliation");
-    assert.match(store.get().agentRuns.find((item) => item.id === "ci-failed").quarantineReason, /Merge gate rejected PR #5/);
-    assert.equal(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").status, "failed", "completed leaves rejected by exact-head full validation are failed during reconciliation");
-    assert.equal(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").prState, "closed", "fully evaluated rejected leaves are retired instead of orphaned open");
-    assert.equal(store.get().agentRuns.find((item) => item.id === "absorbed-experiment").prState, "closed", "absorbed experiment checkpoints are retired after their change moves into the composite");
-    assert.equal(store.get().agentRuns.find((item) => item.id === "rejected-experiment").prState, "closed", "rejected experiment checkpoints are retired instead of orphaned open");
-    assert.match(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").error, /Benchmark integrity -8\.0/);
-    assert.match(closed.find(([number]) => number === 6)[1], /retry the failed run to repair the same PR/i);
-    assert.equal(store.get().agentRuns.find((item) => item.id === "reserved-rejected").status, "completed", "an active composite protects a source from leaf-only full-validation retirement");
-    assert.equal(store.get().agentRuns.find((item) => item.id === "reserved-rejected").prState, "open");
-    assert.equal(store.get().agentRuns.find((item) => item.id === "reserved-failed").prState, "open", "an active composite protects an already-failed source until the composite resolves");
+    assert.deepEqual(store.get().agentRuns, before, "list state, labels, old scores and mutable membership cannot adopt or retire an unowned leaf");
+    assert.equal(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").fullMergeValidation.qualified, false);
+    assert.equal(store.get().agentRuns.find((item) => item.id === "full-validation-rejected").error, undefined);
     assert.equal(store.get().composites.find((item) => item.id === "validated").status, "open");
     assert.equal(store.get().composites.find((item) => item.id === "validated").sources.length, 2);
-    assert.match(closed.find(([number]) => number === 4)[1], /explicit retry will reopen this same PR/i);
+    const preserved = store.get().activity.find((item) => item.message === "Unknown apparent Burner PRs preserved");
+    assert.match(preserved.detail, /#200/);
+    assert.match(preserved.detail, /#201/);
+    assert.equal(store.get().activity.some((item) => /Leaf PR #\d+ has unknown historical ownership/.test(item.message)), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -5635,27 +5811,39 @@ test("review-budget exhaustion preserves leaf work as a quarantined draft PR", a
     const timestamp = new Date().toISOString();
     await store.update((state) => {
       state.ideas.push({ id: "idea", title: "Large feature", description: "Keep the work", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "failed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "run" });
-      state.agentRuns.push({ id: "run", ideaId: "idea", status: "failed", branch: "burner/feature", worktree: root, startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], reviewRounds: [{ id: "review", round: 12, commit: "head", approved: false, summary: "Blocked", findings: [{ severity: "high", title: "Race", detail: "Fix the race", file: "src/app.ts" }], createdAt: timestamp }], reviewApproved: false });
+      state.agentRuns.push({ id: "run", ideaId: "idea", status: "failed", branch: "burner/feature", worktree: root, startedAt: timestamp, completedAt: timestamp, deltas: [], resources: [], baseRef: "main", baseCommit: "base", reviewRounds: [{ id: "review", round: 12, commit: "head", approved: false, summary: "Blocked", findings: [{ severity: "high", title: "Race", detail: "Fix the race", file: "src/app.ts" }], createdAt: timestamp }], reviewApproved: false, continuation: {
+        id: "checkpoint", step: "author", reason: { kind: "review", roundId: "review" }, head: "head",
+        identity: { baseRef: "main", baseCommit: "base", branch: "burner/feature", evaluationFingerprint: fullMergeValidationFingerprint(state), remote: state.settings.remote, baseBranch: state.settings.baseBranch },
+      } });
     });
     const opened = [];
     const quarantined = [];
+    let pr;
+    let remoteHead = null;
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
     orchestrator.git = {
-      push: async () => undefined,
-      openPr: async (options) => { opened.push(options); return { url: "https://example.test/pull/12", number: 12 }; },
+      assertWorktree: async () => undefined, resolveRef: async (ref) => ref === "main" ? "base" : "head", head: async () => "head", hasChanges: async () => false,
+      remoteBranchHead: async () => remoteHead,
+      pushLeaf: async (_cwd, _remote, _branch, head, previous) => { assert.equal(previous, remoteHead); remoteHead = head; },
       markPrQuarantined: async (_cwd, number) => quarantined.push(number),
     };
-    await orchestrator.publishAgentCheckpoint(store.get().ideas[0], "run", root, "burner/feature", store.get().settings);
-    assert.equal(opened[0].draft, true);
+    installLeafPrFixtureTransport(orchestrator.git, { observe: async () => { assert.ok(pr); return { ...pr }; }, search: async () => pr ? [pr] : [],
+      create: async (options) => { opened.push(options); pr = { number: 12, url: "https://example.test/pull/12", headRefName: "burner/feature",
+        headRefOid: remoteHead, title: options.title, body: options.body, isDraft: options.isDraft, state: "OPEN", mergeable: "MERGEABLE", statusCheckRollup: [] }; return { url: pr.url, number: pr.number }; } });
+    const claim = orchestrator.claimAgents(["run"]);
+    try { await orchestrator.publishAgentCheckpoint(store.get().ideas[0], "run", root, "burner/feature", store.get().settings, claim); }
+    finally { claim.release(); }
+    assert.equal(opened[0].isDraft, true);
     assert.match(opened[0].body, /not approved, fully evaluated, or eligible for YOLO merge/);
     assert.deepEqual(quarantined, [12]);
     assert.equal(store.get().agentRuns[0].prState, "open");
+    assert.deepEqual(store.get().agentRuns[0].continuation.identity.pullRequest, { number: 12, head: "head", url: "https://example.test/pull/12" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("cadence-yielded checkpoints close immediately and retain their retry PR", async () => {
+test("cadence-yielded checkpoints retain their tracked PR without a close/reopen cycle", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-cadence-checkpoint-test-"));
   try {
     const store = new StateStore(root);
@@ -5675,10 +5863,10 @@ test("cadence-yielded checkpoints close immediately and retain their retry PR", 
 
     await orchestrator.retireCadenceYieldedAgentPr("run");
 
-    assert.deepEqual(closed.map(([number]) => number), [12]);
-    assert.match(closed[0][1], /explicit retry will reopen this same PR/i);
+    assert.deepEqual(closed, []);
     assert.equal(store.get().agentRuns[0].prNumber, 12);
-    assert.equal(store.get().agentRuns[0].prState, "closed");
+    assert.equal(store.get().agentRuns[0].prState, "open");
+    assert.match(store.get().activity[0].detail, /No close\/reopen cycle/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -6126,7 +6314,7 @@ test("Codex preflight supports Meta's launcher-level sandbox bypass without a PT
   }
 });
 
-test("merged composites supersede source PRs and queue overlapping composites for rebuild", async () => {
+test("proved merged-composite inclusion retires exact owned sources and preserves already closed sources", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-reconcile-test-"));
   try {
     const store = new StateStore(root);
@@ -6145,7 +6333,22 @@ test("merged composites supersede source PRs and queue overlapping composites fo
     });
     const closed = [];
     const labeled = [];
+    const proved = [];
+    const terminalEvents = [];
+    const remoteLeaves = new Map();
     const orchestrator = new Orchestrator(root, store, new EventHub());
+    await store.update((state) => {
+      for (const run of state.agentRuns) {
+        Object.assign(run, { baseRef: "main", baseCommit: "base" });
+        const fields = { title: run.id, body: "Exact source presentation", isDraft: true, state: run.prState === "closed" ? "CLOSED" : "OPEN" };
+        const remote = { ...fields, number: run.prNumber, url: run.prUrl, headRefName: run.branch, headRefOid: `head-${run.id}`,
+          mergeable: "MERGEABLE", statusCheckRollup: [] };
+        remoteLeaves.set(run.prNumber, remote);
+        run.leafPr = fixtureLeafPr(run, fields);
+        run.continuation = { id: `done-${run.id}`, step: "done", outcome: "completed", head: remote.headRefOid,
+          identity: orchestrator.continuationIdentity(run, state, remote) };
+      }
+    });
     orchestrator.git = {
       remoteExists: async () => true,
       listPullRequests: async () => [
@@ -6156,18 +6359,25 @@ test("merged composites supersede source PRs and queue overlapping composites fo
       closePr: async (_cwd, number, _comment, disposition) => { closed.push([number, disposition]); },
       markPrDisposition: async (_cwd, number, disposition) => { labeled.push([number, disposition]); },
       syncBase: async () => "abcdef1234567890",
+      resolveRef: async (ref) => ref.startsWith("branch-") ? `head-${ref.slice(7)}` : "base",
     };
+    installLeafPrFixtureTransport(orchestrator.git, { base: async () => "abcdef1234567890",
+      observe: async (_cwd, number) => { assert.ok(remoteLeaves.has(number)); return { ...remoteLeaves.get(number) }; },
+      close: async (_cwd, number) => { assert.equal(number, 1); terminalEvents.push("close"); closed.push(number); remoteLeaves.get(number).state = "CLOSED"; },
+      prove: async (input) => { assert.equal(input.head, "head-a"); assert.equal(input.sourceBase, "base"); terminalEvents.push("proof"); proved.push(input); return { targetCommit: "abcdef1234567890" }; } });
     await orchestrator.syncPullRequests(true);
     const state = store.get();
     assert.equal(state.composites.find((item) => item.id === "merged").status, "merged");
     assert.equal(state.composites.find((item) => item.id === "merged").error, undefined);
     assert.equal(state.agentRuns.find((item) => item.id === "a").prState, "superseded");
-    assert.equal(state.agentRuns.find((item) => item.id === "b").prState, "superseded");
+    assert.equal(state.agentRuns.find((item) => item.id === "b").prState, "closed", "old terminal closure is not converted into an inclusion claim");
     const overlap = state.composites.find((item) => item.id === "overlap");
     assert.equal(overlap.status, "rebuilding");
     assert.deepEqual(overlap.sources.map((source) => source.agentRunId), ["c", "d"]);
-    assert.deepEqual(closed, [[1, "merged"]]);
-    assert.deepEqual(labeled, [[100, "merged"], [2, "merged"]]);
+    assert.deepEqual(closed, [1]);
+    assert.equal(proved.length, 3);
+    assert.deepEqual(terminalEvents, ["proof", "proof", "close", "proof"], "inclusion is proved for nomination, before close, and before acknowledgement");
+    assert.deepEqual(labeled, [[100, "merged"]], "leaf graph settlement never borrows composite disposition labels as evidence");
     assert.equal(state.orchestrator.baseSyncPending, false);
     assert.equal(state.orchestrator.lastEvaluationAt, undefined);
     assert.ok(state.orchestrator.lastMergeAt);
@@ -6220,7 +6430,9 @@ test("direct merges refresh stale reviewed siblings on the same PR without retir
       startedAt: timestamp,
       completedAt: timestamp,
       prNumber: number,
+      prUrl: `https://example.test/pull/${number}`,
       prState: "open",
+      baseRef: "main",
       baseCommit: "old-base",
       deltas: [],
       resources: [],
@@ -6239,8 +6451,20 @@ test("direct merges refresh stale reviewed siblings on the same PR without retir
     });
     const closed = [];
     const refreshed = [];
+    const remoteLeaves = new Map();
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
-    await store.update((state) => { state.orchestrator.enabled = true; });
+    await store.update((state) => {
+      state.orchestrator.enabled = true;
+      for (const run of state.agentRuns) {
+        const fields = { title: run.id, body: "Reviewed source", isDraft: true, state: "OPEN" };
+        const remote = { ...fields, number: run.prNumber, url: run.prUrl, headRefName: run.branch, headRefOid: `head-${run.id}`,
+          ...(run.id === "merged" ? { state: "MERGED", mergeCommit: "landing" } : {}), mergeable: "MERGEABLE", statusCheckRollup: [] };
+        remoteLeaves.set(run.prNumber, remote);
+        run.leafPr = fixtureLeafPr(run, fields);
+        run.continuation = { id: `done-${run.id}`, step: "done", outcome: "completed", head: remote.headRefOid,
+          identity: orchestrator.continuationIdentity(run, state, remote) };
+      }
+    });
     orchestrator.git = {
       remoteExists: async () => true,
       listPullRequests: async () => [
@@ -6251,9 +6475,14 @@ test("direct merges refresh stale reviewed siblings on the same PR without retir
       markPrDisposition: async () => undefined,
       syncBase: async () => "new-base",
       closePr: async (_cwd, number, comment) => { closed.push([number, comment]); },
+      resolveRef: async (ref) => ref.startsWith("branch-") ? `head-${ref.slice(7)}` : "new-base",
     };
+    installLeafPrFixtureTransport(orchestrator.git, { base: async () => "new-base",
+      observe: async (_cwd, number) => { assert.ok(remoteLeaves.has(number)); return { ...remoteLeaves.get(number) }; },
+      prove: async (input) => { assert.equal(input.head, "head-merged"); assert.equal(input.landing, "landing");
+        assert.equal(input.sourceBase, "old-base"); return { targetCommit: "new-base" }; } });
     orchestrator.refreshAgentBaseAndRetry = async (runId) => { refreshed.push(runId); return store.get().agentRuns.find((run) => run.id === runId); };
-    orchestrator.retryingAgentIds.add("active-retry");
+    orchestrator.agentClaims.set("active-retry", Symbol("test"));
 
     await orchestrator.syncPullRequests(true);
 
@@ -6271,7 +6500,7 @@ test("direct merges refresh stale reviewed siblings on the same PR without retir
     assert.equal(sibling.agentRunId, "sibling");
     assert.deepEqual(closed, []);
     assert.deepEqual(refreshed, ["sibling"]);
-    assert.match(state.activity[0].detail, /existing branch/);
+    assert.match(state.activity[0].detail, /existing owned OPEN branch/);
 
     // A composite can reserve the retained source while asynchronous PR
     // reconciliation is finishing. Recheck eligibility before dispatch.
@@ -6314,7 +6543,8 @@ test("reviewed PRs pending refresh survive repeated base advances without retain
       { id: "unapproved", number: 44, status: "failed", error: pendingError, approved: false },
       { id: "replaced", number: 45, status: "failed", error: pendingError, owner: "replacement-run" },
     ];
-    const remote = fixtures.map(({ id, number }) => ({ number, state: "OPEN", headRefName: `branch-${id}`, url: "" }));
+    const remote = fixtures.map(({ id, number }) => ({ number, state: "OPEN", headRefName: `branch-${id}`, headRefOid: `head-${id}`,
+      url: `https://example.test/pull/${number}`, title: id, body: "Retained source", isDraft: true, mergeable: "MERGEABLE", statusCheckRollup: [] }));
     await store.update((state) => {
       state.orchestrator.enabled = false;
       for (const fixture of fixtures) {
@@ -6328,11 +6558,11 @@ test("reviewed PRs pending refresh survive repeated base advances without retain
           id: fixture.id, ideaId: `idea-${fixture.id}`, status: fixture.status,
           branch: `branch-${fixture.id}`, worktree: "", startedAt: timestamp, completedAt: timestamp,
           authorThreadId: `thread-${fixture.id}`, baseRef: "main", baseCommit: "original-base",
-          prNumber: fixture.number, prState: "open", deltas: [], resources: [],
+          prNumber: fixture.number, prUrl: `https://example.test/pull/${fixture.number}`, prState: "open", deltas: [], resources: [],
           reviewApproved: approved,
           reviewRounds: [{ id: `review-${fixture.id}`, round: 1, commit: `head-${fixture.id}`, approved, summary: "Reviewed", findings: [], createdAt: timestamp }],
           error: fixture.error, quarantinedAt: fixture.quarantinedAt,
-          fullMergeValidation: { candidateCommit: `head-${fixture.id}` },
+          fullMergeValidation: { baseCommit: "original-base", candidateCommit: `head-${fixture.id}`, evaluationFingerprint: fullMergeValidationFingerprint(state), qualified: false, completedAt: timestamp },
         });
       }
     });
@@ -6340,6 +6570,14 @@ test("reviewed PRs pending refresh survive repeated base advances without retain
     const refreshed = [];
     let baseCommit;
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
+    await store.update((state) => {
+      for (const run of state.agentRuns) {
+        const observed = remote.find((pr) => pr.number === run.prNumber);
+        run.leafPr = fixtureLeafPr(run, { title: observed.title, body: observed.body, isDraft: true, state: "OPEN" });
+        run.continuation = { id: `done-${run.id}`, step: "done", outcome: "completed", head: observed.headRefOid,
+          identity: orchestrator.continuationIdentity(run, state, observed) };
+      }
+    });
     orchestrator.git = {
       remoteExists: async () => true,
       listPullRequests: async () => remote.map((pr) => ({ ...pr })),
@@ -6349,7 +6587,11 @@ test("reviewed PRs pending refresh survive repeated base advances without retain
         closed.push(number);
         remote.find((pr) => pr.number === number).state = "CLOSED";
       },
+      resolveRef: async (ref) => ref.startsWith("branch-") ? `head-${ref.slice(7)}` : baseCommit,
     };
+    installLeafPrFixtureTransport(orchestrator.git, { base: async () => baseCommit,
+      observe: async (_cwd, number) => { const pr = remote.find((item) => item.number === number); assert.ok(pr); return { ...pr }; },
+      close: async (_cwd, number) => { closed.push(number); remote.find((pr) => pr.number === number).state = "CLOSED"; } });
     orchestrator.ensureLivingComposite = async () => undefined;
     orchestrator.refreshAgentBaseAndRetry = async (runId) => { refreshed.push(runId); };
 
@@ -6363,7 +6605,8 @@ test("reviewed PRs pending refresh survive repeated base advances without retain
       assert.equal(retained.prState, "open", `reviewed work must survive base advance ${generation}`);
       assert.equal(retained.status, "failed");
       assert.equal(retained.error, `Base advanced to ${baseCommit.slice(0, 8)}; same-PR refresh pending.`);
-      assert.equal(retained.fullMergeValidation, undefined, "old final-validation caches must remain invalidated");
+      assert.equal(retained.fullMergeValidation.candidateCommit, "head-retained", "historical full evidence must survive base refresh");
+      assert.equal(cachedFullMergeValidationResult(retained, baseCommit, "head-retained", fullMergeValidationFingerprint(state)), undefined, "old-base evidence cannot qualify the new comparison");
       assert.equal(retained.baseCommit, "original-base", "cleanup must not pretend that a refresh ran");
       assert.equal(retained.authorThreadId, "thread-retained");
       assert.equal(retained.reviewApproved, true);
@@ -6404,7 +6647,7 @@ test("a pending same-PR base refresh claims the next available agent slot", asyn
     const refreshed = [];
     orchestrator.refreshAgentBaseAndRetry = async (runId) => {
       refreshed.push(runId);
-      orchestrator.retryingAgentIds.add(runId);
+      orchestrator.agentClaims.set(runId, Symbol("test"));
       return store.get().agentRuns.find((run) => run.id === runId);
     };
 
@@ -6453,7 +6696,7 @@ test("an approved unpublished base-move checkpoint reclaims a slot after the cur
     const refreshed = [];
     orchestrator.refreshAgentBaseAndRetry = async (runId) => {
       refreshed.push(runId);
-      orchestrator.retryingAgentIds.add(runId);
+      orchestrator.agentClaims.set(runId, Symbol("test"));
       return store.get().agentRuns.find((run) => run.id === runId);
     };
 
@@ -6528,7 +6771,7 @@ test("unpublished base refresh eligibility excludes unrelated, superseded, and u
       }
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
-    orchestrator.retryingAgentIds.add("retrying");
+    orchestrator.agentClaims.set("retrying", Symbol("test"));
     assert.deepEqual(orchestrator.pendingBaseRefreshes(store.get()).map((run) => run.id), [
       "main", "open-parent", "merged-parent", "main-advanced-during-evaluation",
       "parent-advanced-during-evaluation", "parent-merged-before-absorption", "published",
@@ -6566,13 +6809,27 @@ test("busy resources preserve published and unpublished pending base-refresh che
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 2 });
     orchestrator.locks.tryAcquireAll = async () => undefined;
-    orchestrator.git = { resolveRef: async () => assert.fail("busy refresh must stop before touching Git") };
+    const fields = { title: "Published source", body: "Owned reviewed checkpoint", isDraft: true, state: "OPEN" };
+    const remote = { ...fields, number: 42, url: "https://example.test/pull/42", headRefName: "burner/published", headRefOid: "head",
+      mergeable: "MERGEABLE", statusCheckRollup: [] };
+    await store.update((state) => {
+      const run = state.agentRuns.find((item) => item.id === "published");
+      run.prUrl = remote.url;
+      run.leafPr = fixtureLeafPr(run, fields);
+      run.continuation = { id: "published-done", step: "done", outcome: "completed", head: "head", completedAt: timestamp,
+        identity: orchestrator.continuationIdentity(run, state, remote) };
+    });
+    orchestrator.git = { resolveRef: async () => assert.fail("busy refresh must stop before local Git source/worktree operations") };
+    const observed = [];
+    installLeafPrFixtureTransport(orchestrator.git, { base: async () => "new-base",
+      observe: async (_cwd, number) => { assert.equal(number, 42); observed.push(number); return structuredClone(remote); } });
     const before = structuredClone(store.get().agentRuns);
     for (const run of before) {
       await assert.rejects(orchestrator.refreshAgentBaseAndRetry(run.id), /required resource is currently locked/);
-      assert.equal(orchestrator.retryingAgentIds.has(run.id), false);
+      assert.equal(orchestrator.agentClaims.has(run.id), false);
     }
     assert.deepEqual(store.get().agentRuns, before, "contention must not erase the pending error or alter provenance");
+    assert.deepEqual(observed, [42], "the existing published owner is checked before acquiring a refresh lease");
     assert.equal(orchestrator.activeAgents.size, 0, "release temporary scheduling reservations");
     assert.deepEqual(orchestrator.pendingBaseRefreshes(store.get()).map((run) => run.id), ["unpublished", "published"]);
   } finally {
@@ -6646,7 +6903,7 @@ test("an exactly merged composite becomes the next full baseline without rerunni
   }
 });
 
-test("an exactly merged fully validated leaf becomes the next full baseline", async () => {
+test("legacy leaf presentation deltas cannot forge a confirmed baseline from an arbitrary raw sample", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-promote-leaf-baseline-test-"));
   try {
     const store = new StateStore(root);
@@ -6674,12 +6931,11 @@ test("an exactly merged fully validated leaf becomes the next full baseline", as
     });
     const orchestrator = new Orchestrator(root, store, new EventHub());
     orchestrator.git = { tree: async () => "same-tree" };
-    assert.equal(await orchestrator.promoteMergedAgentBaseline("leaf", "new-main"), true);
-    assert.equal(store.latestRuns().get("quality").score, 88);
-    assert.equal(store.latestRuns().get("quality").commit, "new-main");
-    assert.equal(store.latestRuns().get("docs").score, 80, "the confirmed delta score must override an arbitrary confirmation sample");
-    assert.equal(store.latestRuns().get("docs").summary, "Docs improved");
-    assert.equal(store.latestRuns().get("docs").promptSampleCount, 3, "a changed prompt score was already median-confirmed by the full merge gate");
+    const before = structuredClone(store.get().evaluationRuns);
+    assert.equal(await orchestrator.promoteMergedAgentBaseline("leaf", "new-main"), false);
+    assert.deepEqual(store.get().evaluationRuns, before, "unproven presentation deltas must not create or relabel measured rows");
+    assert.equal(store.latestRuns().get("docs").score, 75);
+    assert.equal(store.latestRuns().get("docs").commit, "old-main");
     assert.equal(store.latestScreeningRuns().size, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -6709,11 +6965,23 @@ test("evaluation weight changes restamp open leaf impacts and PR bodies", async 
     });
     const edits = [];
     const orchestrator = new Orchestrator(root, store, new EventHub());
-    orchestrator.git = { editPr: async (...args) => edits.push(args) };
+    const pr = { number: 42, url: "https://example.test/pull/42", headRefName: "branch", headRefOid: "candidate",
+      title: "Improve", body: "Previous impact", isDraft: true, state: "OPEN", mergeable: "MERGEABLE", statusCheckRollup: [] };
+    await store.update((state) => {
+      const run = state.agentRuns[0];
+      Object.assign(run, { prUrl: pr.url, baseRef: "main", baseCommit: "base" });
+      run.leafPr = fixtureLeafPr(run, { title: pr.title, body: pr.body, isDraft: true, state: "OPEN" });
+      run.continuation = { id: "done", step: "done", head: "candidate", outcome: "completed",
+        identity: orchestrator.continuationIdentity(run, state, pr) };
+    });
+    orchestrator.git = { resolveRef: async (ref) => ref === "main" ? "base" : "candidate" };
+    installLeafPrFixtureTransport(orchestrator.git, { observe: async () => ({ ...pr }),
+      edit: async (_cwd, number, field, value) => { edits.push([number, field, value]); pr[field] = value; } });
     await orchestrator.refreshEvaluationWeights();
     assert.equal(store.get().agentRuns[0].impact, 0.7);
     assert.equal(edits.length, 1);
-    assert.match(edits[0][3], /Burner impact score: \+0\.7/);
+    assert.equal(edits[0][1], "body");
+    assert.match(edits[0][2], /Burner impact score: \+0\.7/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -6727,33 +6995,54 @@ test("successful experiments bind to and incrementally evolve the living composi
     const timestamp = new Date().toISOString();
     const evaluation = store.get().evaluations[0];
     await store.update((state) => {
+      state.evaluations = [evaluation];
       state.orchestrator.livingCompositeId = "living";
       state.composites.push({ id: "living", title: "Year-long line", description: "", status: "open", branch: "burner/living", worktree: "", sources: [{ agentRunId: "seed-a", prNumber: 1, title: "A", branch: "a", kind: "pull_request" }, { agentRunId: "seed-b", prNumber: 2, title: "B", branch: "b", kind: "pull_request" }], deltas: [{ evaluationId: evaluation.id, name: evaluation.name, before: 75, after: 80, delta: 5 }], impact: 5, compositeScore: 80, reviewRounds: [], reviewApproved: true, prNumber: 10, prUrl: "https://example.test/pull/10", createdAt: timestamp, updatedAt: timestamp, isLiving: true, pendingExperimentRunIds: [] });
       state.evaluationRuns.push({ id: "composite-eval", evaluationId: evaluation.id, score: 80, commit: "living-head", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "living", promptSampleCount: 3, evaluationDefinitionVersion: evaluation.definitionVersion });
-      state.agentRuns.push({ id: "experiment", ideaId: "idea", status: "evaluating", branch: "burner/experiment", worktree: "/tmp/worktree", startedAt: timestamp, deltas: [], impact: 4, resources: [], reviewRounds: [], reviewApproved: true, baseRef: "burner/living", baseCommit: "living-head", parentCompositeId: "living", prNumber: 11, prUrl: "https://example.test/pull/11", prState: "open" });
+      state.ideas.push({ id: "idea", title: "Experiment", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "running", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "experiment" });
+      state.agentRuns.push({ id: "experiment", ideaId: "idea", status: "evaluating", branch: "burner/experiment", worktree: root, startedAt: timestamp, deltas: [], impact: 4, resources: [], reviewRounds: [], reviewApproved: true, baseRef: "burner/living", baseCommit: "living-head", parentCompositeId: "living", prNumber: 11, prUrl: "https://example.test/pull/11", prState: "open", continuation: {
+        id: "delivery", head: "candidate", step: "delivery", approvalRoundId: "review",
+        identity: { baseRef: "burner/living", baseCommit: "living-head", branch: "burner/experiment", evaluationFingerprint: fullMergeValidationFingerprint(state), remote: state.settings.remote, baseBranch: state.settings.baseBranch, pullRequest: { number: 11, head: "candidate" } },
+      } });
     });
     const pushed = [];
     const closed = [];
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
-    orchestrator.git = { fetchBranch: async () => "origin/burner/living", resolveRef: async () => "living-head", push: async (_cwd, _remote, branch) => pushed.push(branch), closePr: async (_cwd, number, comment) => closed.push([number, comment]) };
+    const pr = { number: 11, url: "https://example.test/pull/11", headRefName: "burner/experiment", headRefOid: "candidate",
+      title: "Experiment", body: "Published checkpoint", isDraft: true, state: "OPEN", mergeable: "MERGEABLE", statusCheckRollup: [] };
+    await store.update((state) => { state.agentRuns[0].leafPr = fixtureLeafPr(state.agentRuns[0], { title: pr.title, body: pr.body, isDraft: true, state: "OPEN" }); });
+    orchestrator.git = { fetchBranch: async () => "origin/burner/living", resolveRef: async (ref) => ref === "burner/experiment" ? "candidate" : "living-head",
+      head: async () => "candidate", hasChanges: async () => false, assertWorktree: async () => undefined,
+      pushLeaf: async (_cwd, _remote, branch, head, previous) => { assert.equal(head, "candidate"); assert.equal(previous, "candidate"); pushed.push(branch); } };
+    installLeafPrFixtureTransport(orchestrator.git, { observe: async () => ({ ...pr }),
+      close: async (_cwd, number) => { closed.push(number); pr.state = "CLOSED"; } });
+    let samples = 0;
+    orchestrator.codex = { preflight: async () => undefined,
+      evaluate: async () => { samples += 1; return { score: 84, summary: "Measured experiment", evidence: [], suggestions: [] }; },
+      refreshAgentEvidence: async () => ({ threadId: "thread", message: "Measured evidence" }),
+      review: async () => ({ approved: true, summary: "Reviewed", findings: [] }) };
     const base = await orchestrator.resolveAgentBase({ id: "idea", title: "Experiment", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "queued", createdAt: timestamp, updatedAt: timestamp, source: "manual", baseCompositeId: "living" }, store.get());
     assert.equal(base.compositeId, "living");
     assert.equal(base.baseline.get(evaluation.id).score, 80);
     assert.equal(base.baseline.get(evaluation.id).commit, "living-head");
     assert.equal(base.baseline.get(evaluation.id).promptSampleCount, 3);
-    await orchestrator.absorbExperiment("living", "experiment", { id: "idea", title: "Experiment", description: "", rationale: "", predictedImpact: 1, evaluationIds: [], resources: [], status: "running", createdAt: timestamp, updatedAt: timestamp, source: "manual" }, "/tmp/worktree", "burner/experiment", 4, store.get().settings);
+    await reviewLeaf(orchestrator, root, "experiment", "Experiment", "burner/living", "thread", store.get().settings,
+      { deliver: true, baseline: base.baseline });
     const state = store.get();
     const living = state.composites.find((item) => item.id === "living");
     assert.equal(state.agentRuns.find((item) => item.id === "experiment").status, "absorbed");
+    assert.equal(state.agentRuns.find((item) => item.id === "experiment").continuation.outcome, "absorbed");
+    assert.equal(state.ideas[0].status, "completed");
     assert.equal(state.agentRuns.find((item) => item.id === "experiment").prState, "closed");
     assert.equal(living.status, "rebuilding");
     assert.equal(living.rebuildMode, "incremental");
     assert.deepEqual(living.pendingExperimentRunIds, ["experiment"]);
     assert.equal(living.sources.at(-1).kind, "experiment");
     assert.deepEqual(pushed, ["burner/experiment"]);
-    assert.equal(closed.length, 1);
-    assert.equal(closed[0][0], 11);
-    assert.match(closed[0][1], /absorbed.*draft composite PR #10/i);
+    assert.deepEqual(closed, [11]);
+    assert.equal(samples, 3, "absorption retains receipt-backed confirmed measurements");
+    assert.equal(state.agentRuns[0].leafPr.terminal.kind, "absorbed");
+    assert.equal(state.agentRuns[0].leafPr.terminal.compositeId, "living");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -6771,26 +7060,31 @@ test("living-composite experiments confirm prompt score changes before absorptio
       state.evaluations = [evaluation];
       state.ideas = [idea];
       state.agentRuns = [{ id: "experiment", ideaId: "idea", status: "reviewing", branch: "burner/experiment", worktree: root, startedAt: timestamp, baseRef: "burner/living", baseCommit: "base", parentCompositeId: "living", deltas: [], resources: [], reviewRounds: [], reviewApproved: false }];
+      state.composites = [{ id: "living", title: "Living line", description: "", status: "open", branch: "burner/living", worktree: "", sources: [], deltas: [], reviewRounds: [], reviewApproved: true, createdAt: timestamp, updatedAt: timestamp, isLiving: true, pendingExperimentRunIds: [] }];
+      state.evaluationRuns = [{ id: "baseline", evaluationId: "quality", score: 80, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "living", promptSampleCount: 3, evaluationDefinitionVersion: state.evaluations[0].definitionVersion }];
     });
-    const baseline = new Map([["quality", { id: "baseline", evaluationId: "quality", score: 80, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "living", promptSampleCount: 3 }]]);
+    const baseline = new Map([["quality", store.get().evaluationRuns[0]]]);
     const orchestrator = new Orchestrator(root, store, new EventHub());
-    orchestrator.git = { resolveRef: async () => "base" };
-    orchestrator.reviewAgent = async () => ({ message: "Reviewed", threadId: "thread" });
-    orchestrator.runCandidateEvaluations = async () => [{ id: "sample", evaluationId: "quality", score: 79, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "agent", agentRunId: "experiment" }];
-    let confirmationCalls = 0;
-    orchestrator.confirmPromptChanges = async (_cwd, _baseline, runs) => {
-      confirmationCalls += 1;
-      return runs.map((run) => ({ ...run, score: 80, promptSampleCount: 3 }));
+    const pushes = [];
+    orchestrator.git = { resolveRef: async () => "base", pushLeaf: async (...args) => { pushes.push(args); } };
+    installLeafPrFixtureTransport(orchestrator.git, { observe: async () => assert.fail("This source has never opened a PR") });
+    let samples = 0;
+    orchestrator.codex = {
+      preflight: async () => undefined,
+      evaluate: async () => ({ score: [79, 80, 80][samples++], summary: "Measured quality", evidence: [], suggestions: [] }),
+      refreshAgentEvidence: async () => ({ message: "Evidence", threadId: "thread" }),
+      review: async () => ({ approved: true, summary: "Reviewed", findings: [] }),
     };
-    let absorbed = false;
-    orchestrator.absorbExperiment = async () => { absorbed = true; };
 
-    await orchestrator.reviewAndDeliverAgent(idea, { ref: "burner/living", commit: "base", baseline, compositeId: "living" }, "experiment", root, "burner/experiment", store.get().settings, "thread", "Implemented");
+    await reviewLeaf(orchestrator, root, "experiment", idea.title, "burner/living", "thread", store.get().settings, { deliver: true, baseline });
 
-    assert.equal(confirmationCalls, 1);
-    assert.equal(absorbed, true, "the confirmed unchanged score should not reject the experiment");
+    assert.equal(samples, 3);
+    assert.equal(store.get().agentRuns[0].status, "absorbed", "the confirmed unchanged score should not reject the experiment");
+    assert.equal(pushes.length, 1);
     assert.equal(store.get().agentRuns[0].impact, 0);
     assert.equal(store.get().agentRuns[0].deltas[0].delta, 0);
+    assert.equal(store.get().agentRuns[0].continuation.evaluation.evaluations[0].candidate.length, 3);
+    assert.ok(store.get().evaluationRuns.filter((row) => row.agentRunId === "experiment").every((row) => row.promptSampleCount === undefined), "raw candidate samples must remain raw after absorption");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

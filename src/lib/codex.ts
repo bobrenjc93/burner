@@ -407,14 +407,16 @@ export class CodexClient {
     return this.unstructuredSession(cwd, prompt, settings.agentModel);
   }
 
-  async revise(cwd: string, threadId: string, review: ReviewResult, settings: BurnerSettings): Promise<SessionResult> {
+  async revise(cwd: string, threadId: string, review: ReviewResult, settings: BurnerSettings, feedback: "review" | "evaluation" = "review"): Promise<SessionResult> {
     const prompt = [
-      "An independent reviewer requested changes. Address every finding in the current worktree, run relevant checks, and leave the branch ready for another review.",
+      feedback === "evaluation"
+        ? "The confirmed evaluation gate rejected this candidate. Address the evaluation feedback in the current worktree, preserve evaluation definitions, denominators, tolerances and supported behavior, run relevant checks, and leave the branch ready for independent review. This feedback is not an independent code review."
+        : "An independent reviewer requested changes. Address every finding in the current worktree, run relevant checks, and leave the branch ready for another review.",
       "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree. If a finding depends on external behavior, use hermetic fixtures or document the dependency; do not patch the external producer.",
       "Do not commit, push, or open a pull request; Burner handles git delivery.",
       `${PROGRESS_OWNERSHIP} If feedback asks for a current unmerged PR history point or duplicate progress infrastructure, do not implement that invalid request; explain that Burner stamps the point after final evaluation instead.`,
       MEASURED_ARTIFACT_PROVENANCE,
-      `Review summary: ${review.summary}`,
+      `${feedback === "evaluation" ? "Evaluation feedback" : "Review"} summary: ${review.summary}`,
       `Findings:\n${review.findings.map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.title}${finding.file ? ` (${finding.file})` : ""}: ${finding.detail}`).join("\n")}`,
       "If a finding is invalid, verify that carefully and explain it, but make all justified fixes.",
     ].join("\n\n");

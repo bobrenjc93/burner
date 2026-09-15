@@ -8,6 +8,9 @@ import { EventHub } from "../dist/lib/events.js";
 import { Orchestrator } from "../dist/lib/orchestrator.js";
 import { runCommand } from "../dist/lib/process.js";
 import { StateStore } from "../dist/lib/store.js";
+import { finishLeafDeliveryForTest } from "./leaf-test-helpers.js";
+import { fullMergeValidationFingerprint } from "../dist/lib/orchestrator.js";
+import { fixtureLeafPr, installLeafPrFixtureTransport } from "./leaf-pr-test-helpers.js";
 
 const threadEvent = (threadId) => JSON.stringify({ type: "thread.started", thread_id: threadId });
 const commandResult = (stdout = "", exitCode = 0) => ({ stdout, stderr: exitCode ? "credential expired" : "", exitCode });
@@ -173,8 +176,17 @@ async function retryFixture(t, options = {}) {
       id: "agent", ideaId: idea.id, status: "failed", branch: "burner/original", worktree,
       startedAt: timestamp, completedAt: timestamp, deltas: [], resources: idea.resources, authorThreadId: "original-author",
       authoringComplete: Object.hasOwn(options, "authoringComplete") ? options.authoringComplete : false,
-      baseRef: "main", baseCommit: "base", reviewRounds: [], prNumber: 7, prState: "open",
+      baseRef: "main", baseCommit: "base", reviewRounds: [],
+      ...(!Object.hasOwn(options, "authoringComplete") ? { prNumber: 7, prState: "open", continuation: {
+        id: "interrupted-author", head: "candidate", step: "author", reason: { kind: "initial" },
+        identity: { baseRef: "main", baseCommit: "base", branch: "burner/original", evaluationFingerprint: fullMergeValidationFingerprint(state), remote: "origin", baseBranch: "main", pullRequest: { number: 7, head: "candidate" } },
+      } } : {}),
     });
+    const run = state.agentRuns[0];
+    if (run?.prNumber) {
+      run.prUrl = "https://example.test/pr/7";
+      run.leafPr = fixtureLeafPr(run, { title: idea.title, body: "Original checkpoint", isDraft: true, state: "OPEN" });
+    }
   });
   const orchestrator = new Orchestrator(root, store, new EventHub());
   const calls = [];
@@ -187,24 +199,36 @@ async function retryFixture(t, options = {}) {
       return { locks: [], release: async () => { calls.push("release"); } };
     },
   };
+  let head = options.seedRun === false ? "base" : "candidate";
+  let dirty = options.seedRun !== false && !Object.hasOwn(options, "authoringComplete");
   orchestrator.git = {
     status: async () => ({ available: true, dirty: false }),
-    resolveRef: async () => "base",
+    resolveRef: async (ref) => ref === "main" ? "base" : head,
     createWorktree: async () => worktree,
-    head: async () => "candidate",
-    hasChanges: async () => true,
-    commit: async (_cwd, message) => { calls.push(message); return "checkpoint"; },
+    head: async () => head,
+    tree: async (commit) => `tree-${commit}`,
+    assertWorktree: async () => undefined,
+    hasChanges: async () => dirty,
+    prepareLeafCommit: async (_cwd, _branch, inputHead) => ({ inputHead, tree: dirty ? "tree-checkpoint" : `tree-${head}` }),
+    finalizeLeafCommit: async (_cwd, _branch, _receipt, message) => {
+      if (dirty) { head = "checkpoint"; dirty = false; calls.push(message); }
+      return head;
+    },
+    getPullRequest: async () => ({ number: 7, headRefName: "burner/original", headRefOid: "candidate", state: "OPEN", url: "https://example.test/pr/7",
+      title: idea.title, body: "Original checkpoint", isDraft: true, statusCheckRollup: [] }),
   };
-  orchestrator.reviewAndDeliverAgent = async (_idea, base, runId, cwd, branch, _settings, threadId, message) => {
-    assert.equal(cwd, worktree);
+  installLeafPrFixtureTransport(orchestrator.git, { observe: (...args) => orchestrator.git.getPullRequest(...args) });
+  orchestrator.codex.refreshAgentEvidence = async () => ({ threadId: store.get().agentRuns[0].authorThreadId, message: "Evidence complete" });
+  orchestrator.codex.review = async () => {
+    const run = store.get().agentRuns[0];
+    calls.push({ review: { threadId: run.authorThreadId, message: run.lastMessage ?? "" } });
+    return { approved: true, summary: "Approved", findings: [] };
+  };
+  finishLeafDeliveryForTest(orchestrator, async (_idea, base, run) => {
+    assert.equal(run.worktree, worktree);
     assert.equal(base.commit, "base");
-    assert.equal(branch, "burner/original");
-    calls.push({ review: { threadId, message } });
-    await store.update((state) => {
-      state.agentRuns.find((run) => run.id === runId).status = "completed";
-      state.ideas.find((item) => item.id === idea.id).status = "completed";
-    });
-  };
+    assert.equal(run.branch, "burner/original");
+  });
   return { root, worktree, store, idea, orchestrator, calls };
 }
 
@@ -242,13 +266,14 @@ test("an interrupted initial author retains its session and incomplete phase acr
   const interrupted = store.get().agentRuns[0];
   assert.equal(interrupted.status, "failed");
   assert.equal(interrupted.authorThreadId, "initial-author");
-  assert.equal(interrupted.authoringComplete, false);
+  assert.equal(interrupted.continuation.step, "author");
+  assert.equal(interrupted.continuation.reason.kind, "initial");
   assert.equal(interrupted.worktree, worktree);
   assert.match(interrupted.error, /credential expired/);
   const restarted = new StateStore(root);
   await restarted.init();
   assert.equal(restarted.get().agentRuns[0].authorThreadId, "initial-author");
-  assert.equal(restarted.get().agentRuns[0].authoringComplete, false);
+  assert.equal(restarted.get().agentRuns[0].continuation.step, "author");
 });
 
 test("retry completes interrupted authoring on the same candidate before review", async (t) => {
@@ -265,25 +290,31 @@ test("retry completes interrupted authoring on the same candidate before review"
     return { threadId, message: "Finished original scope" };
   };
   const run = await orchestrator.retryAgent("agent");
-  assert.equal(run.authoringComplete, true);
+  assert.equal(run.continuation.step, "done");
+  assert.equal(run.initialAuthorMessage, "Finished original scope");
   assert.equal(run.prNumber, 7);
   assert.equal(run.branch, "burner/original");
   assert.equal(run.status, "completed");
   assert.deepEqual(calls, [
-    "burner: preserve interrupted revision", "resume-author", "progress-guard", "burner: complete interrupted implementation",
+    "resume-author", "progress-guard", "burner: Recover the original implementation", "progress-guard",
     { review: { threadId: "original-author", message: "Finished original scope" } }, "release",
   ]);
   assert.equal(orchestrator.activeAgents.size, 0);
-  assert.equal(orchestrator.retryingAgentIds.size, 0);
+  assert.equal(orchestrator.agentClaims.size, 0);
 });
 
-test("completed-author and legacy retries do not repeat the implementation phase", async (t) => {
+test("completed-author legacy retries skip authoring and ambiguous legacy completion fails closed", async (t) => {
   for (const authoringComplete of [true, undefined]) {
     const { orchestrator, calls } = await retryFixture(t, { authoringComplete });
     orchestrator.codex.implement = async () => { assert.fail("completed author must not be restarted"); };
-    const run = await orchestrator.retryAgent("agent");
-    assert.equal(run.status, "completed");
-    assert.deepEqual(calls, ["burner: preserve interrupted revision", { review: { threadId: "original-author", message: "" } }, "release"]);
+    if (authoringComplete) {
+      const run = await orchestrator.retryAgent("agent");
+      assert.equal(run.status, "completed");
+      assert.deepEqual(calls, ["progress-guard", { review: { threadId: "original-author", message: "" } }, "release"]);
+    } else {
+      await assert.rejects(orchestrator.retryAgent("agent"), /initial-author completion cannot be established/);
+      assert.deepEqual(calls, ["release"]);
+    }
   }
 });
 
@@ -299,7 +330,7 @@ test("another author interruption retains its checkpoint and releases the candid
   assert.equal(run.authorThreadId, "resumed-author");
   assert.equal(run.prNumber, 7);
   assert.equal(store.get().agentRuns.length, 1);
-  assert.deepEqual(calls, ["burner: preserve interrupted revision", "release"]);
+  assert.deepEqual(calls, ["release"]);
   assert.equal(orchestrator.activeAgents.size, 0);
-  assert.equal(orchestrator.retryingAgentIds.size, 0);
+  assert.equal(orchestrator.agentClaims.size, 0);
 });

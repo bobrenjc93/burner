@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createBurnerServer } from "./server.js";
 import { EventHub } from "./lib/events.js";
 import { Orchestrator } from "./lib/orchestrator.js";
+import { validateLegacyLeafPrProofInput } from "./lib/legacy-leaf-pr.js";
 import { StateStore, validateEvaluation } from "./lib/store.js";
 import { errorMessage, id, now } from "./lib/utils.js";
-import type { BurnerSettings, Idea } from "./types.js";
+import type { BurnerSettings, Idea, LegacyLeafPrProofInput } from "./types.js";
 
 const VERSION = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 const colors = {
@@ -34,7 +36,7 @@ Commands:
   idea add       Queue an idea (--title, --description, [--impact])
   idea list      List improvement ideas
   queue run-next Run exactly one queued idea through review and delivery
-  queue retry    Resume a failed candidate (--run)
+  queue retry    Resume a failed or full-score-rejected candidate (--run)
   pr merge       Merge an open agent PR and synchronize the base (--run)
   settings set   Update automation settings
   status         Print project state and runtime readiness as JSON
@@ -53,6 +55,8 @@ Command options:
   --merge-cadence-minutes <n>  YOLO merge-health window (default: 60)
   --stall-termination-hours <n> stop after this long without a new best score (default: 24; 0 never stops)
   --portfolio-review-rounds <n> cumulative YOLO rounds before quarantine/recovery (default: 12)
+  --legacy-pr-proof <file> explicit archived-writer proof JSON for queue retry
+  --retain-worktree      retain this numbered leaf's canonical checkout on retry
   --json                  JSON output (commands already default to JSON)
   -V, --version           output the version number
   -h, --help              display help`;
@@ -98,7 +102,7 @@ function print(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
 }
 
-async function withOrchestrator<T>(root: string, task: (orchestrator: Orchestrator, store: StateStore) => Promise<T>): Promise<T> {
+async function withOrchestrator<T>(root: string, task: (orchestrator: Orchestrator, store: StateStore) => Promise<T>, manual = false): Promise<T> {
   const store = new StateStore(root);
   await store.init({ recoverInterrupted: false });
   const live = store.get();
@@ -110,7 +114,7 @@ async function withOrchestrator<T>(root: string, task: (orchestrator: Orchestrat
   }
   await store.init();
   const orchestrator = new Orchestrator(root, store, new EventHub());
-  await orchestrator.init();
+  await orchestrator.init(manual ? { manual: true } : {});
   try { return await task(orchestrator, store); }
   finally { await orchestrator.close(); }
 }
@@ -203,7 +207,14 @@ async function runHeadless(args: string[]): Promise<boolean> {
   }
 
   if (command === "queue" && subcommand === "retry") {
-    const run = await withOrchestrator(root, (orchestrator) => orchestrator.retryAgent(required(args, "--run")));
+    const proofPath = option(args, "--legacy-pr-proof");
+    const legacyPrProof = proofPath === undefined ? undefined : JSON.parse(await readFile(resolve(proofPath), "utf8")) as LegacyLeafPrProofInput;
+    if (legacyPrProof !== undefined) validateLegacyLeafPrProofInput(legacyPrProof);
+    const run = await withOrchestrator(root, (orchestrator) => orchestrator.retryAgent(required(args, "--run"), {
+      ...(option(args, "--repair-notes") !== undefined ? { repairNotes: option(args, "--repair-notes") } : {}),
+      ...(legacyPrProof ? { legacyPrProof } : {}),
+      ...(args.includes("--retain-worktree") ? { retainWorktree: true as const } : {}),
+    }), true);
     print(run);
     if (!["completed", "absorbed", "rejected", "no_changes"].includes(run.status)) process.exitCode = 2;
     return true;

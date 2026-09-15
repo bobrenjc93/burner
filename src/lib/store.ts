@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
-import type { Activity, BurnerState, Evaluation, EvaluationRun } from "../types.js";
+import type { Activity, BurnerState, Evaluation, EvaluationRun, LeafEvaluationReceipt } from "../types.js";
 import { DEFAULT_CODEX_MODEL } from "./codex-config.js";
 import { id, now, weightedScore, wellFormedText } from "./utils.js";
 
@@ -409,8 +409,75 @@ export class StateStore {
 
   private trim(): void {
     this.state.activity = this.state.activity.slice(0, 250);
+    const recentIdeas = new Set(this.state.ideas.slice(-500).map((idea) => idea.id));
+    const retainedComposites = new Set(this.state.composites.slice(-250).map((item) => item.id));
+    for (const composite of this.state.composites) {
+      if (["queued", "building", "reviewing", "revising", "evaluating", "open", "rebuilding", "failed"].includes(composite.status)) retainedComposites.add(composite.id);
+    }
+    for (const run of this.state.agentRuns) {
+      if (!run.leafPr) continue;
+      const pendingOwner = run.leafPr.pending?.owner;
+      for (const compositeId of [run.parentCompositeId, run.leafPr.terminal?.compositeId,
+        pendingOwner?.kind === "terminal-close" ? pendingOwner.reason.compositeId : undefined]) {
+        if (compositeId) retainedComposites.add(compositeId);
+      }
+    }
+    this.state.composites = this.state.composites.filter((item) => retainedComposites.has(item.id));
+    const referencedRuns = new Set(this.state.composites.flatMap((composite) => composite.sources.map((source) => source.agentRunId)));
+    const recentRuns = new Set(this.state.agentRuns.slice(-500).map((run) => run.id));
+    this.state.agentRuns = this.state.agentRuns.filter((run) => recentRuns.has(run.id) || referencedRuns.has(run.id) || run.prState === "open" ||
+      Boolean(run.leafPr) || Boolean(run.fullEvaluation) || (run.continuation && run.continuation.step !== "done"));
+    // PR disposition is not a release condition: a remote close can precede
+    // local acknowledgment, and terminal source/history still has one owner.
+    const retainedIdeaIds = new Set(this.state.agentRuns.map((run) => run.ideaId));
+    this.state.ideas = this.state.ideas.filter((idea) => recentIdeas.has(idea.id) || retainedIdeaIds.has(idea.id));
+    const evidenceOwners = this.state.agentRuns.filter((run) => run.continuation || run.leafPr);
+    const evidenceOwnerIds = new Set(evidenceOwners.map((run) => run.id));
+    const comparisonCommits = new Set(evidenceOwners.flatMap((run) => [
+      run.baseCommit, run.continuation?.identity.baseCommit, run.fullMergeValidation?.baseCommit, run.evaluationRepair?.validation.baseCommit,
+      ...run.fullEvaluationHistory?.map((entry) => entry.kind === "assessment" ? entry.assessment.baseCommit : entry.evaluation.identity.baseCommit) ?? [],
+      ...run.reviewRounds.map((round) => round.baseCommit),
+    ].filter((commit): commit is string => Boolean(commit))));
     const evaluationRuns = this.state.evaluationRuns;
     const retainedEvaluationRunIds = new Set(evaluationRuns.slice(-1000).map((run) => run.id));
+    const retainReceipt = (receipt: LeafEvaluationReceipt): void => {
+      for (const entry of receipt.evaluations) {
+        retainedEvaluationRunIds.add(entry.baseline.source.runId);
+        for (const source of entry.baseline.projection?.inputs ?? []) retainedEvaluationRunIds.add(source.runId);
+        if (entry.baselineMedian) retainedEvaluationRunIds.add(entry.baselineMedian.runId);
+        for (const slot of [...entry.candidate, ...entry.baselineConfirmations ?? []]) {
+          if ("reuse" in slot) retainedEvaluationRunIds.add(slot.reuse.runId);
+          else for (const runId of slot.attempts) retainedEvaluationRunIds.add(runId);
+        }
+      }
+      for (const source of receipt.result?.sources ?? []) retainedEvaluationRunIds.add(source.runId);
+    };
+    for (const run of this.state.agentRuns) {
+      const cursor = run.continuation;
+      const delivery = cursor?.step === "progress" ? cursor.done.evaluation : cursor && "evaluation" in cursor ? cursor.evaluation : undefined;
+      if (delivery) {
+        if ("id" in delivery) retainReceipt(delivery);
+        else for (const runId of delivery.evaluationRunIds) retainedEvaluationRunIds.add(runId);
+      }
+      if (run.fullEvaluation?.step === "sampling") retainReceipt(run.fullEvaluation.evaluation);
+      const assessments = [run.fullMergeValidation, run.evaluationRepair?.validation,
+        ...run.fullEvaluationHistory?.flatMap((entry) => entry.kind === "assessment" ? [entry.assessment] : []) ?? []];
+      for (const assessment of assessments) {
+        if (assessment?.evaluation) retainReceipt(assessment.evaluation);
+        for (const source of assessment?.legacyProvenance?.sources ?? []) retainedEvaluationRunIds.add(source.runId);
+      }
+      for (const entry of run.fullEvaluationHistory ?? []) if (entry.kind === "superseded") retainReceipt(entry.evaluation);
+    }
+    // Reductions can outlive their original agent through baseline promotion.
+    // Keep that explicit source closure; do not infer membership by head/time.
+    const retainSources = (runId: string): void => {
+      const row = evaluationRuns.find((item) => item.id === runId);
+      for (const source of row?.sourceRunIds ?? []) {
+        if (retainedEvaluationRunIds.has(source)) continue;
+        retainedEvaluationRunIds.add(source);
+        retainSources(source);
+      }
+    };
     const retainLatestUsableByEvaluation = (matches: (run: EvaluationRun) => boolean): void => {
       const latest = new Map<string, EvaluationRun>();
       for (const run of evaluationRuns) {
@@ -426,18 +493,16 @@ export class StateStore {
     retainLatestUsableByEvaluation((run) => run.context === "baseline" || run.context === "manual");
     retainLatestUsableByEvaluation((run) => run.context === "screening_baseline");
     for (const run of evaluationRuns) {
-      if (run.status === "running") retainedEvaluationRunIds.add(run.id);
+      // A retained execution or PR owner keeps its measurements and every
+      // comparison baseline, including after terminal acknowledgment. This
+      // cannot restore previously trimmed rows or unrelated campaign history.
+      if (run.status === "running" || (run.agentRunId && evidenceOwnerIds.has(run.agentRunId)) ||
+        (["baseline", "manual", "screening_baseline"].includes(run.context) && comparisonCommits.has(run.commit))) {
+        retainedEvaluationRunIds.add(run.id);
+      }
     }
+    for (const runId of retainedEvaluationRunIds) retainSources(runId);
     this.state.evaluationRuns = evaluationRuns.filter((run) => retainedEvaluationRunIds.has(run.id));
-    this.state.ideas = this.state.ideas.slice(-500);
-    const retainedComposites = new Set(this.state.composites.slice(-250).map((item) => item.id));
-    for (const composite of this.state.composites) {
-      if (["queued", "building", "reviewing", "revising", "evaluating", "open", "rebuilding", "failed"].includes(composite.status)) retainedComposites.add(composite.id);
-    }
-    this.state.composites = this.state.composites.filter((item) => retainedComposites.has(item.id));
-    const referencedRuns = new Set(this.state.composites.flatMap((composite) => composite.sources.map((source) => source.agentRunId)));
-    const recentRuns = new Set(this.state.agentRuns.slice(-500).map((run) => run.id));
-    this.state.agentRuns = this.state.agentRuns.filter((run) => recentRuns.has(run.id) || referencedRuns.has(run.id) || run.prState === "open");
     const compact = (value: string | undefined) => value && value.length > 8_000 ? `…[truncated]\n${value.slice(-8_000)}` : value;
     for (const run of this.state.evaluationRuns) run.error = compact(run.error);
     for (const run of this.state.agentRuns) run.error = compact(run.error);

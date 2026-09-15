@@ -11,9 +11,10 @@ import { CommandEvidenceArchive, COMMAND_EVIDENCE_LIMITS } from "../dist/lib/com
 import { CodexClient } from "../dist/lib/codex.js";
 import { EventHub } from "../dist/lib/events.js";
 import { GitService } from "../dist/lib/git.js";
-import { Orchestrator } from "../dist/lib/orchestrator.js";
+import { fullMergeValidationFingerprint, latestFullAssessment, fullAssessmentForIdentity, Orchestrator } from "../dist/lib/orchestrator.js";
 import { runCommand } from "../dist/lib/process.js";
 import { StateStore } from "../dist/lib/store.js";
+import { fixtureLeafPr, installLeafPrFixtureTransport } from "./leaf-pr-test-helpers.js";
 
 const payload = { score: 11.360180, summary: "Measured normally", evidence: ["same workload"], suggestions: [] };
 const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
@@ -704,11 +705,29 @@ test("baseline promotion preserves the original command archive identity and imm
   const original = await readFile(join(f.root, run.commandEvidence.manifest));
   await f.store.update((state) => {
     state.agentRuns.push({ id: "author-1", ideaId: "idea-1", status: "completed", branch: "burner/source", worktree: f.cwd,
-      startedAt: run.createdAt, prState: "merged", prNumber: 1, reviewRounds: [], resources: [],
-      fullMergeValidation: { qualified: true, candidateCommit: "measured-commit" },
+      startedAt: run.createdAt, prState: "open", prNumber: 1, prUrl: "https://example.test/pull/1", baseRef: "main", baseCommit: "base", reviewApproved: true,
+      reviewRounds: [{ id: "review", round: 1, commit: "measured-commit", approved: true, summary: "Approved", findings: [],
+        createdAt: run.createdAt, completedAt: run.createdAt, baseCommit: "base", evaluationFingerprint: fullMergeValidationFingerprint(state) }], resources: [],
       deltas: [{ evaluationId: "bench", name: "Benchmark", before: 10, after: 11.4, delta: 1.4 }] });
+    state.agentRuns[0].leafPr = fixtureLeafPr(state.agentRuns[0], { title: "Old", body: "Old", isDraft: true, state: "OPEN" }, { historical: true });
+    state.evaluationRuns.push({ id: "baseline", evaluationId: "bench", status: "completed", context: "baseline", score: 10,
+      commit: "base", createdAt: run.createdAt, durationMs: 1, evaluationDefinitionVersion: state.evaluations[0].definitionVersion });
   });
-  f.orchestrator.git.tree = async () => "same-tested-tree";
+  const pr = { number: 1, url: "https://example.test/pull/1", state: "OPEN", headRefName: "burner/source", headRefOid: "measured-commit", title: "Old", body: "Old", isDraft: true, statusCheckRollup: [] };
+  Object.assign(f.orchestrator.git, {
+    tree: async () => "same-tested-tree", resolveRef: async (ref) => ref === "main" ? "base" : "measured-commit",
+    createExistingWorktree: async () => f.cwd, assertWorktree: async () => undefined, hasChanges: async () => false,
+    getPullRequest: async () => ({ ...pr }), editPr: async (_cwd, _number, title, body) => { Object.assign(pr, { title, body }); },
+    removeWorktree: async () => undefined,
+  });
+  installLeafPrFixtureTransport(f.orchestrator.git, {
+    observe: (...args) => f.orchestrator.git.getPullRequest(...args),
+    edit: (cwd, number, field, value) => f.orchestrator.git.editPr(cwd, number, field === "title" ? value : pr.title, field === "body" ? value : pr.body),
+  });
+  f.orchestrator.codex = { preflight: async () => undefined, evaluate: async () => { assert.fail("full command reuse must not rerun the archived invocation"); } };
+  assert.equal(await f.orchestrator.fullyValidateLeafForMerge("author-1", "base"), true);
+  assert.equal(latestFullAssessment(f.store.get().agentRuns[0]).evaluation.evaluations[0].candidate[0].reuse.reason, "full-command");
+  await f.store.update((state) => { state.agentRuns[0].prState = "merged"; });
   assert.equal(await f.orchestrator.promoteMergedAgentBaseline("author-1", "merged-commit"), true);
   const baseline = f.store.latestRuns().get("bench");
   assert.notEqual(baseline.id, run.id);

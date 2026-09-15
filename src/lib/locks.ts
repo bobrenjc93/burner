@@ -35,26 +35,51 @@ export class LockManager {
       // Publish complete metadata atomically without replacing another owner.
       // Opening the public path first exposes an empty file to concurrent readers.
       const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+      const token = randomUUID();
+      let released = false;
+      let releaseInFlight: Promise<void> | undefined;
+      const release = (): Promise<void> => {
+        if (released) return Promise.resolve();
+        if (releaseInFlight) return releaseInFlight;
+        // Concurrent releases of one handle must join the same unlink. A second
+        // token read followed by a delayed unlink could remove a replacement
+        // published after the first caller completed its unlink.
+        releaseInFlight = (async () => {
+          try {
+            const current = JSON.parse(await readFile(path, "utf8")) as { token?: string };
+            if (current.token !== token) throw new Error(`Lock '${name}' no longer belongs to this acquisition.`);
+            await rm(path, { force: true });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+          released = true;
+        })().finally(() => { releaseInFlight = undefined; });
+        return releaseInFlight;
+      };
       const handle = await open(temporaryPath, "wx");
+      let published = false;
+      let publicationError: unknown;
       try {
         try {
-          await handle.writeFile(JSON.stringify({ owner, pid: process.pid, createdAt: now() }));
+          await handle.writeFile(JSON.stringify({ owner, pid: process.pid, createdAt: now(), token }));
         } finally {
           await handle.close();
         }
         await link(temporaryPath, path);
-      } finally {
-        await rm(temporaryPath, { force: true });
+        published = true;
+      } catch (error) {
+        publicationError = error;
       }
-      let released = false;
-      return {
-        name,
-        release: async () => {
-          if (released) return;
-          released = true;
-          await rm(path, { force: true });
-        },
-      };
+      try { await rm(temporaryPath, { force: true }); }
+      catch (error) {
+        // The hard link may already be public although no handle was returned.
+        // Only its token owner may undo that publication; retain every failure.
+        const errors = [...(publicationError ? [publicationError] : []), error];
+        if (published) try { await release(); } catch (cleanupError) { errors.push(cleanupError); }
+        throw new AggregateError(errors, `Could not clean up lock publication for '${name}'.`);
+      }
+      if (publicationError) throw publicationError;
+      return { name, release };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       try {
@@ -99,15 +124,26 @@ export class LockManager {
 
   async tryAcquireAll(names: string[], owner: string): Promise<{ locks: HeldLock[]; release: () => Promise<void> } | undefined> {
     const locks: HeldLock[] = [];
-    for (const name of [...new Set(names)].sort()) {
-      const lock = await this.tryAcquire(name, owner);
-      if (!lock) {
-        await Promise.all(locks.map((held) => held.release()));
-        return undefined;
+    const release = async () => {
+      const results = await Promise.allSettled(locks.map((held) => held.release()));
+      const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+      if (failures.length) throw new AggregateError(failures, "Could not release all acquired resource locks.");
+    };
+    try {
+      for (const name of [...new Set(names)].sort()) {
+        const lock = await this.tryAcquire(name, owner);
+        if (!lock) {
+          await release();
+          return undefined;
+        }
+        locks.push(lock);
       }
-      locks.push(lock);
+    } catch (error) {
+      try { await release(); }
+      catch (cleanupError) { throw new AggregateError([error, cleanupError], "Resource acquisition and partial cleanup failed."); }
+      throw error;
     }
-    return { locks, release: async () => void (await Promise.all(locks.map((lock) => lock.release()))) };
+    return { locks, release };
   }
 
   async list(): Promise<string[]> {
