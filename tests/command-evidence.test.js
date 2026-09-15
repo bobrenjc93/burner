@@ -614,23 +614,46 @@ for (const count of [128, 129]) test(`flat export entry count boundary: ${count}
   if (count === 129) assert.match(manifest.issues.join(" "), /Export count exceeds 128/);
 });
 
+test("recorded report bundle sizes fit the export limits without transforming raw files", () => {
+  // Metadata from retained public-default-compile-v2 coverage/CUDA runs; no canonical files are read or copied.
+  const bundles = [
+    { name: "coverage", count: 13, total: 158812772,
+      sizes: [45415241, 2162, 2143, 823, 45417449, 2563, 11080649, 851, 11080670, 851, 45417613, 2563, 389194] },
+    { name: "CUDA performance", count: 9, total: 113272026,
+      sizes: [45417588, 2563, 11080639, 851, 11080675, 851, 45417561, 2575, 268723] },
+  ];
+  for (const bundle of bundles) {
+    assert.equal(bundle.sizes.length, bundle.count, bundle.name);
+    assert.equal(bundle.sizes.reduce((sum, size) => sum + size, 0), bundle.total, bundle.name);
+    assert.ok(bundle.count <= COMMAND_EVIDENCE_LIMITS.files, bundle.name);
+    assert.ok(bundle.sizes.every((size) => size <= COMMAND_EVIDENCE_LIMITS.fileBytes), bundle.name);
+    assert.ok(bundle.total <= COMMAND_EVIDENCE_LIMITS.exportBytes, bundle.name);
+    assert.ok(bundle.sizes.some((size) => size > 32 * 1024 * 1024), "both bundles exceed the old per-file limit");
+  }
+  assert.ok(bundles[0].total > 128 * 1024 * 1024, "coverage also exceeds the old total limit");
+});
+
 test("per-file and total export byte limits accept the boundary and reject overflow", async (t) => {
-  assert.deepEqual(COMMAND_EVIDENCE_LIMITS, { files: 128, fileBytes: 32 * 1024 * 1024, exportBytes: 128 * 1024 * 1024, streamBytes: 8 * 1024 * 1024 });
+  assert.deepEqual(COMMAND_EVIDENCE_LIMITS, { files: 128, fileBytes: 64 * 1024 * 1024, exportBytes: 512 * 1024 * 1024, streamBytes: 8 * 1024 * 1024 });
+  const wholeFileCount = COMMAND_EVIDENCE_LIMITS.exportBytes / COMMAND_EVIDENCE_LIMITS.fileBytes;
+  assert.equal(wholeFileCount, 8);
   const f = await recorder(t);
-  // Sparse inputs avoid filling the producer sink; retained copies exercise the real 128 MiB ceiling.
-  for (const [name, size] of [
-    ["a.bin", COMMAND_EVIDENCE_LIMITS.fileBytes], ["b.bin", COMMAND_EVIDENCE_LIMITS.fileBytes],
-    ["c.bin", COMMAND_EVIDENCE_LIMITS.fileBytes], ["d.bin", COMMAND_EVIDENCE_LIMITS.fileBytes],
-  ]) {
-    const handle = await open(join(f.archive.artifactDir, name), "wx");
-    await handle.truncate(size);
+  // Sparse inputs avoid filling the producer sink; retained copies exercise the real 512 MiB ceiling.
+  for (let i = 0; i < wholeFileCount; i++) {
+    const handle = await open(join(f.archive.artifactDir, `${i}.bin`), "wx");
+    await handle.truncate(COMMAND_EVIDENCE_LIMITS.fileBytes);
     await handle.close();
   }
   // Collect the exact boundary first; directory iteration order cannot influence this assertion.
   const reference = await finish(f.archive);
   const manifest = await verifyManifest(f.root, reference);
   assert.equal(reference.status, "complete");
+  assert.equal(manifest.status, "complete");
+  assert.deepEqual(manifest.limits, COMMAND_EVIDENCE_LIMITS);
+  assert.equal(manifest.outcome.status, "completed");
+  assert.ok(manifest.files.every((file) => file.complete));
   assert.equal(reference.recoveryDirectory, undefined);
+  assert.equal(manifest.recoveryDirectory, undefined);
   assert.equal(existsSync(f.archive.artifactDir), false);
   assert.equal(manifest.files.filter((file) => file.path.startsWith("artifacts/")).reduce((sum, file) => sum + file.bytes, 0), COMMAND_EVIDENCE_LIMITS.exportBytes);
   const g = await recorder(t);
@@ -638,12 +661,19 @@ test("per-file and total export byte limits accept the boundary and reject overf
   await tooLarge.truncate(COMMAND_EVIDENCE_LIMITS.fileBytes + 1);
   await tooLarge.close();
   const rejected = await finish(g.archive);
+  const rejectedManifest = await verifyManifest(g.root, rejected);
   assert.equal(rejected.status, "incomplete");
-  assert.match(rejected.issues.join(" "), /32 MiB per-file limit/);
-  assert.equal((await verifyManifest(g.root, rejected)).files.some((file) => file.path.startsWith("artifacts/")), false);
-  // A fifth maximum-size file must exceed the total in every possible enumeration order.
+  assert.equal(rejectedManifest.status, "incomplete");
+  assert.deepEqual(rejectedManifest.limits, COMMAND_EVIDENCE_LIMITS);
+  assert.equal(rejectedManifest.outcome.status, "completed");
+  assert.match(rejected.issues.join(" "), /64 MiB per-file limit/);
+  assert.equal(rejectedManifest.files.some((file) => file.path.startsWith("artifacts/")), false);
+  assert.equal(rejected.recoveryDirectory, g.archive.artifactDir);
+  assert.equal(rejectedManifest.recoveryDirectory, g.archive.artifactDir);
+  assert.equal((await lstat(join(rejected.recoveryDirectory, "too-large.bin"))).size, COMMAND_EVIDENCE_LIMITS.fileBytes + 1);
+  // One extra maximum-size file must exceed the total in every possible enumeration order.
   const h = await recorder(t);
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < wholeFileCount + 1; i++) {
     const handle = await open(join(h.archive.artifactDir, `${i}.bin`), "wx");
     await handle.truncate(COMMAND_EVIDENCE_LIMITS.fileBytes);
     await handle.close();
@@ -651,8 +681,48 @@ test("per-file and total export byte limits accept the boundary and reject overf
   const totalRejected = await finish(h.archive);
   const totalManifest = await verifyManifest(h.root, totalRejected);
   assert.equal(totalRejected.status, "incomplete");
-  assert.match(totalRejected.issues.join(" "), /128 MiB total limit/);
+  assert.equal(totalManifest.status, "incomplete");
+  assert.deepEqual(totalManifest.limits, COMMAND_EVIDENCE_LIMITS);
+  assert.equal(totalManifest.outcome.status, "completed");
+  assert.ok(totalManifest.files.every((file) => file.complete));
+  assert.match(totalRejected.issues.join(" "), /512 MiB total limit/);
   assert.equal(totalManifest.files.filter((file) => file.path.startsWith("artifacts/")).reduce((sum, file) => sum + file.bytes, 0), COMMAND_EVIDENCE_LIMITS.exportBytes);
+  assert.equal(totalRejected.recoveryDirectory, h.archive.artifactDir);
+  assert.equal(totalManifest.recoveryDirectory, h.archive.artifactDir);
+  const preserved = await readdir(totalRejected.recoveryDirectory);
+  assert.equal(preserved.length, wholeFileCount + 1);
+  for (const name of preserved) assert.equal((await lstat(join(totalRejected.recoveryDirectory, name))).size, COMMAND_EVIDENCE_LIMITS.fileBytes);
+});
+
+test("total export limit plus one byte is incomplete and recoverable regardless of enumeration order", async (t) => {
+  const f = await recorder(t);
+  const wholeFileCount = COMMAND_EVIDENCE_LIMITS.exportBytes / COMMAND_EVIDENCE_LIMITS.fileBytes;
+  for (let i = 0; i < wholeFileCount; i++) {
+    const handle = await open(join(f.archive.artifactDir, `${i}.bin`), "wx");
+    await handle.truncate(COMMAND_EVIDENCE_LIMITS.fileBytes);
+    await handle.close();
+  }
+  await writeFile(join(f.archive.artifactDir, "one-byte.bin"), Buffer.from([0x7f]));
+  const reference = await finish(f.archive);
+  const manifest = await verifyManifest(f.root, reference);
+  assert.equal(reference.status, "incomplete");
+  assert.equal(manifest.status, "incomplete");
+  assert.deepEqual(manifest.limits, COMMAND_EVIDENCE_LIMITS);
+  assert.equal(manifest.outcome.status, "completed");
+  assert.equal((await json(join(f.directory, "normalized.json"))).score, 11.4);
+  assert.match(reference.issues.join(" "), /512 MiB total limit/);
+  assert.ok(manifest.files.every((file) => file.complete));
+  const retainedBytes = manifest.files.filter((file) => file.path.startsWith("artifacts/")).reduce((sum, file) => sum + file.bytes, 0);
+  assert.ok(retainedBytes <= COMMAND_EVIDENCE_LIMITS.exportBytes);
+  // The byte can be retained before the last maximum-size file, or rejected after all eight fit.
+  assert.ok([COMMAND_EVIDENCE_LIMITS.exportBytes, COMMAND_EVIDENCE_LIMITS.exportBytes - COMMAND_EVIDENCE_LIMITS.fileBytes + 1].includes(retainedBytes));
+  assert.equal(reference.recoveryDirectory, f.archive.artifactDir);
+  assert.equal(manifest.recoveryDirectory, f.archive.artifactDir);
+  const preserved = await readdir(reference.recoveryDirectory);
+  assert.equal(preserved.length, wholeFileCount + 1);
+  for (const name of preserved) {
+    assert.equal((await lstat(join(reference.recoveryDirectory, name))).size, name === "one-byte.bin" ? 1 : COMMAND_EVIDENCE_LIMITS.fileBytes);
+  }
 });
 
 test("missing sink keeps raw data, marks capture incomplete, and preserves the original failure", async (t) => {
