@@ -39,22 +39,26 @@ export async function runCommand(
     let settled = false;
     let timedOut = false;
     let aborted = false;
+    let spawned = child.pid !== undefined;
+    const childErrors: Error[] = [];
     let timeout: NodeJS.Timeout | undefined;
     let activeTimeoutMs = 0;
     let lastTimeoutCheckAt = Date.now();
     let forceKill: NodeJS.Timeout | undefined;
-    let forceResolve: NodeJS.Timeout | undefined;
     let abortListener: (() => void) | undefined;
     const clearTimers = () => {
       if (timeout) clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
-      if (forceResolve) clearTimeout(forceResolve);
       if (abortListener) options.signal?.removeEventListener("abort", abortListener);
     };
     const finish = (exitCode: number, signal?: NodeJS.Signals | null) => {
       if (settled) return;
       settled = true;
       clearTimers();
+      if (childErrors.length) {
+        reject(childErrors.length === 1 ? childErrors[0] : new AggregateError(childErrors, "Started child reported multiple errors."));
+        return;
+      }
       const termination = timedOut
         ? `Command timed out after ${options.timeoutMs}ms.`
         : aborted ? "Command aborted during Burner shutdown." : "";
@@ -80,13 +84,8 @@ export async function runCommand(
       killTree("SIGTERM");
       forceKill = setTimeout(() => killTree("SIGKILL"), 5_000);
       forceKill.unref();
-      forceResolve = setTimeout(() => {
-        child.stdout.destroy();
-        child.stderr.destroy();
-        child.stdin.destroy();
-        finish(reason === "timeout" ? 124 : 130);
-      }, 6_000);
-      forceResolve.unref();
+      // A signal is not proof of exit. Keep the invocation (and its caller's
+      // resource admission) pending until close, even if termination stalls.
     };
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -99,11 +98,17 @@ export async function runCommand(
       options.onStderrChunk?.(chunk);
       for (const line of chunk.split("\n").filter(Boolean)) options.onStderr?.(line);
     });
+    child.once("spawn", () => { spawned = true; });
     child.on("error", (error) => {
       if (settled) return;
-      settled = true;
-      clearTimers();
-      reject(error);
+      if (!spawned && child.pid === undefined) {
+        settled = true;
+        clearTimers();
+        reject(error);
+      } else {
+        // Errors concerning an already-started process do not establish exit.
+        childErrors.push(error);
+      }
     });
     child.on("close", (code, signal) => finish(code ?? 1, signal));
     if (options.input !== undefined) child.stdin.end(options.input);

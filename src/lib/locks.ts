@@ -1,9 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { link, mkdir, open, readFile, readdir, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { errorMessage, now } from "./utils.js";
+import { join, resolve } from "node:path";
+import { now } from "./utils.js";
 
-export type HeldLock = { name: string; release: () => Promise<void> };
+export type HeldLock = {
+  name: string;
+  release: () => Promise<void>;
+  /** Return this live acquisition for a canonical resource, never an inferred owner. */
+  forResource: (manager: LockManager, name: string) => HeldLock | undefined;
+};
 export type AcquireOptions = { timeoutMs?: number; pollMs?: number };
 
 function lockKey(name: string): string {
@@ -15,7 +20,9 @@ export class LockManager {
   // cross-process exclusion. New job leases must not bypass waiting evals.
   private readonly waiters = new Map<string, symbol[]>();
 
-  constructor(private readonly lockDir: string, private readonly staleMs = 6 * 60 * 60 * 1000) {}
+  // Retain the old constructor argument for callers, but never expire a lock:
+  // age or controller death does not prove its protected work has stopped.
+  constructor(private readonly lockDir: string, _staleMs?: number) {}
 
   async init(): Promise<void> {
     await mkdir(this.lockDir, { recursive: true });
@@ -37,8 +44,10 @@ export class LockManager {
       const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
       const token = randomUUID();
       let released = false;
+      let borrowingClosed = false;
       let releaseInFlight: Promise<void> | undefined;
       const release = (): Promise<void> => {
+        borrowingClosed = true;
         if (released) return Promise.resolve();
         if (releaseInFlight) return releaseInFlight;
         // Concurrent releases of one handle must join the same unlink. A second
@@ -60,11 +69,11 @@ export class LockManager {
       let published = false;
       let publicationError: unknown;
       try {
-        try {
-          await handle.writeFile(JSON.stringify({ owner, pid: process.pid, createdAt: now(), token }));
-        } finally {
-          await handle.close();
-        }
+        const errors: unknown[] = [];
+        try { await handle.writeFile(JSON.stringify({ owner, pid: process.pid, createdAt: now(), token })); }
+        catch (error) { errors.push(error); }
+        try { await handle.close(); } catch (error) { errors.push(error); }
+        if (errors.length) throw errors.length === 1 ? errors[0] : new AggregateError(errors, `Could not write lock '${name}'.`);
         await link(temporaryPath, path);
         published = true;
       } catch (error) {
@@ -79,23 +88,18 @@ export class LockManager {
         throw new AggregateError(errors, `Could not clean up lock publication for '${name}'.`);
       }
       if (publicationError) throw publicationError;
-      return { name, release };
+      const held: HeldLock = {
+        name, release,
+        forResource: (manager, requestedName) => {
+          if (manager !== this) throw new Error(`Lock '${name}' belongs to a different resource manager.`);
+          if (safeName !== lockKey(requestedName)) return undefined;
+          if (borrowingClosed) throw new Error(`Lock '${name}' is releasing or released; it cannot be borrowed.`);
+          return held;
+        },
+      };
+      return held;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      try {
-        const contents = JSON.parse(await readFile(path, "utf8")) as { createdAt?: string };
-        if (contents.createdAt && Date.now() - new Date(contents.createdAt).getTime() > this.staleMs) {
-          await rm(path, { force: true });
-          return this.tryAcquireQueued(name, owner, waiter);
-        }
-      } catch (readError) {
-        // Older publishers can still expose incomplete metadata. Treat that as
-        // contention: never steal an unknown owner's lock or fail a waiting eval.
-        if (readError instanceof SyntaxError) return undefined;
-        if ((readError as NodeJS.ErrnoException).code !== "ENOENT") {
-          throw new Error(`Could not inspect lock ${name}: ${errorMessage(readError)}`);
-        }
-      }
       return undefined;
     }
   }
@@ -113,7 +117,11 @@ export class LockManager {
       while (true) {
         const lock = await this.tryAcquireQueued(name, owner, waiter);
         if (lock) return lock;
-        if (Date.now() >= deadline) throw new Error(`Timed out waiting for resource lock '${name}'.`);
+        if (Date.now() >= deadline) {
+          throw new Error(`Timed out waiting for resource lock '${name}' at ${resolve(this.lockDir, `${key}.lock`)}. ` +
+            "Burner does not expire or automatically reclaim occupied locks. Stopping a controller does not prove its work stopped. " +
+            "Establish quiescence of every controller and its work for this project before operator recovery of this exact lock.");
+        }
         await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(1, deadline - Date.now()))));
       }
     } finally {
@@ -151,28 +159,9 @@ export class LockManager {
     return (await readdir(this.lockDir)).filter((name) => name.endsWith(".lock")).map((name) => name.slice(0, -5));
   }
 
+  /** @deprecated Compatibility no-op. Only an operator with established project quiescence may recover abandoned locks. */
   async reapOrphans(): Promise<string[]> {
     await this.init();
-    const removed: string[] = [];
-    for (const filename of await readdir(this.lockDir)) {
-      if (!filename.endsWith(".lock")) continue;
-      const path = join(this.lockDir, filename);
-      try {
-        const contents = JSON.parse(await readFile(path, "utf8")) as { pid?: number; createdAt?: string };
-        const stale = contents.createdAt && Date.now() - new Date(contents.createdAt).getTime() > this.staleMs;
-        let alive = false;
-        if (contents.pid) {
-          try { process.kill(contents.pid, 0); alive = true; } catch { alive = false; }
-        }
-        if (stale || !alive) {
-          await rm(path, { force: true });
-          removed.push(filename.slice(0, -5));
-        }
-      } catch {
-        await rm(path, { force: true });
-        removed.push(filename.slice(0, -5));
-      }
-    }
-    return removed;
+    return [];
   }
 }

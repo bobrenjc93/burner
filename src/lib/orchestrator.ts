@@ -29,6 +29,14 @@ type LeafEvaluationExecution = { run: AgentRun; receiptId: string; claim: AgentC
 export type LeafAdmissionOptions = { legacyPrProof?: LegacyLeafPrProofInput; retainWorktree?: true };
 export type AgentRetryOptions = LeafAdmissionOptions & { repairNotes?: string };
 
+/** Every fan-out owner must drain its writers before its resource/claim unwinds. */
+async function settleEvaluationWork<T>(work: Promise<T>[]): Promise<T[]> {
+  const results = await Promise.allSettled(work);
+  const errors = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (errors.length) throw errors.length === 1 ? errors[0] : new AggregateError(errors, "Evaluation work failed.");
+  return results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+}
+
 type FullAssessmentSource = Pick<AgentRun, "fullEvaluationHistory" | "fullMergeValidation" | "evaluationRepair">;
 
 function fullAssessments(run: FullAssessmentSource | undefined): FullMergeValidation[] {
@@ -424,6 +432,12 @@ class CandidateEvaluationError extends Error {
     super(message);
     this.name = "CandidateEvaluationError";
   }
+}
+
+/** Draining siblings must not turn incomplete samples into an infrastructure failure. */
+function isCandidateEvaluationError(error: unknown): boolean {
+  return error instanceof CandidateEvaluationError || (error instanceof AggregateError &&
+    error.errors.length > 0 && error.errors.every(isCandidateEvaluationError));
 }
 
 const CANDIDATE_EVALUATION_PROTOCOL = "baseline-anchored-v4-independent-baseline";
@@ -1274,15 +1288,41 @@ export class Orchestrator {
     const limit = 3;
     if (this.activePromptEvaluations >= limit) {
       await new Promise<void>((resolve) => this.promptEvaluationWaiters.push(resolve));
+    } else {
+      this.activePromptEvaluations += 1;
     }
-    this.activePromptEvaluations += 1;
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      this.activePromptEvaluations -= 1;
-      this.promptEvaluationWaiters.shift()?.();
+      const next = this.promptEvaluationWaiters.shift();
+      // Transfer the reservation before the waiter resumes. A newcomer must
+      // not acquire this slot in the gap between resolve and continuation.
+      if (next) next();
+      else this.activePromptEvaluations -= 1;
     };
+  }
+
+  private async withEvaluationLease<T>(lease: ResourceLease | undefined, work: (cpuLock: HeldLock) => Promise<T>): Promise<T> {
+    let borrowed: HeldLock | undefined;
+    for (const held of lease?.locks ?? []) {
+      const cpu = held.forResource(this.locks, "cpu-heavy");
+      if (cpu) borrowed = cpu;
+    }
+    const cpuLock = borrowed ?? await this.locks.acquire("cpu-heavy", id("evaluation-cohort"), { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
+    let failed = false;
+    let workError: unknown;
+    try { return await work(cpuLock); }
+    catch (error) { failed = true; workError = error; throw error; }
+    finally {
+      if (!borrowed) {
+        try { await cpuLock.release(); }
+        catch (error) {
+          if (failed) throw new AggregateError([workError, error], "Evaluation work and resource release failed.");
+          throw error;
+        }
+      }
+    }
   }
 
   private portfolioMode(): boolean {
@@ -1481,9 +1521,12 @@ export class Orchestrator {
     if (options.startPaused || options.manual) await this.setEnabled(false);
     await this.initializeProtectedParentRepository();
     await this.locks.init();
-    const orphanedLocks = await this.locks.reapOrphans();
-    if (orphanedLocks.length) {
-      await this.store.addActivity({ type: "system", message: "Recovered stale resource locks", detail: orphanedLocks.join(", ") });
+    const retainedLocks = await this.locks.list();
+    if (retainedLocks.length) {
+      await this.store.addActivity({ type: "system", message: "Resource locks retained",
+        detail: `Existing locks in ${join(this.store.dataDir, "locks")}: ${retainedLocks.join(", ")}. ` +
+          "Burner never automatically reclaims occupied locks. Stopping a controller does not prove its work stopped; " +
+          "establish quiescence of every project controller and its work before operator recovery of an individual abandoned lock." });
     }
     const status = await this.git.status();
     if (status.available && status.branch) {
@@ -1856,7 +1899,7 @@ export class Orchestrator {
       }
       let completed: LeafEvaluationReceipt;
       try { completed = receipt.result ? receipt : await this.runLeafEvaluation(run, receipt.id, worktree, claim); }
-      catch (error) { if (error instanceof CandidateEvaluationError) return false; throw error; }
+      catch (error) { if (isCandidateEvaluationError(error)) return false; throw error; }
       const qualifies = this.recordedFullQualification(completed);
       run = await this.finishRecordedFullEvaluation({ ...run, fullEvaluation: { step: "sampling", evaluation: completed } }, claim, worktree);
       terminalAssessment = true;
@@ -2386,7 +2429,7 @@ export class Orchestrator {
     }));
   }
 
-  private async runLeafEvaluation(run: AgentRun, receiptId: string, cwd: string, claim: AgentClaim): Promise<LeafEvaluationReceipt> {
+  private async runLeafEvaluation(run: AgentRun, receiptId: string, cwd: string, claim: AgentClaim, lease?: ResourceLease): Promise<LeafEvaluationReceipt> {
     const scope: LeafEvaluationExecution = { run, receiptId, claim, side: "candidate", index: 0 };
     const read = () => this.assertLeafEvaluation(scope, this.store.get());
     const initial = read();
@@ -2404,91 +2447,91 @@ export class Orchestrator {
       verifyCurrentLeafReceipt(this.store.get(), initial);
       return initial;
     }
-    const callerOwnsCpuLock = run.resources.includes("cpu-heavy") && this.activeAgents.has(run.ideaId);
-    const fill = async (evaluationIds: string[], side: "candidate" | "baseline", index: number) => {
-      const pending = () => evaluationIds.filter((evaluationId) => !completedSample(this.store.get(), read(), evaluationId, side, index));
-      for (let pass = 0; pass < 2 && pending().length; pass += 1) {
-        await checkGit();
-        if (side === "baseline" && (await this.git.head(this.root) !== initial.identity.baseCommit || await this.git.hasChanges(this.root))) {
-          throw new Error("Leaf baseline confirmation requires the clean pinned comparison checkout.");
+    return this.withEvaluationLease(lease, async (cpuLock) => {
+      const fill = async (evaluationIds: string[], side: "candidate" | "baseline", index: number) => {
+        const pending = () => evaluationIds.filter((evaluationId) => !completedSample(this.store.get(), read(), evaluationId, side, index));
+        for (let pass = 0; pass < 2 && pending().length; pass += 1) {
+          await checkGit();
+          if (side === "baseline" && (await this.git.head(this.root) !== initial.identity.baseCommit || await this.git.hasChanges(this.root))) {
+            throw new Error("Leaf baseline confirmation requires the clean pinned comparison checkout.");
+          }
+          const receipt = read();
+          await this.runEvaluationSuite(cpuLock, side === "baseline" ? "baseline" : receipt.purpose === "delivery" && index === 0 ? "agent" : "composite",
+            side === "baseline" ? this.root : cwd, run.id, undefined, pending(),
+            side === "candidate" ? this.leafBaseline(this.store.get(), receipt) : undefined, { ...scope, side, index }, index > 0);
         }
-        const receipt = read();
-        await this.runEvaluationSuite(side === "baseline" ? "baseline" : receipt.purpose === "delivery" && index === 0 ? "agent" : "composite",
-          side === "baseline" ? this.root : cwd, run.id, undefined, pending(), callerOwnsCpuLock,
-          side === "candidate" ? this.leafBaseline(this.store.get(), receipt) : undefined, { ...scope, side, index });
-      }
-      if (pending().length) throw new CandidateEvaluationError(`Leaf evaluation ${receiptId} has incomplete ${side} sample ${index} after targeted retries; completed slots are preserved.`);
-    };
-    await fill(initial.evaluations.map((entry) => entry.evaluationId), "candidate", 0);
-    await checkGit();
-    const seeded = read();
-    const changed = seeded.evaluations.filter((entry) => entry.mode === "prompt" &&
-      Math.round((completedSample(this.store.get(), seeded, entry.evaluationId, "candidate", 0)!.score! - entry.baseline.score) * 10) !== 0);
-    const baselineChanges = changed.filter((entry) => entry.baseline.count < 3);
-    await this.persistLeafUpdate((draft) => {
-      const receipt = this.assertLeafEvaluation(scope, draft);
-      for (const entry of receipt.evaluations) {
-        if (!changed.some((item) => item.evaluationId === entry.evaluationId)) continue;
-        if (entry.candidate.length === 1) entry.candidate.push({ attempts: [] }, { attempts: [] });
-        if (entry.baseline.count < 3) entry.baselineConfirmations ??= [{ attempts: [] }, { attempts: [] }];
-      }
-    }, (draft) => {
-      const receipt = leafEvaluation(draft.agentRuns.find((item) => item.id === run.id), receiptId);
-      return Boolean(receipt && changed.every((item) => receipt.evaluations.find((entry) => entry.evaluationId === item.evaluationId)?.candidate.length === 3) &&
-        baselineChanges.every((item) => receipt.evaluations.find((entry) => entry.evaluationId === item.evaluationId)?.baselineConfirmations?.length === 2));
-    });
-    // Settle every sibling before leaving this phase, including notification
-    // failures. A released claim must never leave a writer running behind it.
-    const confirmations = await Promise.allSettled([
-      ...[1, 2].map((index) => fill(changed.map((entry) => entry.evaluationId), "candidate", index)),
-      ...[1, 2].map((index) => fill(baselineChanges.map((entry) => entry.evaluationId), "baseline", index)),
-    ]);
-    const failed = confirmations.find((result) => result.status === "rejected");
-    if (failed?.status === "rejected") throw failed.reason;
-    await checkGit();
-    const median = (rows: EvaluationRun[]) => [...rows].sort((left, right) => left.score! - right.score!)[Math.floor(rows.length / 2)]!;
-    const createdAt = nextEvaluationTimestamp(this.store.get().evaluationRuns);
-    const medianIds = new Map(baselineChanges.map((entry) => [entry.evaluationId, id("evalrun")]));
-    await this.persistLeafUpdate((draft) => {
-      const receipt = this.assertLeafEvaluation(scope, draft);
-      for (const entry of receipt.evaluations.filter((item) => item.baselineConfirmations && !item.baselineMedian)) {
-        const rows = [evidenceRow(draft, entry.baseline.source), ...[1, 2].map((index) => completedSample(draft, receipt, entry.evaluationId, "baseline", index)!)];
-        const reduced: EvaluationRun = { ...median(rows), id: medianIds.get(entry.evaluationId)!, context: "baseline", agentRunId: undefined,
-          compositeId: undefined, leafSample: undefined, commit: receipt.identity.baseCommit, createdAt, promptSampleCount: 3, sourceRunIds: rows.map((row) => row.id) };
-        draft.evaluationRuns.push(reduced);
-        entry.baselineMedian = evaluationEvidence(reduced);
-      }
-    }, (draft) => {
-      const receipt = leafEvaluation(draft.agentRuns.find((item) => item.id === run.id), receiptId);
-      return Boolean(receipt && baselineChanges.every((entry) => receipt.evaluations.find((item) => item.evaluationId === entry.evaluationId)?.baselineMedian));
-    });
-    await checkGit();
-    let completed: LeafEvaluationReceipt | undefined;
-    await this.persistLeafUpdate((draft) => {
-      const receipt = this.assertLeafEvaluation(scope, draft);
-      if (receipt.result) { completed = structuredClone(receipt); return; }
-      const after = receipt.evaluations.map((entry) => median(entry.candidate.map((_slot, index) => completedSample(draft, receipt, entry.evaluationId, "candidate", index)!)));
-      const baseline = this.leafBaseline(draft, receipt, true);
-      const deltas = this.calculateDeltas(draft, baseline, after).map((delta) => ({ ...delta,
-        screening: receipt.evaluations.find((entry) => entry.evaluationId === delta.evaluationId)?.mode === "screening-command" }));
-      const references = new Map<string, LeafEvidenceReference>();
-      const selections = receipt.evaluations.map((entry) => {
-        const candidateRows = entry.candidate.map((_slot, index) => completedSample(draft, receipt, entry.evaluationId, "candidate", index)!);
-        const baselineRows = [evidenceRow(draft, entry.baseline.source), ...entry.baselineConfirmations?.map((_slot, index) => completedSample(draft, receipt, entry.evaluationId, "baseline", index + 1)!) ?? []];
-        for (const row of [...candidateRows, ...baselineRows]) references.set(row.id, evaluationEvidence(row));
-        for (const reference of entry.baseline.projection?.inputs ?? []) references.set(reference.runId, reference);
-        if (entry.baselineMedian) references.set(entry.baselineMedian.runId, entry.baselineMedian);
-        return { evaluationId: entry.evaluationId, candidate: median(candidateRows).id, baseline: entry.baselineMedian?.runId ?? entry.baseline.source.runId,
-          candidateSources: candidateRows.map((row) => row.id), baselineSources: baselineRows.map((row) => row.id), count: candidateRows.length,
-          baselineCount: entry.baselineMedian ? 3 : entry.baseline.count };
+        if (pending().length) throw new CandidateEvaluationError(`Leaf evaluation ${receiptId} has incomplete ${side} sample ${index} after targeted retries; completed slots are preserved.`);
+      };
+      await fill(initial.evaluations.map((entry) => entry.evaluationId), "candidate", 0);
+      await checkGit();
+      const seeded = read();
+      const changed = seeded.evaluations.filter((entry) => entry.mode === "prompt" &&
+        Math.round((completedSample(this.store.get(), seeded, entry.evaluationId, "candidate", 0)!.score! - entry.baseline.score) * 10) !== 0);
+      const baselineChanges = changed.filter((entry) => entry.baseline.count < 3);
+      await this.persistLeafUpdate((draft) => {
+        const receipt = this.assertLeafEvaluation(scope, draft);
+        for (const entry of receipt.evaluations) {
+          if (!changed.some((item) => item.evaluationId === entry.evaluationId)) continue;
+          if (entry.candidate.length === 1) entry.candidate.push({ attempts: [] }, { attempts: [] });
+          if (entry.baseline.count < 3) entry.baselineConfirmations ??= [{ attempts: [] }, { attempts: [] }];
+        }
+      }, (draft) => {
+        const receipt = leafEvaluation(draft.agentRuns.find((item) => item.id === run.id), receiptId);
+        return Boolean(receipt && changed.every((item) => receipt.evaluations.find((entry) => entry.evaluationId === item.evaluationId)?.candidate.length === 3) &&
+          baselineChanges.every((item) => receipt.evaluations.find((entry) => entry.evaluationId === item.evaluationId)?.baselineConfirmations?.length === 2));
       });
-      receipt.result = { completedAt: now(), sources: [...references.values()], selections, deltas, impact: this.calculateImpact(draft, deltas) };
-      completed = structuredClone(receipt);
-    }, (draft) => Boolean(completed?.result && JSON.stringify(leafEvaluation(draft.agentRuns.find((item) => item.id === run.id), receiptId)?.result) === JSON.stringify(completed.result)));
-    return completed!;
+      // Settle every sibling before leaving this phase, including notification
+      // failures. A released claim must never leave a writer running behind it.
+      await settleEvaluationWork([
+        ...[1, 2].map((index) => fill(changed.map((entry) => entry.evaluationId), "candidate", index)),
+        ...[1, 2].map((index) => fill(baselineChanges.map((entry) => entry.evaluationId), "baseline", index)),
+      ]);
+      await checkGit();
+      const median = (rows: EvaluationRun[]) => [...rows].sort((left, right) => left.score! - right.score!)[Math.floor(rows.length / 2)]!;
+      const createdAt = nextEvaluationTimestamp(this.store.get().evaluationRuns);
+      const medianIds = new Map(baselineChanges.map((entry) => [entry.evaluationId, id("evalrun")]));
+      await this.persistLeafUpdate((draft) => {
+        const receipt = this.assertLeafEvaluation(scope, draft);
+        for (const entry of receipt.evaluations.filter((item) => item.baselineConfirmations && !item.baselineMedian)) {
+          const rows = [evidenceRow(draft, entry.baseline.source), ...[1, 2].map((index) => completedSample(draft, receipt, entry.evaluationId, "baseline", index)!)];
+          const reduced: EvaluationRun = { ...median(rows), id: medianIds.get(entry.evaluationId)!, context: "baseline", agentRunId: undefined,
+            compositeId: undefined, leafSample: undefined, commit: receipt.identity.baseCommit, createdAt, promptSampleCount: 3, sourceRunIds: rows.map((row) => row.id) };
+          draft.evaluationRuns.push(reduced);
+          entry.baselineMedian = evaluationEvidence(reduced);
+        }
+      }, (draft) => {
+        const receipt = leafEvaluation(draft.agentRuns.find((item) => item.id === run.id), receiptId);
+        return Boolean(receipt && baselineChanges.every((entry) => receipt.evaluations.find((item) => item.evaluationId === entry.evaluationId)?.baselineMedian));
+      });
+      await checkGit();
+      let completed: LeafEvaluationReceipt | undefined;
+      await this.persistLeafUpdate((draft) => {
+        const receipt = this.assertLeafEvaluation(scope, draft);
+        if (receipt.result) { completed = structuredClone(receipt); return; }
+        const after = receipt.evaluations.map((entry) => median(entry.candidate.map((_slot, index) => completedSample(draft, receipt, entry.evaluationId, "candidate", index)!)));
+        const baseline = this.leafBaseline(draft, receipt, true);
+        const deltas = this.calculateDeltas(draft, baseline, after).map((delta) => ({ ...delta,
+          screening: receipt.evaluations.find((entry) => entry.evaluationId === delta.evaluationId)?.mode === "screening-command" }));
+        const references = new Map<string, LeafEvidenceReference>();
+        const selections = receipt.evaluations.map((entry) => {
+          const candidateRows = entry.candidate.map((_slot, index) => completedSample(draft, receipt, entry.evaluationId, "candidate", index)!);
+          const baselineRows = [evidenceRow(draft, entry.baseline.source), ...entry.baselineConfirmations?.map((_slot, index) => completedSample(draft, receipt, entry.evaluationId, "baseline", index + 1)!) ?? []];
+          for (const row of [...candidateRows, ...baselineRows]) references.set(row.id, evaluationEvidence(row));
+          for (const reference of entry.baseline.projection?.inputs ?? []) references.set(reference.runId, reference);
+          if (entry.baselineMedian) references.set(entry.baselineMedian.runId, entry.baselineMedian);
+          return { evaluationId: entry.evaluationId, candidate: median(candidateRows).id, baseline: entry.baselineMedian?.runId ?? entry.baseline.source.runId,
+            candidateSources: candidateRows.map((row) => row.id), baselineSources: baselineRows.map((row) => row.id), count: candidateRows.length,
+            baselineCount: entry.baselineMedian ? 3 : entry.baseline.count };
+        });
+        receipt.result = { completedAt: now(), sources: [...references.values()], selections, deltas, impact: this.calculateImpact(draft, deltas) };
+        completed = structuredClone(receipt);
+      }, (draft) => Boolean(completed?.result && JSON.stringify(leafEvaluation(draft.agentRuns.find((item) => item.id === run.id), receiptId)?.result) === JSON.stringify(completed.result)));
+      return completed!;
+    });
   }
 
   private async collectPromptMedians(
+    cpuLock: HeldLock,
     context: EvaluationRun["context"],
     cwd: string,
     evaluationIds: string[],
@@ -2499,8 +2542,8 @@ export class Orchestrator {
     candidateBaseline?: ReadonlyMap<string, EvaluationRun>,
   ): Promise<Map<string, EvaluationRun> | undefined> {
     if (!evaluationIds.length) return new Map();
-    const initialConfirmationBatches = await Promise.all([0, 1].map(() =>
-      this.runEvaluations(context, cwd, agentRunId, compositeId, evaluationIds, candidateBaseline),
+    const initialConfirmationBatches = await settleEvaluationWork([0, 1].map(() =>
+      this.runEvaluationSuite(cpuLock, context, cwd, agentRunId, compositeId, evaluationIds, candidateBaseline, undefined, true),
     ));
     const incompleteBatchIds = initialConfirmationBatches.map((confirmationRuns) =>
       evaluationIds.filter((evaluationId) => {
@@ -2516,16 +2559,19 @@ export class Orchestrator {
         detail: "Only missing samples are retried once; scoring remains fail-closed if any retry is incomplete.",
       });
     }
-    const confirmationBatches = await Promise.all(initialConfirmationBatches.map(async (confirmationRuns, index) => {
+    const confirmationBatches = await settleEvaluationWork(initialConfirmationBatches.map(async (confirmationRuns, index) => {
       const incompleteIds = incompleteBatchIds[index]!;
       if (!incompleteIds.length) return confirmationRuns;
-      const retries = await this.runEvaluations(
+      const retries = await this.runEvaluationSuite(
+        cpuLock,
         context,
         cwd,
         agentRunId,
         compositeId,
         incompleteIds,
         candidateBaseline,
+        undefined,
+        true,
       );
       const completed = new Map(confirmationRuns
         .filter((item) => item.status === "completed" && item.score !== undefined)
@@ -2551,6 +2597,7 @@ export class Orchestrator {
   }
 
   private async confirmPromptChanges(
+    cpuLock: HeldLock,
     cwd: string,
     baseline: Map<string, EvaluationRun>,
     afterRuns: EvaluationRun[],
@@ -2600,8 +2647,9 @@ export class Orchestrator {
       afterRuns.find((item) => item.evaluationId === evaluationId)!,
     ]));
     const baselineSeeds = new Map(baselineConfirmationIds.map((evaluationId) => [evaluationId, baseline.get(evaluationId)!]));
-    const [candidateMedians, baselineMedians] = await Promise.all([
+    const [candidateMedians, baselineMedians] = await settleEvaluationWork([
       this.collectPromptMedians(
+        cpuLock,
         "composite",
         cwd,
         promptChangeIds,
@@ -2611,7 +2659,7 @@ export class Orchestrator {
         compositeId,
         baseline,
       ),
-      this.collectPromptMedians("baseline", this.root, baselineConfirmationIds, baselineSeeds, `${candidateLabel} baseline`),
+      this.collectPromptMedians(cpuLock, "baseline", this.root, baselineConfirmationIds, baselineSeeds, `${candidateLabel} baseline`),
     ]);
     if (!candidateMedians || !baselineMedians) return undefined;
     for (const [evaluationId, median] of baselineMedians) baseline.set(evaluationId, median);
@@ -2746,7 +2794,7 @@ export class Orchestrator {
     const lease = await this.locks.tryAcquireAll(resources, idea.id);
     if (!lease) throw new Error("A required resource is currently locked.");
     this.activeAgents.add(idea.id);
-    await this.runIdea(idea, base, resources, lease.locks, lease.release);
+    await this.runIdea(idea, base, resources, lease);
     const after = this.store.get();
     const runId = after.ideas.find((item) => item.id === idea.id)?.agentRunId;
     const completed = after.agentRuns.find((run) => run.id === runId);
@@ -3321,7 +3369,7 @@ export class Orchestrator {
       await this.store.addActivity({ type: "agent", message: `Agent retry resumed: ${idea.title}`, detail: resumeDelivery
         ? "Resuming delivery of the exact independently approved head without another author or review round."
         : "Reusing the existing candidate, pull request, author session, and cumulative review history." });
-      await this.continueLeaf(idea, base, run.id, claim);
+      await this.continueLeaf(idea, base, run.id, claim, lease);
     } catch (error) {
       if (!started || !run || !idea) {
         if (run?.leafPr?.known && (error instanceof LeafReviewLimitError || error instanceof PortfolioReviewLimitError)) {
@@ -3385,20 +3433,18 @@ export class Orchestrator {
     evaluationIds?: readonly string[],
     candidateBaseline?: ReadonlyMap<string, EvaluationRun>,
   ): Promise<EvaluationRun[]> {
-    const callerRun = agentRunId ? this.store.get().agentRuns.find((run) => run.id === agentRunId) : undefined;
-    const callerOwnsCpuLock = Boolean(callerRun?.resources.includes("cpu-heavy") && this.activeAgents.has(callerRun.ideaId));
-    return this.runEvaluationSuite(
+    return this.withEvaluationLease(undefined, (cpuLock) => this.runEvaluationSuite(
+      cpuLock,
       context,
       cwd,
       agentRunId,
       compositeId,
       evaluationIds,
-      callerOwnsCpuLock,
       candidateBaseline,
-    );
+    ));
   }
 
-  private async confirmBaselinePromptScores(commit: string): Promise<EvaluationRun[] | undefined> {
+  private async confirmBaselinePromptScores(cpuLock: HeldLock, commit: string): Promise<EvaluationRun[] | undefined> {
     const state = this.store.get();
     const latest = this.store.latestRuns();
     const evaluationIds = state.evaluations
@@ -3417,7 +3463,7 @@ export class Orchestrator {
       detail: "Burner will persist median-of-three baseline scores before starting the merge-cadence clock or dispatching candidate work.",
     });
     const seeds = new Map(evaluationIds.map((evaluationId) => [evaluationId, latest.get(evaluationId)!]));
-    const medians = await this.collectPromptMedians("baseline", this.root, evaluationIds, seeds, "the baseline");
+    const medians = await this.collectPromptMedians(cpuLock, "baseline", this.root, evaluationIds, seeds, "the baseline");
     if (!medians) {
       await this.store.addActivity({
         type: "error",
@@ -3448,43 +3494,45 @@ export class Orchestrator {
   }
 
   async runBaselineEvaluations(context: "baseline" | "manual" = "manual"): Promise<EvaluationRun[]> {
-    const commit = await this.git.resolveRef(this.store.get().settings.baseBranch);
-    let enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
-    let fullBaseline = this.store.latestRuns();
-    let missingFull = enabled.filter((evaluation) => !isCurrentEvaluationRun(evaluation, fullBaseline.get(evaluation.id), commit));
-    if (missingFull.length) {
-      const mergedLeaves = this.store.get().agentRuns.filter((run) => run.prState === "merged").reverse();
-      for (const mergedLeaf of mergedLeaves) {
-        if (await this.promoteMergedAgentBaseline(mergedLeaf.id, commit)) break;
+    return this.withEvaluationLease(undefined, async (cpuLock) => {
+      const commit = await this.git.resolveRef(this.store.get().settings.baseBranch);
+      let enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
+      let fullBaseline = this.store.latestRuns();
+      let missingFull = enabled.filter((evaluation) => !isCurrentEvaluationRun(evaluation, fullBaseline.get(evaluation.id), commit));
+      if (missingFull.length) {
+        const mergedLeaves = this.store.get().agentRuns.filter((run) => run.prState === "merged").reverse();
+        for (const mergedLeaf of mergedLeaves) {
+          if (await this.promoteMergedAgentBaseline(mergedLeaf.id, commit)) break;
+        }
+        enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
+        fullBaseline = this.store.latestRuns();
+        missingFull = enabled.filter((evaluation) => !isCurrentEvaluationRun(evaluation, fullBaseline.get(evaluation.id), commit));
       }
-      enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
-      fullBaseline = this.store.latestRuns();
-      missingFull = enabled.filter((evaluation) => !isCurrentEvaluationRun(evaluation, fullBaseline.get(evaluation.id), commit));
-    }
-    const fullRuns = missingFull.length === 0
-      ? []
-      : await this.runEvaluations(context, this.root, undefined, undefined, missingFull.map((evaluation) => evaluation.id));
-    const screeningBaseline = this.store.latestScreeningRuns();
-    const missingScreening = enabled.filter((evaluation) => evaluation.screeningCommand && !isAuthoritativeScreeningBaseline(evaluation, screeningBaseline.get(evaluation.id), commit));
-    const screeningRuns = missingScreening.length > 0
-      ? await this.runEvaluations("screening_baseline", this.root, undefined, undefined, missingScreening.map((evaluation) => evaluation.id))
-      : [];
-    const promptMedians = await this.confirmBaselinePromptScores(commit);
-    const runs = [...fullRuns, ...screeningRuns, ...(promptMedians ?? [])];
-    const refreshedState = this.store.get();
-    const refreshedEnabled = refreshedState.evaluations.filter((evaluation) => evaluation.enabled);
-    const refreshedFull = this.store.latestRuns();
-    const refreshedScreening = this.store.latestScreeningRuns();
-    const complete = promptMedians !== undefined &&
-      refreshedEnabled.every((evaluation) => isAuthoritativeFullBaseline(evaluation, refreshedFull.get(evaluation.id), commit)) &&
-      refreshedEnabled.every((evaluation) => !evaluation.screeningCommand || isAuthoritativeScreeningBaseline(evaluation, refreshedScreening.get(evaluation.id), commit));
-    if (runs.every((run) => run.status === "completed" && run.score !== undefined) && complete) {
-      await this.store.update((draft) => {
-        draft.orchestrator.lastEvaluationAt = now();
-        if (this.portfolioMode()) draft.orchestrator.mergeWindowStartedAt ??= now();
-      });
-    }
-    return runs;
+      const fullRuns = missingFull.length === 0
+        ? []
+        : await this.runEvaluationSuite(cpuLock, context, this.root, undefined, undefined, missingFull.map((evaluation) => evaluation.id));
+      const screeningBaseline = this.store.latestScreeningRuns();
+      const missingScreening = enabled.filter((evaluation) => evaluation.screeningCommand && !isAuthoritativeScreeningBaseline(evaluation, screeningBaseline.get(evaluation.id), commit));
+      const screeningRuns = missingScreening.length > 0
+        ? await this.runEvaluationSuite(cpuLock, "screening_baseline", this.root, undefined, undefined, missingScreening.map((evaluation) => evaluation.id))
+        : [];
+      const promptMedians = await this.confirmBaselinePromptScores(cpuLock, commit);
+      const runs = [...fullRuns, ...screeningRuns, ...(promptMedians ?? [])];
+      const refreshedState = this.store.get();
+      const refreshedEnabled = refreshedState.evaluations.filter((evaluation) => evaluation.enabled);
+      const refreshedFull = this.store.latestRuns();
+      const refreshedScreening = this.store.latestScreeningRuns();
+      const complete = promptMedians !== undefined &&
+        refreshedEnabled.every((evaluation) => isAuthoritativeFullBaseline(evaluation, refreshedFull.get(evaluation.id), commit)) &&
+        refreshedEnabled.every((evaluation) => !evaluation.screeningCommand || isAuthoritativeScreeningBaseline(evaluation, refreshedScreening.get(evaluation.id), commit));
+      if (runs.every((run) => run.status === "completed" && run.score !== undefined) && complete) {
+        await this.store.update((draft) => {
+          draft.orchestrator.lastEvaluationAt = now();
+          if (this.portfolioMode()) draft.orchestrator.mergeWindowStartedAt ??= now();
+        });
+      }
+      return runs;
+    });
   }
 
   private missingBaselineEvaluations(baseCommit: string, state = this.store.get()): Evaluation[] {
@@ -3626,15 +3674,17 @@ export class Orchestrator {
   }
 
   private async runEvaluationSuite(
+    cpuLock: HeldLock,
     context: EvaluationRun["context"],
     cwd: string,
     agentRunId?: string,
     compositeId?: string,
     evaluationIds?: readonly string[],
-    callerOwnsCpuLock = false,
     candidateBaseline?: ReadonlyMap<string, EvaluationRun>,
     leafScope?: LeafEvaluationExecution,
+    promptOnly = false,
   ): Promise<EvaluationRun[]> {
+    if (cpuLock.forResource(this.locks, "cpu-heavy") !== cpuLock) throw new Error("Evaluation requires a live CPU resource acquisition.");
     const state = this.store.get();
     const candidateBaselines = context === "agent" || context === "composite"
       ? candidateBaseline ?? this.store.latestRuns()
@@ -3644,11 +3694,18 @@ export class Orchestrator {
       evaluation.enabled &&
       (!selectedIds || selectedIds.has(evaluation.id)) &&
       (context !== "screening_baseline" || evaluation.screeningCommand),
-    );
+    ).map((evaluation) => structuredClone(evaluation));
     if (!evaluations.length) throw new Error("Add at least one enabled evaluation first.");
+    // Validate the actual execution snapshot, not an earlier ID list: public
+    // definitions can change while confirmation/retry work is waiting.
+    if (promptOnly && evaluations.some((evaluation) => evaluation.command || evaluation.screeningCommand)) {
+      throw new Error("Parallel prompt confirmations cannot launch a command evaluation.");
+    }
     if (evaluations.some((evaluation) => !evaluation.command)) await this.codex.preflight(cwd);
     const commit = await this.git.head(cwd);
     this.runningEvaluations += evaluations.length;
+    let failed = false;
+    let workError: unknown;
     try {
       await this.store.addActivity({
         type: "evaluation",
@@ -3697,8 +3754,6 @@ export class Orchestrator {
         });
         this.events.emit("evaluation", { id: run.id, status: "running", evaluationId: evaluation.id });
         const commandBacked = Boolean(evaluation.command || evaluation.screeningCommand);
-        let cpuLock: HeldLock | undefined;
-        let commandLock: HeldLock | undefined;
         let releasePromptSlot: (() => void) | undefined;
         let commandEvidence: CommandEvidenceArchive | undefined;
         const persistRun = () => this.persistLeafUpdate((draft) => {
@@ -3725,55 +3780,51 @@ export class Orchestrator {
           const receipt = leafEvaluation(draft.agentRuns.find((item) => item.id === leafScope.run.id), leafScope.receiptId);
           return Boolean(receipt && completedSample(draft, receipt, evaluation.id, leafScope.side, leafScope.index)?.id === run.id);
         });
+        const errors: unknown[] = [];
         try {
-          if (commandBacked) {
-            if (!callerOwnsCpuLock) cpuLock = await this.locks.acquire("cpu-heavy", `${run.id}-cpu`, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
-            commandLock = await this.locks.acquire(`command-evaluation-${evaluation.id}`, run.id, { timeoutMs: 6 * 60 * 60 * 1000, pollMs: 250 });
-          } else {
-            releasePromptSlot = await this.acquirePromptEvaluationSlot();
+          try {
+            if (!commandBacked) releasePromptSlot = await this.acquirePromptEvaluationSlot();
+            const leafMode = leafScope ? this.assertLeafEvaluation(leafScope, this.store.get()).evaluations.find((entry) => entry.evaluationId === evaluation.id)?.mode : undefined;
+            const evaluated = leafMode === "full-command" || (context === "agent" && !this.portfolioMode() && !leafScope)
+              ? { ...evaluation, screeningCommand: undefined }
+              : evaluation;
+            run.attempts = 1;
+            if (evaluated.command) {
+              const screening = (context === "agent" || context === "screening_baseline") && Boolean(evaluated.screeningCommand);
+              commandEvidence = await CommandEvidenceArchive.create(this.store.dataDir, run, evaluation.name, cwd, screening ? "screening" : "full");
+              run.commandEvidence = structuredClone(commandEvidence.reference);
+              await this.store.update((draft) => {
+                const current = draft.evaluationRuns.find((item) => item.id === run.id);
+                if (current) current.commandEvidence = run.commandEvidence;
+              });
+            }
+            const output = await this.codex.evaluate(cwd, evaluated, state.settings, context, candidateBaselines?.get(evaluation.id), commandEvidence);
+            if (commandEvidence) run.commandEvidence = await commandEvidence.finalize({ status: "completed" });
+            Object.assign(run, output, { status: "completed" as const, durationMs: Date.now() - started });
+          } catch (error) {
+            if (commandEvidence) {
+              try { run.commandEvidence = await commandEvidence.finalize({ status: "failed", error: errorMessage(error) }); }
+              catch (cleanupError) { errors.push(error, cleanupError); }
+            }
+            Object.assign(run, { status: "failed" as const, error: errorMessage(error), durationMs: Date.now() - started });
           }
-          const leafMode = leafScope ? this.assertLeafEvaluation(leafScope, this.store.get()).evaluations.find((entry) => entry.evaluationId === evaluation.id)?.mode : undefined;
-          const evaluated = leafMode === "full-command" || (context === "agent" && !this.portfolioMode() && !leafScope)
-            ? { ...evaluation, screeningCommand: undefined }
-            : evaluation;
-          run.attempts = 1;
-          if (evaluated.command) {
-            const screening = (context === "agent" || context === "screening_baseline") && Boolean(evaluated.screeningCommand);
-            commandEvidence = await CommandEvidenceArchive.create(this.store.dataDir, run, evaluation.name, cwd, screening ? "screening" : "full");
-            run.commandEvidence = structuredClone(commandEvidence.reference);
-            await this.store.update((draft) => {
-              const current = draft.evaluationRuns.find((item) => item.id === run.id);
-              if (current) current.commandEvidence = run.commandEvidence;
-            });
-          }
-          const output = await this.codex.evaluate(cwd, evaluated, state.settings, context, candidateBaselines?.get(evaluation.id), commandEvidence);
-          if (commandEvidence) run.commandEvidence = await commandEvidence.finalize({ status: "completed" });
-          Object.assign(run, output, { status: "completed" as const, durationMs: Date.now() - started });
-        } catch (error) {
-          if (commandEvidence) run.commandEvidence = await commandEvidence.finalize({ status: "failed", error: errorMessage(error) });
-          Object.assign(run, { status: "failed" as const, error: errorMessage(error), durationMs: Date.now() - started });
-        }
-        // Persist before notifications or release. None of those later errors
-        // is permission to change a durable success into a failed attempt.
-        try { await persistRun(); }
-        finally {
-          releasePromptSlot?.();
-          try { await commandLock?.release(); } finally { await cpuLock?.release(); }
-        }
-        this.events.emit("evaluation", run.status === "completed" ? { id: run.id, status: "completed", score: run.score }
-          : { id: run.id, status: "failed", error: run.error });
-        return run;
+          // Finalization failures cannot skip persistence or prompt cleanup.
+          // Later failures never rewrite a durable successful attempt.
+          try { await persistRun(); } catch (error) { errors.push(error); }
+          if (errors.length) throw errors.length === 1 ? errors[0] : new AggregateError(errors, "Evaluation execution and finalization failed.");
+          this.events.emit("evaluation", run.status === "completed" ? { id: run.id, status: "completed", score: run.score }
+            : { id: run.id, status: "failed", error: run.error });
+          return run;
+        } finally { releasePromptSlot?.(); }
       };
       const errors: unknown[] = [];
       const settleOne = async (evaluation: Evaluation) => {
         try { return await evaluateOne(evaluation); }
         catch (error) { errors.push(error); return undefined; }
       };
-      const [commandRuns, promptRuns] = await Promise.all([
-        mapLimit(evaluations.filter((evaluation) => evaluation.command || evaluation.screeningCommand), 1, settleOne),
-        mapLimit(evaluations.filter((evaluation) => !evaluation.command && !evaluation.screeningCommand), 3, settleOne),
-      ]);
-      if (errors.length) throw errors[0];
+      const commandRuns = await mapLimit(evaluations.filter((evaluation) => evaluation.command || evaluation.screeningCommand), 1, settleOne);
+      const promptRuns = await mapLimit(evaluations.filter((evaluation) => !evaluation.command && !evaluation.screeningCommand), 3, settleOne);
+      if (errors.length) throw errors.length === 1 ? errors[0] : new AggregateError(errors, "Evaluation suite failed.");
       const runs = [...commandRuns, ...promptRuns].filter((run): run is EvaluationRun => Boolean(run));
       const succeeded = runs.filter((run) => run.status === "completed").length;
       await this.store.addActivity({
@@ -3782,13 +3833,19 @@ export class Orchestrator {
         detail: context === "agent" || context === "composite" ? "Candidate branch scoring finished." : "Baseline signals are up to date.",
       });
       return runs;
-    } finally {
+    } catch (error) { failed = true; workError = error; throw error; }
+    finally {
       this.runningEvaluations -= evaluations.length;
-      this.events.emit("state", this.store.get());
+      try { this.events.emit("state", this.store.get()); }
+      catch (error) {
+        if (failed) throw new AggregateError([workError, error], "Evaluation suite and state notification failed.");
+        throw error;
+      }
     }
   }
 
   private async runCandidateEvaluations(
+    cpuLock: HeldLock,
     context: "agent" | "composite",
     cwd: string,
     agentRunId?: string,
@@ -3798,46 +3855,22 @@ export class Orchestrator {
   ): Promise<EvaluationRun[]> {
     const enabled = this.store.get().evaluations.filter((evaluation) => evaluation.enabled);
     const enabledIds = enabled.map((evaluation) => evaluation.id);
-    const initial = new Map(initialRuns.map((run) => [run.evaluationId, run]));
-    const runLane = async (laneIds: readonly string[]): Promise<Map<string, EvaluationRun>> => {
-      const latest = new Map(laneIds.flatMap((evaluationId) => {
-        const run = initial.get(evaluationId);
-        return run ? [[evaluationId, run] as const] : [];
-      }));
-      let pending: readonly string[] = laneIds.filter((evaluationId) => {
-        const run = latest.get(evaluationId);
-        return !run || run.status !== "completed" || run.score === undefined;
-      });
-      for (let pass = 1; pass <= 2; pass += 1) {
-        if (!pending.length) break;
-        const runs = await this.runEvaluations(
-          context,
-          cwd,
-          agentRunId,
-          compositeId,
-          pending,
-          candidateBaseline,
-        );
-        for (const run of runs) latest.set(run.evaluationId, run);
-        pending = laneIds.filter((evaluationId) => {
-          const run = latest.get(evaluationId);
-          return !run || run.status !== "completed" || run.score === undefined;
+    const latest = new Map(initialRuns.map((run) => [run.evaluationId, run]));
+    const pending = () => enabledIds.filter((evaluationId) => {
+      const run = latest.get(evaluationId);
+      return !run || run.status !== "completed" || run.score === undefined;
+    });
+    for (let pass = 1; pass <= 2 && pending().length; pass += 1) {
+      const runs = await this.runEvaluationSuite(cpuLock, context, cwd, agentRunId, compositeId, pending(), candidateBaseline);
+      for (const run of runs) latest.set(run.evaluationId, run);
+      if (pass < 2 && pending().length) {
+        await this.store.addActivity({
+          type: "evaluation",
+          message: `Retrying ${pending().length} incomplete candidate evaluation${pending().length === 1 ? "" : "s"}`,
+          detail: "Successful scores are retained; only missing evaluations will run again.",
         });
-        if (!pending.length) break;
-        if (pass < 2) {
-          await this.store.addActivity({
-            type: "evaluation",
-            message: `Retrying ${pending.length} incomplete candidate evaluation${pending.length === 1 ? "" : "s"}`,
-            detail: "Successful scores are retained; only missing evaluations will run again.",
-          });
-        }
       }
-      return latest;
-    };
-    const commandIds = enabled.filter((evaluation) => evaluation.command || evaluation.screeningCommand).map((evaluation) => evaluation.id);
-    const promptIds = enabled.filter((evaluation) => !evaluation.command && !evaluation.screeningCommand).map((evaluation) => evaluation.id);
-    const [commandRuns, promptRuns] = await Promise.all([runLane(commandIds), runLane(promptIds)]);
-    const latest = new Map([...commandRuns, ...promptRuns]);
+    }
     return enabledIds.flatMap((evaluationId) => {
       const run = latest.get(evaluationId);
       return run ? [run] : [];
@@ -5646,7 +5679,7 @@ export class Orchestrator {
         Boolean(run.quarantinedAt) &&
         new Date(run.quarantinedAt!).getTime() >= mergeWindowStartedAt,
       );
-      void this.runIdea(idea, base, resources, lease.locks, lease.release, cadenceFallback);
+      void this.runIdea(idea, base, resources, lease, cadenceFallback);
     }
   }
 
@@ -5783,8 +5816,7 @@ export class Orchestrator {
     idea: Idea,
     base: AgentBase,
     resources: string[],
-    heldLocks: HeldLock[],
-    releaseLocks: () => Promise<void>,
+    lease: ResourceLease,
     cadenceFallback = false,
   ): Promise<void> {
     const runId = id("agent");
@@ -5832,7 +5864,7 @@ export class Orchestrator {
         await gitLock.release();
       }
       await this.updateAgent(runId, { worktree, status: "running" });
-      await this.continueLeaf(idea, base, runId, claim);
+      await this.continueLeaf(idea, base, runId, claim, lease);
     } catch (error) {
       await this.store.refresh();
       if (this.store.get().agentRuns.find((item) => item.id === runId)?.continuation?.step === "done") return;
@@ -5842,7 +5874,7 @@ export class Orchestrator {
         failedRun.continuation?.step !== "delivery" && failedRun.reviewRounds.length >= this.leafReviewLimit(failedRun, this.store.get().settings));
       const cadenceYield = error instanceof PortfolioCadenceYieldError ? error : undefined;
       const quarantined = reviewLimited || Boolean(cadenceYield);
-      retryEvaluation = error instanceof CandidateEvaluationError && (this.store.get().agentRuns.find((item) => item.id === runId)?.evaluationRetryCount ?? 0) < 1;
+      retryEvaluation = isCandidateEvaluationError(error) && (this.store.get().agentRuns.find((item) => item.id === runId)?.evaluationRetryCount ?? 0) < 1;
       const completedAt = now();
       await this.updateAgent(runId, {
         status: "failed",
@@ -5869,7 +5901,7 @@ export class Orchestrator {
       });
       this.events.emit("agent", { runId, status: "failed", error: message });
     } finally {
-      try { await releaseLocks(); }
+      try { await lease.release(); }
       finally { claim.release(); }
       this.activeAgents.delete(idea.id);
       this.runtimeCache = undefined;
@@ -5884,12 +5916,11 @@ export class Orchestrator {
         else void this.schedule();
       }
       if (!this.yolo || !this.store.get().orchestrator.enabled) void this.scheduleComposites(true);
-      void heldLocks;
     }
   }
 
   private async deliverReviewedAgent(
-    idea: Idea, base: AgentBase, run: AgentRun, claim: AgentClaim,
+    idea: Idea, base: AgentBase, run: AgentRun, claim: AgentClaim, lease: ResourceLease,
   ): Promise<AgentRun | undefined> {
     const cursor = run.continuation;
     if (cursor?.step !== "delivery") throw new Error("The leaf has no admitted delivery.");
@@ -5929,7 +5960,7 @@ export class Orchestrator {
     }
     if (!preserveFull && cursor.evaluation && "id" in cursor.evaluation) {
       const complete = Boolean(cursor.evaluation.result);
-      const evaluation = await this.runLeafEvaluation(run, cursor.evaluation.id, worktree, claim);
+      const evaluation = await this.runLeafEvaluation(run, cursor.evaluation.id, worktree, claim, lease);
       if (!complete) return { ...run, continuation: { ...cursor, evaluation } };
     }
     const result = cursor.evaluation && ("id" in cursor.evaluation ? cursor.evaluation.result : cursor.evaluation);
@@ -6186,38 +6217,43 @@ export class Orchestrator {
       for (let evaluationRevision = 1; evaluationRevision <= 3; evaluationRevision += 1) {
         await this.assertCompositeEvaluationHeadroom(compositeId, this.store.get());
         const comparisonBaseline = previousCompositeFloor ?? baseline;
-        afterRuns = await this.runCandidateEvaluations(
-          "composite",
-          worktree,
-          undefined,
-          compositeId,
-          [],
-          comparisonBaseline,
-        );
-        state = this.store.get();
-        const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
-        const incomplete = enabled.filter((evaluation) => {
-          const run = afterRuns.find((item) => item.evaluationId === evaluation.id);
-          return !run || run.status !== "completed" || run.score === undefined;
-        });
-        if (!incomplete.length) {
-          const confirmed = await this.confirmPromptChanges(worktree, comparisonBaseline, afterRuns, `composite PR #${composite.prNumber ?? composite.id}`, undefined, compositeId);
-          if (!confirmed) throw new Error("Composite prompt-change confirmation remained incomplete; the generation was preserved without publishing unverified scores.");
-          afterRuns = confirmed;
+        const candidateLabel = `composite PR #${composite.prNumber ?? composite.id}`;
+        const { incomplete, regressions, qualifies } = await this.withEvaluationLease(lease, async (cpuLock) => {
+          afterRuns = await this.runCandidateEvaluations(
+            cpuLock,
+            "composite",
+            worktree,
+            undefined,
+            compositeId,
+            [],
+            comparisonBaseline,
+          );
           state = this.store.get();
-        }
-        deltas = incomplete.length ? [] : this.calculateDeltas(state, baseline, afterRuns);
-        impact = this.calculateImpact(state, deltas);
-        const cumulativeRegressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
-        const highWaterRegressions = !incomplete.length && previousCompositeFloor
-          ? this.calculateDeltas(state, previousCompositeFloor, afterRuns)
-              .filter((delta) => (delta.delta ?? -Infinity) < 0)
-              .map((delta) => ({ ...delta, summary: `Incremental composite high-water regression. ${delta.summary ?? ""}`.trim() }))
-          : [];
-        const regressions = [...new Map(
-          [...cumulativeRegressions, ...highWaterRegressions].map((delta) => [delta.evaluationId, delta]),
-        ).values()];
-        const qualifies = !incomplete.length && !regressions.length && impact >= settings.compositeAbsorbThreshold;
+          const enabled = state.evaluations.filter((evaluation) => evaluation.enabled);
+          const incomplete = enabled.filter((evaluation) => {
+            const run = afterRuns.find((item) => item.evaluationId === evaluation.id);
+            return !run || run.status !== "completed" || run.score === undefined;
+          });
+          if (!incomplete.length) {
+            const confirmed = await this.confirmPromptChanges(cpuLock, worktree, comparisonBaseline, afterRuns, candidateLabel, undefined, compositeId);
+            if (!confirmed) throw new Error("Composite prompt-change confirmation remained incomplete; the generation was preserved without publishing unverified scores.");
+            afterRuns = confirmed;
+            state = this.store.get();
+          }
+          deltas = incomplete.length ? [] : this.calculateDeltas(state, baseline, afterRuns);
+          impact = this.calculateImpact(state, deltas);
+          const cumulativeRegressions = deltas.filter((delta) => (delta.delta ?? -Infinity) < 0);
+          const highWaterRegressions = !incomplete.length && previousCompositeFloor
+            ? this.calculateDeltas(state, previousCompositeFloor, afterRuns)
+                .filter((delta) => (delta.delta ?? -Infinity) < 0)
+                .map((delta) => ({ ...delta, summary: `Incremental composite high-water regression. ${delta.summary ?? ""}`.trim() }))
+            : [];
+          const regressions = [...new Map(
+            [...cumulativeRegressions, ...highWaterRegressions].map((delta) => [delta.evaluationId, delta]),
+          ).values()];
+          const qualifies = !incomplete.length && !regressions.length && impact >= settings.compositeAbsorbThreshold;
+          return { incomplete, regressions, qualifies };
+        });
         if (qualifies) {
           const scoreMap = new Map(afterRuns.filter((run) => run.score !== undefined).map((run) => [run.evaluationId, run.score!]));
           compositeScore = weightedScore(state.evaluations, scoreMap) ?? 0;
@@ -6409,7 +6445,7 @@ export class Orchestrator {
     return this.transitionLeaf(run, claim, { ...common, step: "review", implementationCommit: cursor.source.implementationCommit, evidence: cursor.result.message }, patch);
   }
 
-  private async continueLeaf(idea: Idea, base: AgentBase, runId: string, claim: AgentClaim): Promise<void> {
+  private async continueLeaf(idea: Idea, base: AgentBase, runId: string, claim: AgentClaim, lease: ResourceLease): Promise<void> {
     let run = this.store.get().agentRuns.find((item) => item.id === runId)!;
     while (true) {
       const state = this.store.get();
@@ -6423,7 +6459,7 @@ export class Orchestrator {
       }
       if (cursor.step === "refresh") throw new Error("Pinned base refresh must resume through its existing refresh owner.");
       if (cursor.step === "delivery") {
-        const successor = await this.deliverReviewedAgent(idea, base, run, claim);
+        const successor = await this.deliverReviewedAgent(idea, base, run, claim, lease);
         if (!successor) return;
         run = successor;
         continue;

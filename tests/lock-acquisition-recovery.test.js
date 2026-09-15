@@ -182,6 +182,7 @@ test("a failed joined release remains retryable after the filesystem recovers", 
     const joined = held.release();
     assert.equal(first, joined);
     await assert.rejects(first, /temporary unlink failure/);
+    assert.throws(() => held.forResource(manager, "a"), /releasing or released/);
     assert.equal(attempts, 1);
     await held.release();
     assert.equal(attempts, 2);
@@ -190,4 +191,133 @@ test("a failed joined release remains retryable after the filesystem recovers", 
     fs.rm = originalRm;
     syncBuiltinESMExports();
   }
+});
+
+const canonicalRecord = (overrides = {}) => ({
+  owner: "fixture-owner", pid: 987654, createdAt: "2000-01-01T00:00:00.000Z", token: "fixture-dead-token", ...overrides,
+});
+
+test("borrowing uses the canonical physical key and rejects foreign or released authority", async (t) => {
+  const { root, manager } = await fixture(t);
+  const held = await manager.acquire("cpu/heavy", "caller");
+  assert.equal(held.name, "cpu/heavy");
+  assert.equal(held.forResource(manager, "cpu-heavy"), held);
+  assert.equal(held.forResource(manager, "gpu"), undefined);
+  assert.throws(() => held.forResource(new LockManager(root), "cpu-heavy"), /different resource manager/);
+  await held.release();
+  assert.throws(() => held.forResource(manager, "cpu-heavy"), /releasing or released/);
+});
+
+test("live owners never age out, including the ignored legacy constructor argument", async (t) => {
+  const { root, manager } = await fixture(t);
+  const probes = t.mock.method(process, "kill", () => assert.fail("admission must not infer work completion from a PID"));
+  const held = await manager.acquire("cpu-heavy", "live-owner");
+  const path = join(root, "cpu-heavy.lock");
+  const record = JSON.parse(await fs.readFile(path, "utf8"));
+  record.createdAt = "2000-01-01T00:00:00.000Z";
+  await fs.writeFile(path, JSON.stringify(record));
+  const other = new LockManager(root, 1);
+  try {
+    assert.equal(await other.tryAcquire("cpu/heavy", "contender"), undefined);
+    assert.deepEqual(await other.reapOrphans(), []);
+    assert.equal(JSON.parse(await fs.readFile(path, "utf8")).token, record.token);
+    assert.equal(held.forResource(manager, "cpu-heavy"), held);
+    assert.equal(probes.mock.callCount(), 0);
+  } finally { await held.release(); }
+});
+
+test("dead-controller metadata never authorizes admission or automatic reclamation for any resource", async (t) => {
+  const { root, manager } = await fixture(t);
+  const probes = t.mock.method(process, "kill", () => { throw Object.assign(new Error("dead fixture PID"), { code: "ESRCH" }); });
+  const raw = JSON.stringify(canonicalRecord());
+  for (const name of ["cpu-heavy", "gpu", "git-metadata"]) await fs.writeFile(join(root, `${name}.lock`), raw);
+  const others = Array.from({ length: 6 }, () => new LockManager(root, 0));
+  const results = await Promise.all(others.map(async (other) => [
+    await other.tryAcquire("cpu/heavy", "contender"),
+    await other.tryAcquire("gpu", "contender"),
+    await other.tryAcquire("git-metadata", "contender"),
+    await other.reapOrphans(),
+  ]));
+  assert.deepEqual(results, others.map(() => [undefined, undefined, undefined, []]));
+  assert.equal(await manager.tryAcquireAll(["aaa", "cpu-heavy"], "partial-contender"), undefined);
+  await assert.rejects(manager.acquire("cpu/heavy", "blocking-contender", { timeoutMs: 0 }), (error) => {
+    assert.ok(error.message.includes(join(root, "cpu-heavy.lock")));
+    assert.match(error.message, /does not prove its work stopped/);
+    assert.match(error.message, /quiescence.*every controller.*operator recovery/);
+    return true;
+  });
+  assert.deepEqual((await fs.readdir(root)).sort(), ["cpu-heavy.lock", "git-metadata.lock", "gpu.lock"]);
+  for (const name of ["cpu-heavy", "gpu", "git-metadata"]) assert.equal(await fs.readFile(join(root, `${name}.lock`), "utf8"), raw);
+  assert.equal(probes.mock.callCount(), 0, "even ESRCH must not be used to reclaim somebody else's resource");
+  assert.equal(manager.waiters.size, 0, "a timeout still retires its local FIFO reservation");
+});
+
+test("all malformed, legacy and unknown ownership bytes remain occupied without interpretation", async (t) => {
+  const { root, manager } = await fixture(t);
+  const probes = t.mock.method(process, "kill", () => assert.fail("unknown ownership must never be probed as authority"));
+  const records = [
+    "", "{", "null", JSON.stringify(canonicalRecord({ pid: undefined })),
+    JSON.stringify(canonicalRecord({ token: undefined })), JSON.stringify(canonicalRecord({ pid: 0 })),
+    JSON.stringify(canonicalRecord({ pid: -1 })), JSON.stringify(canonicalRecord({ pid: 1.5 })),
+    JSON.stringify(canonicalRecord({ createdAt: "unknown" })), JSON.stringify(canonicalRecord()),
+  ];
+  for (const [index, raw] of records.entries()) {
+    const name = `unknown-${index}`;
+    const path = join(root, `${name}.lock`);
+    await fs.writeFile(path, raw);
+    assert.equal(await manager.tryAcquire(name, "contender"), undefined);
+    assert.deepEqual(await manager.reapOrphans(), []);
+    assert.equal(await fs.readFile(path, "utf8"), raw);
+  }
+  assert.equal(probes.mock.callCount(), 0);
+  assert.equal((await fs.readdir(root)).every((name) => name.endsWith(".lock")), true);
+});
+
+test("unreadable ownership cannot bypass an occupied path and is not inspected during admission", async (t) => {
+  const { root, manager } = await fixture(t);
+  const path = join(root, "a.lock");
+  const raw = JSON.stringify(canonicalRecord());
+  await fs.writeFile(path, raw);
+  const read = fs.readFile;
+  let reads = 0;
+  fs.readFile = async (candidate, ...args) => {
+    if (candidate === path) { reads += 1; throw Object.assign(new Error("fixture metadata unavailable"), { code: "EPERM" }); }
+    return read(candidate, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    assert.equal(await manager.tryAcquire("a", "contender"), undefined);
+    assert.deepEqual(await manager.reapOrphans(), []);
+    assert.deepEqual(await manager.list(), ["a"]);
+    assert.equal(reads, 0);
+    assert.equal(await read(path, "utf8"), raw);
+  } finally {
+    fs.readFile = read;
+    syncBuiltinESMExports();
+  }
+});
+
+test("legacy recovery guard files are inert and never participate in admission", async (t) => {
+  const { root, manager } = await fixture(t);
+  const path = join(root, ".recovery.guard");
+  await fs.writeFile(join(root, "a.lock"), JSON.stringify(canonicalRecord()));
+  for (const raw of [JSON.stringify(canonicalRecord()), "{unknown"]) {
+    await fs.writeFile(path, raw);
+    assert.deepEqual(await manager.reapOrphans(), []);
+    assert.equal(await manager.tryAcquire("a", "contender"), undefined);
+    assert.equal(await fs.readFile(path, "utf8"), raw);
+    assert.deepEqual(await manager.list(), ["a"]);
+    const free = await manager.tryAcquire("free", "unrelated");
+    assert.ok(free);
+    await free.release();
+    assert.deepEqual((await fs.readdir(root)).sort(), [".recovery.guard", "a.lock"]);
+  }
+});
+
+test("deprecated reapOrphans retains its call shape without claiming removal or publishing state", async (t) => {
+  const { root } = await fixture(t);
+  const path = join(root, "compatibility");
+  const manager = new LockManager(path, -1);
+  assert.deepEqual(await manager.reapOrphans(), []);
+  assert.deepEqual(await fs.readdir(path), []);
 });

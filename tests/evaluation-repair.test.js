@@ -20,7 +20,8 @@ const deferred = () => {
 };
 
 // Real persisted state and retry/review/delivery control flow. Only external
-// Git, Codex, resource and measurement effects are replaced; no campaign runs.
+// Git, Codex and measurement effects are replaced; resource leases are private
+// fixture acquisitions, with no campaign runs.
 async function fixture(t, { rounds = 9, limit = 12 } = {}) {
   const root = await mkdtemp(join(tmpdir(), "burner-evaluation-repair-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -54,9 +55,14 @@ async function fixture(t, { rounds = 9, limit = 12 } = {}) {
   const parents = new Map();
   const orchestrator = new Orchestrator(root, store, new EventHub());
   orchestrator.assertCandidateDoesNotOwnProgress = async () => undefined;
-  orchestrator.locks = {
-    tryAcquireAll: async () => { calls.push("lease"); return { locks: [], release: async () => { calls.push("release"); } }; },
-    acquire: async () => ({ name: "test-git-metadata", release: async () => undefined }),
+  const tryAcquireAll = orchestrator.locks.tryAcquireAll.bind(orchestrator.locks);
+  orchestrator.locks.tryAcquireAll = async (...args) => {
+    calls.push("lease");
+    const lease = await tryAcquireAll(...args);
+    if (!lease) return lease;
+    const release = lease.release;
+    lease.release = async () => { await release(); calls.push("release"); };
+    return lease;
   };
   orchestrator.git = {
     status: async () => ({ available: true, dirty: false }),
@@ -164,6 +170,28 @@ test("targeted full-score repair retains one PR, confirmed feedback and cumulati
   assert.equal(f.calls.includes("schedule"), false);
   assert.equal(f.orchestrator.agentClaims.size, 0);
   assert.equal(f.orchestrator.activeAgents.size, 0);
+});
+
+test("public retry lends its actual CPU acquisition, including an aliased physical key", async (t) => {
+  for (const resource of ["cpu-heavy", "cpu/heavy"]) await t.test(resource, async (t) => {
+    const f = await fixture(t);
+    await f.store.update((state) => { state.agentRuns[0].resources = [resource]; });
+    const acquire = f.orchestrator.locks.acquire.bind(f.orchestrator.locks);
+    f.orchestrator.locks.acquire = (name, ...args) => {
+      assert.notEqual(name, "cpu-heavy", "the retry already owns the physical CPU resource; reacquisition would deadlock");
+      return acquire(name, ...args);
+    };
+    const evaluate = f.orchestrator.codex.evaluate;
+    f.orchestrator.codex.evaluate = async (...args) => {
+      assert.ok((await f.orchestrator.locks.list()).includes("cpu-heavy"));
+      return evaluate(...args);
+    };
+    const run = await f.orchestrator.retryAgent("agent");
+    assert.equal(run.status, "completed", run.error);
+    assert.equal(f.world.measurements, 1);
+    assert.equal(f.calls.filter((call) => call === "release").length, 1);
+    assert.deepEqual(await f.orchestrator.locks.list(), []);
+  });
 });
 
 test("fresh repair rejects stale or incomplete identities without state, author or evaluation changes", async (t) => {
@@ -956,9 +984,11 @@ test("the shared initial loop retains no-change, no-PR, absorbed and rejected te
       if (outcome !== "no_changes") { f.world.dirty = true; f.world.tree = "initial-tree"; }
       return { threadId: "initial-author", message: "Original task complete" };
     };
+    const lease = await f.orchestrator.locks.tryAcquireAll([], "initial-agent");
+    assert.ok(lease);
     await f.orchestrator.runIdea(f.store.get().ideas[0], {
       ref: parent ? "burner/living" : "main", commit: "base", baseline: f.store.latestRuns(), ...(parent ? { compositeId: "living" } : {}),
-    }, [], [], async () => { f.calls.push("release"); });
+    }, [], lease);
     const run = f.run();
     assert.equal(run.status, outcome, run.error);
     assert.equal(run.continuation.step, "done");
@@ -1204,6 +1234,92 @@ async function receiptFixture(t, { baselineCount = 3, signals = 2, command = fal
 const receiptOf = (f, purpose) => purpose === "full" ? f.run().fullEvaluation?.evaluation ?? latestFullAssessment(f.run())?.evaluation : f.run().continuation.evaluation;
 const resumeReceipt = (f, purpose) => purpose === "full" ? f.orchestrator.fullyValidateLeafForMerge("agent", "base") : f.orchestrator.retryAgent("agent");
 
+async function incompleteSampleFixture(t) {
+  const f = await receiptFixture(t, { signals: 1 });
+  assert.equal((await f.orchestrator.retryAgent("agent")).status, "completed");
+  const runLeafEvaluation = f.orchestrator.runLeafEvaluation.bind(f.orchestrator);
+  let candidateError;
+  f.orchestrator.codex.evaluate = async () => { throw new Error("Injected sample transport failure"); };
+  f.orchestrator.runLeafEvaluation = async (...args) => {
+    try { return await runLeafEvaluation(...args); }
+    catch (error) { candidateError = error; throw error; }
+  };
+  assert.equal(await resumeReceipt(f, "full"), false);
+  assert.ok(candidateError instanceof Error && !(candidateError instanceof AggregateError));
+  assert.match(candidateError.message, /incomplete candidate sample 0 after targeted retries/);
+  assert.equal(receiptOf(f, "full").evaluations[0].candidate[0].attempts.length, 2);
+  return { ...f, candidateError };
+}
+
+function sampleFailureCases(candidateError) {
+  const nested = new AggregateError([candidateError, candidateError], "Nested sample failures");
+  return [
+    { name: "single", error: candidateError, retryable: true },
+    { name: "multiple", error: nested, retryable: true },
+    { name: "nested", error: new AggregateError([candidateError, nested], "Sample failures"), retryable: true },
+    { name: "mixed nested", error: new AggregateError([candidateError,
+      new AggregateError([candidateError, new Error("Receipt persistence failed")], "Nested persistence failure")], "Mixed failures"), retryable: false },
+    { name: "hard-first nested", error: new AggregateError([
+      new AggregateError([new Error("Receipt persistence failed"), candidateError], "Nested persistence failure"), candidateError], "Mixed failures"), retryable: false },
+    { name: "outer release failure", error: new AggregateError([nested, new Error("Resource lease release failed")], "Work and release failures"), retryable: false },
+    { name: "empty", error: new AggregateError([], "Empty failures"), retryable: false },
+    { name: "nested empty", error: new AggregateError([candidateError, new AggregateError([], "Empty failures")], "Nested empty failures"), retryable: false },
+  ];
+}
+
+test("public full validation classifies only nonempty all-candidate error aggregates as incomplete", async (t) => {
+  // Capture the private error from a genuine exhausted fill, not its name or an exported classifier.
+  const f = await incompleteSampleFixture(t);
+  const pending = structuredClone(f.run().fullEvaluation);
+  const assessment = structuredClone(latestFullAssessment(f.run()));
+  for (const { name, error, retryable } of sampleFailureCases(f.candidateError)) await t.test(name, async () => {
+    f.orchestrator.runLeafEvaluation = async () => { throw error; };
+    if (retryable) assert.equal(await resumeReceipt(f, "full"), false);
+    else await assert.rejects(resumeReceipt(f, "full"), (caught) => caught === error, "the original hard aggregate must escape intact");
+    assert.deepEqual(f.run().fullEvaluation, pending);
+    assert.deepEqual(latestFullAssessment(f.run()), assessment);
+    assert.equal(f.orchestrator.agentClaims.size, 0);
+  });
+});
+
+test("runIdea grants one bounded retry only to nonempty all-candidate error aggregates", async (t) => {
+  const { candidateError } = await incompleteSampleFixture(t);
+  const nested = new AggregateError([candidateError, new AggregateError([candidateError], "Nested sample failure")], "Sample failures");
+  const cases = [...sampleFailureCases(candidateError),
+    { name: "retry already spent", error: nested, retryable: true, previousRetries: 1 },
+    { name: "orchestrator disabled", error: nested, retryable: true, enabled: false }];
+  for (const { name, error, retryable, previousRetries = 0, enabled = true } of cases) await t.test(name, async (t) => {
+    const f = await fixture(t);
+    await f.store.update((state) => {
+      state.agentRuns = [];
+      Object.assign(state.ideas[0], { status: "queued", agentRunId: undefined });
+      state.orchestrator.enabled = enabled;
+    });
+    f.orchestrator.continueLeaf = async (_idea, _base, runId) => {
+      if (previousRetries) await f.store.update((state) => { state.agentRuns.find((run) => run.id === runId).evaluationRetryCount = previousRetries; });
+      throw error;
+    };
+    f.orchestrator.schedule = async () => undefined;
+    const retries = [];
+    f.orchestrator.retryAgent = async (runId) => {
+      retries.push({ runId, claims: f.orchestrator.agentClaims.size, active: f.orchestrator.activeAgents.size, released: f.calls.includes("release") });
+      return f.run();
+    };
+    const lease = await f.orchestrator.locks.tryAcquireAll([], "initial-agent");
+    assert.ok(lease);
+    f.orchestrator.activeAgents.add("idea");
+    await f.orchestrator.runIdea(f.store.get().ideas[0], { ref: "main", commit: "base", baseline: f.store.latestRuns() }, [], lease);
+    const run = f.run();
+    assert.equal(run.status, "failed");
+    assert.equal(run.error, error.message, "classification must not replace the original aggregate message");
+    assert.equal(run.evaluationRetryCount, previousRetries || (retryable ? 1 : undefined));
+    assert.deepEqual(retries, retryable && !previousRetries && enabled
+      ? [{ runId: run.id, claims: 0, active: 0, released: true }] : []);
+    assert.equal(f.orchestrator.agentClaims.size, 0);
+    assert.equal(f.calls.filter((call) => call === "release").length, 1);
+  });
+});
+
 function failBeforeReceiptWrite(f, predicate) {
   const update = f.store.update.bind(f.store);
   let failed = false;
@@ -1313,9 +1429,18 @@ test("durable successful samples survive listener, notification and resource-rel
         return emit(type, value);
       };
     }
-    if (fault === "release") f.orchestrator.locks.acquire = async (name) => ({ name, release: async () => {
-      if (!fired && name.startsWith("command-evaluation-")) { fired = true; throw new Error("Sample resource release failed"); }
-    } });
+    if (fault === "release") {
+      const acquire = f.orchestrator.locks.acquire.bind(f.orchestrator.locks);
+      f.orchestrator.locks.acquire = async (...args) => {
+        const held = await acquire(...args);
+        const release = held.release;
+        held.release = async () => {
+          await release();
+          if (!fired && args[0] === "cpu-heavy") { fired = true; throw new Error("Sample resource release failed"); }
+        };
+        return held;
+      };
+    }
     const first = await f.orchestrator.retryAgent("agent");
     assert.equal(fired, true);
     const receipt = receiptOf(f, "delivery");

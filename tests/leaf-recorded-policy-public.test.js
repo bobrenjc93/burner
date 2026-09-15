@@ -58,8 +58,6 @@ async function fixture(t) {
   let orchestrator;
   const install = () => {
     orchestrator = new Orchestrator(root, store, new EventHub());
-    orchestrator.locks = { acquire: async () => ({ release: async () => undefined }),
-      tryAcquireAll: async () => ({ locks: [], release: async () => undefined }) };
     orchestrator.git = {
       assertWorktree: async (cwd, branch) => { assert.equal(cwd, root); assert.equal(branch, "burner/policy"); },
       head: async () => world.head,

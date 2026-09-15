@@ -42,7 +42,7 @@ async function fixture(t, source = print(), options = {}) {
   const orchestrator = new Orchestrator(root, store, events, options);
   orchestrator.git = { head: async () => "measured-commit" };
   const run = async (context = "agent") => {
-    const measured = (await orchestrator.runEvaluationSuite(context, cwd, "author-1"))[0];
+    const measured = (await orchestrator.runEvaluations(context, cwd, "author-1"))[0];
     if (measured.commandEvidence?.recoveryDirectory) retainedSinks.add(measured.commandEvidence.recoveryDirectory);
     return measured;
   };

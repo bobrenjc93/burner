@@ -192,12 +192,14 @@ async function retryFixture(t, options = {}) {
   const calls = [];
   orchestrator.scheduleComposites = async () => undefined;
   orchestrator.assertCandidateDoesNotOwnProgress = async () => { calls.push("progress-guard"); };
-  orchestrator.locks = {
-    acquire: async () => ({ release: async () => undefined }),
-    tryAcquireAll: async (resources) => {
-      assert.deepEqual(resources, idea.resources);
-      return { locks: [], release: async () => { calls.push("release"); } };
-    },
+  const tryAcquireAll = orchestrator.locks.tryAcquireAll.bind(orchestrator.locks);
+  orchestrator.locks.tryAcquireAll = async (resources, owner) => {
+    assert.deepEqual(resources, idea.resources);
+    const lease = await tryAcquireAll(resources, owner);
+    assert.ok(lease);
+    const release = lease.release;
+    lease.release = async () => { await release(); calls.push("release"); };
+    return lease;
   };
   let head = options.seedRun === false ? "base" : "candidate";
   let dirty = options.seedRun !== false && !Object.hasOwn(options, "authoringComplete");
@@ -261,7 +263,8 @@ test("an interrupted initial author retains its session and incomplete phase acr
     options.onStdout(`${threadEvent("initial-author")}\n`);
     return commandResult("", 1);
   };
-  await orchestrator.runIdea(idea, { ref: "main", commit: "base", baseline: new Map() }, idea.resources, [], async () => { calls.push("release"); });
+  const lease = await orchestrator.locks.tryAcquireAll(idea.resources, "initial-agent");
+  await orchestrator.runIdea(idea, { ref: "main", commit: "base", baseline: new Map() }, idea.resources, lease);
   assert.deepEqual(calls, ["release"]);
   const interrupted = store.get().agentRuns[0];
   assert.equal(interrupted.status, "failed");

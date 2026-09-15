@@ -284,7 +284,7 @@ test("manual startup pauses before readiness without scheduling or changing auto
             state.settings.baseBranch = "missing-base";
           });
           await mkdir(join(store.dataDir, "locks"));
-          await writeFile(join(store.dataDir, "locks", "orphan.lock"), JSON.stringify({ owner: "departed", createdAt: new Date().toISOString() }));
+          await writeFile(join(store.dataDir, "locks", "orphan.lock"), JSON.stringify({ owner: "departed", pid: 2_147_483_647, token: "dead-startup-owner", createdAt: new Date().toISOString() }));
           orchestrator = new Orchestrator(root, store, new EventHub(), { yolo });
           const readiness = [];
           orchestrator.initializeProtectedParentRepository = async () => {
@@ -292,7 +292,7 @@ test("manual startup pauses before readiness without scheduling or changing auto
             readiness.push("protection");
           };
           orchestrator.git.status = async () => {
-            assert.deepEqual(await orchestrator.locks.list(), [], "startup must recover orphaned resource locks");
+            assert.deepEqual(await orchestrator.locks.list(), ["orphan"], "startup must preserve an abandoned controller's resource locks");
             readiness.push("repository");
             return { available: true, branch: "current-base" };
           };
@@ -312,7 +312,7 @@ test("manual startup pauses before readiness without scheduling or changing auto
           assert.equal(store.get().settings.autoRun, autoRun);
           assert.equal(store.get().settings.baseBranch, "current-base", "existing base-branch repair remains active");
           assert.deepEqual(readiness, yolo ? ["protection", "repository", "preflight"] : ["protection", "repository"]);
-          assert.ok(store.get().activity.some(({ message }) => message === "Recovered stale resource locks"));
+          assert.ok(store.get().activity.some(({ message, detail }) => message === "Resource locks retained" && detail.includes(join(store.dataDir, "locks"))));
           assert.equal(orchestrator.timer, undefined);
           t.mock.timers.tick(20_000);
           assert.equal(ticks.mock.callCount(), 0);
@@ -592,14 +592,15 @@ test("candidate evaluation plumbing preserves living-composite calibration", asy
     };
 
     const calibration = new Map([[evaluation.id, livingBaseline]]);
-    const runs = await orchestrator.runCandidateEvaluations(
+    const runs = await orchestrator.withEvaluationLease(undefined, (cpuLock) => orchestrator.runCandidateEvaluations(
+      cpuLock,
       "agent",
       root,
       "child",
       "living",
       [],
       calibration,
-    );
+    ));
 
     assert.equal(observedBaseline, livingBaseline);
     assert.equal(runs[0].score, 60);
@@ -781,8 +782,6 @@ test("fresh and resumed composite builds forward scope and verified source feedb
           createdAt: timestamp, updatedAt: timestamp,
         });
       });
-      const lock = { release: async () => undefined };
-      orchestrator.locks = { tryAcquireAll: async () => lock, acquire: async () => lock };
       const merged = [];
       const included = new Set(resume ? heads.values() : []);
       orchestrator.git = {
@@ -1822,11 +1821,12 @@ test("full leaf validation runs only evaluations missing from exact-head seeds",
     };
     const orchestrator = new Orchestrator(root, store, new EventHub());
     const requested = [];
-    orchestrator.runEvaluations = async (_context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+    orchestrator.runEvaluationSuite = async (_cpuLock, _context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
       requested.push([...evaluationIds]);
       return [promptRun];
     };
-    const runs = await orchestrator.runCandidateEvaluations("composite", root, "leaf", undefined, [commandRun]);
+    const runs = await orchestrator.withEvaluationLease(undefined, (cpuLock) =>
+      orchestrator.runCandidateEvaluations(cpuLock, "composite", root, "leaf", undefined, [commandRun]));
     assert.deepEqual(requested, [["prompt"]]);
     assert.deepEqual(runs.map((run) => run.id), ["command-run", "prompt-run"]);
   } finally {
@@ -2196,7 +2196,7 @@ test("YOLO keeps authoring when idling cannot preserve the merge cadence", async
     orchestrator.locks = { tryAcquireAll: async () => ({ locks: [], release: async () => {} }) };
     let dispatched = false;
     let cadenceFallback = false;
-    orchestrator.runIdea = async (...args) => { dispatched = true; cadenceFallback = args[5]; };
+    orchestrator.runIdea = async (...args) => { dispatched = true; cadenceFallback = args[4]; };
     await orchestrator.schedule();
     assert.equal(dispatched, true, "Burner must start the only path to a candidate instead of idling until the deadline");
 
@@ -2452,7 +2452,7 @@ test("portfolio merge clock starts after full and screening baselines", async ()
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
     orchestrator.git = { resolveRef: async () => "base" };
     const contexts = [];
-    orchestrator.runEvaluations = async (context) => {
+    orchestrator.runEvaluationSuite = async (_cpuLock, context) => {
       contexts.push(context);
       const run = { id: `run-${context}`, evaluationId: "bench", score: 80, commit: "base", createdAt: new Date().toISOString(), durationMs: 1, status: "completed", context };
       await store.update((state) => state.evaluationRuns.push(run));
@@ -2478,7 +2478,7 @@ test("baseline completion rechecks evaluations added while the suite is running"
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     orchestrator.git = { resolveRef: async () => "base" };
-    orchestrator.runEvaluations = async (context) => {
+    orchestrator.runEvaluationSuite = async (_cpuLock, context) => {
       const run = { id: "first-run", evaluationId: "first", score: 80, commit: "base", createdAt: timestamp, durationMs: 1, status: "completed", context };
       await store.update((state) => {
         state.evaluationRuns.push(run);
@@ -2509,7 +2509,7 @@ test("prompt baselines are median-confirmed before the cadence clock starts and 
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     orchestrator.git = { resolveRef: async () => "base" };
     const calls = [];
-    orchestrator.runEvaluations = async (context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+    orchestrator.runEvaluationSuite = async (_cpuLock, context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
       assert.equal(store.get().orchestrator.mergeWindowStartedAt, undefined, "the clock must remain stopped during every confirmation attempt");
       calls.push({ context, evaluationIds });
       if (calls.length === 1) return [{ id: "timeout", evaluationId: "quality", commit: "base", createdAt: timestamp, durationMs: 1, status: "failed", error: "timed out", context: "baseline" }];
@@ -2552,7 +2552,7 @@ test("baseline recovery reruns only evaluations missing at the current commit", 
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
     orchestrator.git = { resolveRef: async () => "base" };
     const calls = [];
-    orchestrator.runEvaluations = async (context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+    orchestrator.runEvaluationSuite = async (_cpuLock, context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
       calls.push({ context, evaluationIds });
       const run = { id: `run-${calls.length}`, evaluationId: "missing", score: 92, commit: "base", createdAt: new Date().toISOString(), durationMs: 1, status: "completed", context };
       await store.update((state) => state.evaluationRuns.push(run));
@@ -2611,8 +2611,9 @@ test("resource locks are exclusive and recover after release", async () => {
     const second = await waiting;
     assert.ok(second);
     await second.release();
-    await writeFile(join(root, "orphan.lock"), JSON.stringify({ pid: 2_147_483_647, createdAt: new Date().toISOString() }));
-    assert.deepEqual(await locks.reapOrphans(), ["orphan"]);
+    await writeFile(join(root, "orphan.lock"), JSON.stringify({ owner: "departed", pid: 2_147_483_647, token: "dead-resource-owner", createdAt: new Date().toISOString() }));
+    assert.deepEqual(await locks.reapOrphans(), []);
+    assert.deepEqual(await locks.list(), ["orphan"], "only quiescent operator recovery may clear an abandoned lock");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -5057,7 +5058,7 @@ test("composite prompt gains use a persisted median without rerunning commands",
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     const calls = [];
     const confirmationScores = [50, 55];
-    orchestrator.runEvaluations = async (context, _cwd, agentRunId, compositeId, evaluationIds) => {
+    orchestrator.runEvaluationSuite = async (_cpuLock, context, _cwd, agentRunId, compositeId, evaluationIds) => {
       calls.push({ context, agentRunId, compositeId, evaluationIds });
       const score = confirmationScores.shift();
       return [{ id: `confirmation-${calls.length}`, evaluationId: "quality", score, summary: "confirmation", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId }];
@@ -5066,7 +5067,8 @@ test("composite prompt gains use a persisted median without rerunning commands",
       { id: "bench-after", evaluationId: "bench", score: 95, summary: "faster", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "combined" },
       { id: "quality-after", evaluationId: "quality", score: 60, summary: "noisy high", commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "combined" },
     ];
-    const confirmed = await orchestrator.confirmPromptChanges(root, store.latestRuns(), initial, "composite PR #99", undefined, "combined");
+    const confirmed = await orchestrator.withEvaluationLease(undefined, (cpuLock) =>
+      orchestrator.confirmPromptChanges(cpuLock, root, store.latestRuns(), initial, "composite PR #99", undefined, "combined"));
     assert.equal(confirmed.find((run) => run.evaluationId === "quality").score, 55);
     assert.equal(confirmed.find((run) => run.evaluationId === "bench").score, 95);
     assert.equal(calls.length, 2);
@@ -5093,7 +5095,7 @@ test("a confirmed baseline median prevents a noisy single sample from inventing 
     const candidateScores = [85, 90];
     const baselineScores = [85, 85];
     const calls = [];
-    orchestrator.runEvaluations = async (context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+    orchestrator.runEvaluationSuite = async (_cpuLock, context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
       assert.deepEqual(evaluationIds, ["integrity"]);
       calls.push(context);
       const baseline = context === "baseline";
@@ -5112,7 +5114,8 @@ test("a confirmed baseline median prevents a noisy single sample from inventing 
     };
     const baseline = store.latestRuns();
     const initial = [{ id: "candidate-low", evaluationId: "integrity", score: 85, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" }];
-    const confirmed = await orchestrator.confirmPromptChanges(root, baseline, initial, "composite PR #99", undefined, "combined");
+    const confirmed = await orchestrator.withEvaluationLease(undefined, (cpuLock) =>
+      orchestrator.confirmPromptChanges(cpuLock, root, baseline, initial, "composite PR #99", undefined, "combined"));
     assert.equal(confirmed.find((run) => run.evaluationId === "integrity").score, 85);
     assert.equal(baseline.get("integrity").score, 85, "comparison must use the confirmed baseline median, not its noisy first sample");
     assert.equal(baseline.get("integrity").promptSampleCount, 3);
@@ -5138,7 +5141,7 @@ test("living composite prompt baselines inherit confirmation from an unchanged m
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     const calls = [];
     const candidateScores = [97, 97];
-    orchestrator.runEvaluations = async (context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+    orchestrator.runEvaluationSuite = async (_cpuLock, context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
       calls.push(context);
       assert.equal(context, "composite", "an unchanged confirmed main score must not be rerun from the wrong checkout");
       return [{ id: `candidate-${calls.length}`, evaluationId: "integrity", score: candidateScores.shift(), commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" }];
@@ -5146,7 +5149,8 @@ test("living composite prompt baselines inherit confirmation from an unchanged m
     const parentBaseline = new Map([["integrity", { id: "parent", evaluationId: "integrity", score: 97, commit: "composite", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite", compositeId: "living" }]]);
     const initial = [{ id: "candidate-low", evaluationId: "integrity", score: 88, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "agent", agentRunId: "experiment" }];
 
-    const confirmed = await orchestrator.confirmPromptChanges(root, parentBaseline, initial, "experiment", "experiment");
+    const confirmed = await orchestrator.withEvaluationLease(undefined, (cpuLock) =>
+      orchestrator.confirmPromptChanges(cpuLock, root, parentBaseline, initial, "experiment", "experiment"));
 
     assert.equal(parentBaseline.get("integrity").promptSampleCount, 3);
     assert.equal(confirmed.find((run) => run.evaluationId === "integrity").score, 97);
@@ -5174,7 +5178,7 @@ test("prompt change confirmation retries only incomplete samples once", async ()
     });
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 3 });
     const calls = [];
-    orchestrator.runEvaluations = async (_context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
+    orchestrator.runEvaluationSuite = async (_cpuLock, _context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
       calls.push(evaluationIds);
       if (calls.length === 1) return [
         { id: "quality-a", evaluationId: "quality", score: 80, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" },
@@ -5190,7 +5194,8 @@ test("prompt change confirmation retries only incomplete samples once", async ()
       { id: "quality-low", evaluationId: "quality", score: 75, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" },
       { id: "integrity-low", evaluationId: "integrity", score: 85, commit: "candidate", createdAt: timestamp, durationMs: 1, status: "completed", context: "composite" },
     ];
-    const confirmed = await orchestrator.confirmPromptChanges(root, store.latestRuns(), initial, "PR #10", "leaf");
+    const confirmed = await orchestrator.withEvaluationLease(undefined, (cpuLock) =>
+      orchestrator.confirmPromptChanges(cpuLock, root, store.latestRuns(), initial, "PR #10", "leaf"));
     assert.deepEqual(calls, [["quality", "integrity"], ["quality", "integrity"], ["integrity"]]);
     assert.equal(confirmed.find((run) => run.evaluationId === "quality").score, 80);
     assert.equal(confirmed.find((run) => run.evaluationId === "integrity").score, 90);
@@ -5937,7 +5942,7 @@ test("command-backed evaluations are serialized across concurrent candidates", a
   }
 });
 
-test("prompt evaluations overlap across candidates while command checks remain independently locked", async () => {
+test("candidate cohorts serialize commands and prompts without changing calibration", async () => {
   const root = await mkdtemp(join(tmpdir(), "burner-evaluation-suite-test-"));
   try {
     const store = new StateStore(root);
@@ -5974,7 +5979,7 @@ test("prompt evaluations overlap across candidates while command checks remain i
       orchestrator.runEvaluations("agent", "suite-a", "agent-a"),
       orchestrator.runEvaluations("agent", "suite-b", "agent-b"),
     ]);
-    assert.equal(overlapped, true);
+    assert.equal(overlapped, false);
     assert.deepEqual(new Set(order), new Set(["suite-a:command", "suite-a:prompt", "suite-b:command", "suite-b:prompt"]));
     assert.deepEqual(promptBaselines, [60, 60]);
   } finally {
@@ -6011,7 +6016,8 @@ test("evaluation suites share cpu-heavy without deadlocking the owning agent", a
     const plain = orchestrator.runEvaluations("agent", "plain-suite", "plain-agent").then(() => { plainFinished = true; });
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal(plainFinished, false);
-    await orchestrator.runEvaluations("agent", "owned-suite", "cpu-agent");
+    await orchestrator.withEvaluationLease({ locks: [agentLease], release: agentLease.release }, (cpuLock) =>
+      orchestrator.runEvaluationSuite(cpuLock, "agent", "owned-suite", "cpu-agent"));
     assert.deepEqual(order, ["owned-suite"]);
     await agentLease.release();
     orchestrator.activeAgents.delete("cpu-idea");
@@ -6045,7 +6051,8 @@ test("candidate evaluation recovery reruns only failed scores", async () => {
         return { score: 80, summary: "complete", evidence: [], suggestions: [] };
       },
     };
-    const runs = await orchestrator.runCandidateEvaluations("agent", root, "agent");
+    const runs = await orchestrator.withEvaluationLease(undefined, (cpuLock) =>
+      orchestrator.runCandidateEvaluations(cpuLock, "agent", root, "agent"));
     assert.deepEqual(runs.map((run) => run.status), ["completed", "completed"]);
     assert.deepEqual(calls, { stable: 1, flaky: 2 });
   } finally {
@@ -6053,8 +6060,13 @@ test("candidate evaluation recovery reruns only failed scores", async () => {
   }
 });
 
-test("candidate prompt retries do not wait for the long command lane", async () => {
-  const root = await mkdtemp(join(tmpdir(), "burner-independent-evaluation-lanes-test-"));
+test("candidate prompt retries follow the completed command phase", async () => {
+  const root = await mkdtemp(join(tmpdir(), "burner-sequenced-evaluation-phases-test-"));
+  let releaseCommand;
+  const commandGate = new Promise((resolve) => { releaseCommand = resolve; });
+  let commandStarted;
+  const commandEntered = new Promise((resolve) => { commandStarted = resolve; });
+  let evaluationPromise;
   try {
     const store = new StateStore(root);
     await store.init();
@@ -6066,40 +6078,36 @@ test("candidate prompt retries do not wait for the long command lane", async () 
       ];
     });
     const orchestrator = new Orchestrator(root, store, new EventHub());
+    orchestrator.git = { head: async () => "candidate" };
     const order = [];
-    let releaseCommand;
-    const commandGate = new Promise((resolve) => { releaseCommand = resolve; });
     let promptAttempt = 0;
-    const run = (evaluationId, status, score) => ({
-      id: `run-${evaluationId}-${promptAttempt}`,
-      evaluationId,
-      commit: "candidate",
-      createdAt: timestamp,
-      durationMs: 1,
-      status,
-      score,
-      context: "composite",
-    });
-    orchestrator.runEvaluations = async (_context, _cwd, _agentRunId, _compositeId, evaluationIds) => {
-      if (evaluationIds[0] === "command") {
-        order.push("command:start");
-        await commandGate;
-        order.push("command:end");
-        return [run("command", "completed", 100)];
-      }
-      promptAttempt += 1;
-      order.push(`prompt:${promptAttempt}`);
-      return [run("prompt", promptAttempt === 1 ? "failed" : "completed", promptAttempt === 1 ? undefined : 90)];
+    orchestrator.codex = {
+      preflight: async () => undefined,
+      evaluate: async (_cwd, evaluation) => {
+        if (evaluation.command) {
+          order.push("command:start");
+          commandStarted();
+          await commandGate;
+          order.push("command:end");
+          return { score: 100, summary: "Measured", evidence: [], suggestions: [] };
+        }
+        promptAttempt += 1;
+        order.push(`prompt:${promptAttempt}`);
+        if (promptAttempt === 1) throw new Error("transient prompt failure");
+        return { score: 90, summary: "Measured", evidence: [], suggestions: [] };
+      },
     };
-    const evaluationPromise = orchestrator.runCandidateEvaluations("composite", root, undefined, "composite");
-    for (let attempt = 0; attempt < 20 && !order.includes("prompt:2"); attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    assert.deepEqual(order, ["command:start", "prompt:1", "prompt:2"]);
+    evaluationPromise = orchestrator.withEvaluationLease(undefined, (cpuLock) =>
+      orchestrator.runCandidateEvaluations(cpuLock, "composite", root, undefined, "composite"));
+    await commandEntered;
+    assert.deepEqual(order, ["command:start"]);
     releaseCommand();
     const runs = await evaluationPromise;
+    assert.deepEqual(order, ["command:start", "command:end", "prompt:1", "prompt:2"]);
     assert.deepEqual(runs.map((item) => [item.evaluationId, item.status]), [["command", "completed"], ["prompt", "completed"]]);
   } finally {
+    releaseCommand();
+    if (evaluationPromise) await Promise.allSettled([evaluationPromise]);
     await rm(root, { recursive: true, force: true });
   }
 });
