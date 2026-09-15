@@ -1244,7 +1244,9 @@ export class GitService {
   }
 
   async push(cwd: string, remote: string, branch: string): Promise<void> {
-    const result = await runCommand("git", ["push", "-u", remote, branch], { cwd, timeoutMs: 10 * 60 * 1000 });
+    // Pin both refs: source-only pushes can inherit upstream destinations and forced remote mappings.
+    const fullBranch = branch.startsWith("refs/heads/") ? branch : `refs/heads/${branch}`;
+    const result = await runCommand("git", ["push", "-u", remote, `${fullBranch}:${fullBranch}`], { cwd, timeoutMs: 10 * 60 * 1000 });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not push branch");
   }
 
