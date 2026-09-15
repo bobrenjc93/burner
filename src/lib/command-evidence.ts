@@ -9,8 +9,8 @@ import { errorMessage, now } from "./utils.js";
 
 export const COMMAND_EVIDENCE_LIMITS = Object.freeze({
   files: 128,
-  fileBytes: 32 * 1024 * 1024,
-  exportBytes: 128 * 1024 * 1024,
+  fileBytes: 64 * 1024 * 1024,
+  exportBytes: 512 * 1024 * 1024,
   streamBytes: 8 * 1024 * 1024,
 });
 
@@ -191,8 +191,8 @@ export class CommandEvidenceArchive {
         const source = join(this.artifactDir!, entry.name);
         const expected = await lstat(source);
         if (!expected.isFile() || expected.nlink !== 1) throw new Error("Export must be a regular file with exactly one link.");
-        if (expected.size > COMMAND_EVIDENCE_LIMITS.fileBytes) throw new Error("Export exceeds the 32 MiB per-file limit.");
-        if (expected.size > COMMAND_EVIDENCE_LIMITS.exportBytes - total) throw new Error("Export exceeds the 128 MiB total limit.");
+        if (expected.size > COMMAND_EVIDENCE_LIMITS.fileBytes) throw new Error(`Export exceeds the ${COMMAND_EVIDENCE_LIMITS.fileBytes / (1024 * 1024)} MiB per-file limit.`);
+        if (expected.size > COMMAND_EVIDENCE_LIMITS.exportBytes - total) throw new Error(`Export exceeds the ${COMMAND_EVIDENCE_LIMITS.exportBytes / (1024 * 1024)} MiB total limit.`);
         const input = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         let bytes: Buffer | undefined;
         let read = 0;
