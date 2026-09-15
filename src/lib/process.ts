@@ -6,6 +6,8 @@ export type CommandResult = {
   stdout: string;
   stderr: string;
   exitCode: number;
+  termination?: "timeout" | "abort" | "signal";
+  signal?: NodeJS.Signals;
 };
 
 export async function runCommand(
@@ -19,6 +21,8 @@ export async function runCommand(
     signal?: AbortSignal;
     onStdout?: (chunk: string) => void;
     onStderr?: (line: string) => void;
+    /** Decoded stderr chunks, before line splitting or synthetic termination messages. */
+    onStderrChunk?: (chunk: string) => void;
     /** Test seam for simulating a host suspend without making the suite sleep for 30 seconds. */
     timeoutSuspendGapMs?: number;
   },
@@ -47,7 +51,7 @@ export async function runCommand(
       if (forceResolve) clearTimeout(forceResolve);
       if (abortListener) options.signal?.removeEventListener("abort", abortListener);
     };
-    const finish = (exitCode: number) => {
+    const finish = (exitCode: number, signal?: NodeJS.Signals | null) => {
       if (settled) return;
       settled = true;
       clearTimers();
@@ -58,6 +62,7 @@ export async function runCommand(
         stdout,
         stderr: termination ? `${stderr}${stderr && !stderr.endsWith("\n") ? "\n" : ""}${termination}` : stderr,
         exitCode: timedOut ? 124 : aborted ? 130 : exitCode,
+        ...(timedOut || aborted || signal ? { termination: timedOut ? "timeout" as const : aborted ? "abort" as const : "signal" as const, signal: signal ?? undefined } : {}),
       });
     };
     const killTree = (signal: NodeJS.Signals) => {
@@ -91,6 +96,7 @@ export async function runCommand(
     });
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
+      options.onStderrChunk?.(chunk);
       for (const line of chunk.split("\n").filter(Boolean)) options.onStderr?.(line);
     });
     child.on("error", (error) => {
@@ -99,7 +105,7 @@ export async function runCommand(
       clearTimers();
       reject(error);
     });
-    child.on("close", (code) => finish(code ?? 1));
+    child.on("close", (code, signal) => finish(code ?? 1, signal));
     if (options.input !== undefined) child.stdin.end(options.input);
     else child.stdin.end();
     if (options.timeoutMs) {

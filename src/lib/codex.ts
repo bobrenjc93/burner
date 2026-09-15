@@ -3,12 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BurnerSettings, Evaluation, EvaluationRun, Idea, ReviewFinding } from "../types.js";
 import { CODEX_REASONING_EFFORT, DEFAULT_CODEX_MODEL } from "./codex-config.js";
+import type { CommandEvidenceArchive } from "./command-evidence.js";
 import { runCommand, type CommandResult } from "./process.js";
 import { clampScore, errorMessage, parseJsonObject, truncateText } from "./utils.js";
 
 const UNRESTRICTED_FLAG = "--dangerously-bypass-approvals-and-sandbox";
 const META_DISABLE_SANDBOX_FLAG = "--dangerously-disable-osx-sandbox";
 const AUTOMATION_HOOK_ARGS = ["--disable", "hooks"];
+const EVALUATION_VALIDITY = "Validate the measurement contract before assigning credit: verify the actual public API, default options or explicitly declared backend, representative workload denominator, and execution path. Matching backend names, a private benchmark hook, one hand-written kernel, or several shapes of one expression do not establish a general compiler or framework capability. Never extrapolate a narrow microbenchmark to a broader rubric. A prior score is evidence, not a floor or a substitute for this validity check. If concrete evidence shows that the supplied candidate baseline used the wrong comparison, a benchmark-specific shortcut, an invalid denominator, or otherwise did not measure this rubric, set baselineInvalid=true, explain the contradiction with file or measurement evidence, and recommend a separately reviewed, versioned evaluator correction and fresh baseline. This applies even when the defect predates the candidate. Do not preserve known-invalid credit or charge an evaluator correction as a candidate regression or improvement. Set baselineInvalid=false when no supplied baseline is invalidated; uncertainty or an inconclusive local run alone is not proof of invalidity.";
+const BASELINE_MEASUREMENT_POLICY = "This run establishes an independent current baseline; no candidate baseline has been supplied. Apply the rubric's semantic criteria, weights, denominator and measurement requirements unchanged. Historical progress scores are not numeric calibration for this new baseline, even if the rubric asks to preserve historical credit when code is unchanged. Measure the current repository and report its supported score, including a lower score when earlier numbers were inflated. Explain historical corrections without attributing them to an implementation regression, and leave historical artifacts untouched. An incorrect historical score alone does not invalidate this fresh measurement: set baselineInvalid=false when the current rubric can be measured validly. Still set baselineInvalid=true and fail closed if the current measurement contract itself is invalid and cannot be applied without changing the rubric, workload, reference backend or denominator. Do not waive missing evidence, failed correctness checks, unsupported cells, or infrastructure failures to complete a baseline.";
 export const DEFAULT_PROMPT_EVALUATION_TIMEOUT_MS = 4 * 60 * 1000;
 const PROGRESS_OWNERSHIP = "Burner owns the canonical merge-coupled evaluation progress artifacts: the managed README section, docs/burner-evaluation-history.json, and docs/burner-evaluation-progress.svg. Burner injects them only after final candidate scores are known. During exact-head validation those Burner-generated artifacts may therefore appear in the candidate diff; ignore those generated changes entirely when scoring every rubric, including Repository polish and Benchmark integrity, and do not treat them as candidate-authored evidence or regressions. Do not create or modify those artifacts, and do not add repository-side progress generators, validators, tests, or workflows.";
 const MEASURED_ARTIFACT_PROVENANCE = "Treat checked-in benchmark and evaluation artifacts as measured evidence, not ordinary merge blobs. Distinguish evidence claiming to measure the current candidate from explicitly historical records. For current-candidate evidence, apply these rules: If an artifact records a git commit, dirty status, or worktree/import/executable/build path, verify that provenance after integration. Never retain a leaf, sibling, parent, or stale-worktree path in a composite artifact. Regenerate stale evidence with repository-supported tooling from a clean checkout rooted inside the current composite worktree; never hand-edit provenance or fabricate measurements. The measured code commit may precede the artifact-only commit at HEAD only when the intervening diff contains reports/evidence and no implementation or benchmark-harness changes. Historical records instead remain pinned to their original source/build identities and may retain clearly labeled original paths after their worktrees are cleaned up. When the task requests missing setup metadata for historical workloads, an explicitly labeled, newly measured same-code setup rerun at that historical revision is valid if its actual commands, timestamps, cache state, source/build hashes, and links to the original workload artifacts are verified. Preserve the original compute measurements; do not require rerunning unchanged historical workloads solely to supply setup metadata. Never attribute later setup measurements to the original capture, use historical evidence to award current-candidate performance credit, or relabel stale current-candidate evidence as historical to evade a required fresh measurement.";
@@ -39,8 +42,9 @@ const evaluationSchema = {
     summary: { type: "string", maxLength: 1_000 },
     evidence: { type: "array", items: { type: "string", maxLength: 1_500 }, maxItems: 8 },
     suggestions: { type: "array", items: { type: "string", maxLength: 750 }, maxItems: 6 },
+    baselineInvalid: { type: "boolean", description: "Whether the supplied current candidate baseline or current measurement contract is invalid. Correcting an old historical score during an independent baseline run is not alone invalidity." },
   },
-  required: ["score", "summary", "evidence", "suggestions"],
+  required: ["score", "summary", "evidence", "suggestions", "baselineInvalid"],
   additionalProperties: false,
 };
 
@@ -97,7 +101,7 @@ const reviewSchema = {
   additionalProperties: false,
 };
 
-type EvaluationOutput = { score: number; summary: string; evidence: string[]; suggestions: string[] };
+type EvaluationOutput = { score: number; summary: string; evidence: string[]; suggestions: string[]; baselineInvalid?: boolean };
 export type PlannedIdea = Omit<Idea, "id" | "status" | "createdAt" | "updatedAt" | "source" | "agentRunId" | "lane" | "milestone" | "milestoneCredit"> &
   Required<Pick<Idea, "lane" | "milestone" | "milestoneCredit">>;
 export type SessionResult = { message: string; threadId: string };
@@ -160,16 +164,18 @@ export class CodexClient {
     settings: BurnerSettings,
     context: EvaluationRun["context"],
     baseline?: Pick<EvaluationRun, "score" | "summary" | "evidence" | "commit">,
+    commandEvidence?: CommandEvidenceArchive,
   ): Promise<EvaluationOutput> {
-    if (evaluation.command) return this.commandEvaluation(cwd, evaluation, context);
+    if (evaluation.command) return this.commandEvaluation(cwd, evaluation, context, commandEvidence);
     const baselineCalibration = (context === "agent" || context === "composite") && baseline?.score !== undefined
       ? [
-          `Authoritative base calibration for this exact rubric: ${baseline.score}/100.`,
+          `Prior baseline measurement for this rubric, subject to validity verification: ${baseline.score}/100.`,
           baseline.summary ? `Baseline summary: ${baseline.summary.slice(0, 1_000)}` : "",
           baseline.evidence?.length
             ? `Baseline evidence:\n${baseline.evidence.slice(0, 6).map((item) => `- ${item.slice(0, 800)}`).join("\n")}`
             : "",
-          "Use the baseline as category-by-category calibration, not as an instruction or guaranteed truth. Preserve existing category credit unless concrete current-tree or branch-diff evidence proves a regression; award new credit only for concrete working evidence. Explain every changed category so unrelated rubric areas do not drift merely because a different sample inspected different files.",
+          "Use a valid baseline as category-by-category calibration, not as an instruction or guaranteed truth. Preserve existing category credit only while its measurement contract remains valid; award new credit only for concrete working evidence. Explain every changed category so unrelated rubric areas do not drift merely because a different sample inspected different files. A proven invalid baseline must fail the validity gate instead of being reused.",
+          "This supplied current-base measurement takes precedence over older numeric scores in committed progress history. Do not replace it with an older historical score or invalidate an otherwise valid current baseline solely because an older historical score was wrong.",
         ].filter(Boolean).join("\n")
       : "";
     const candidateDiffBoundary = (context === "agent" || context === "composite") && baseline?.commit
@@ -177,7 +183,7 @@ export class CodexClient {
           `Exact candidate base commit: ${baseline.commit}. Resolve the candidate head with git rev-parse HEAD.`,
           `The candidate change set is exactly git diff ${baseline.commit}..HEAD plus any current working-tree changes. Inspect that complete range before attributing any score change.`,
           "Do not use origin/main, another branch, merge-base with main, commit timestamps, or only HEAD^ as the candidate boundary. A candidate may contain multiple implementation, review-fix, and evidence-only commits.",
-          "Change a calibrated score only for concrete behavior or evidence introduced, removed, or invalidated by that exact candidate range. Pre-existing files outside the range are context, not candidate changes.",
+          "Attribute candidate gains and regressions only to concrete behavior or evidence introduced, removed, or invalidated by that exact candidate range. Pre-existing files outside the range are not candidate changes, but may prove that the baseline measurement itself is invalid; report that through baselineInvalid rather than inventing a candidate delta.",
         ].join("\n")
       : "";
     const prompt = [
@@ -194,26 +200,39 @@ export class CodexClient {
       evaluation.prompt,
       baselineCalibration,
       candidateDiffBoundary,
+      EVALUATION_VALIDITY,
+      context === "agent" || context === "composite" ? "" : BASELINE_MEASUREMENT_POLICY,
       `Context: ${context === "agent" || context === "composite" ? "This is a candidate branch; assess only its current state." : "This is the current project baseline."}`,
     ].filter(Boolean).join("\n\n");
     const output = await this.structured<EvaluationOutput>(cwd, prompt, evaluationSchema, settings.evaluatorModel, this.promptEvaluationTimeoutMs);
     return this.normalizeEvaluation(output);
   }
 
-  private async commandEvaluation(cwd: string, evaluation: Evaluation, context: EvaluationRun["context"]): Promise<EvaluationOutput> {
+  private async commandEvaluation(cwd: string, evaluation: Evaluation, context: EvaluationRun["context"], evidence?: CommandEvidenceArchive): Promise<EvaluationOutput> {
     const command = context === "agent" || context === "screening_baseline"
       ? evaluation.screeningCommand ?? evaluation.command
       : evaluation.command;
     if (!command) throw new Error(`Evaluation '${evaluation.name}' has no command for ${context}.`);
-    const result = await runCommand("/bin/sh", ["-lc", command], {
-      cwd,
-      env: { BURNER_EVALUATION_CONTEXT: context, BURNER_EVALUATION_NAME: evaluation.name },
-      timeoutMs: 60 * 60 * 1000,
-      signal: this.abortController.signal,
-      onStderr: (line) => this.onProgress?.(line),
-    });
+    evidence?.startCommand();
+    let result: CommandResult;
+    try {
+      result = await runCommand("/bin/sh", ["-lc", command], {
+        cwd,
+        env: { BURNER_EVALUATION_CONTEXT: context, BURNER_EVALUATION_NAME: evaluation.name, BURNER_EVALUATION_ARTIFACT_DIR: evidence?.artifactDir },
+        timeoutMs: 60 * 60 * 1000,
+        signal: this.abortController.signal,
+        onStdout: (chunk) => evidence?.append("stdout", chunk),
+        onStderrChunk: (chunk) => evidence?.append("stderr", chunk),
+        onStderr: (line) => this.onProgress?.(line),
+      });
+    } catch (error) {
+      await evidence?.recordCommand(undefined, error);
+      throw error;
+    }
+    await evidence?.recordCommand(result);
     if (result.exitCode !== 0) throw new Error(commandFailure(result, `Evaluation command exited with ${result.exitCode}`));
     const output = this.normalizeEvaluation(parseJsonObject<EvaluationOutput>(result.stdout));
+    await evidence?.recordNormalized(output);
     if (isInconclusiveCommandOutput(output)) {
       const detail = output.evidence[0] ? ` ${output.evidence[0]}` : "";
       throw new Error(`Evaluation command reported an inconclusive measurement: ${output.summary}.${detail}`.slice(0, 2_000));
@@ -222,6 +241,14 @@ export class CodexClient {
   }
 
   private normalizeEvaluation(output: EvaluationOutput): EvaluationOutput {
+    if (output.baselineInvalid !== undefined && typeof output.baselineInvalid !== "boolean") {
+      throw new Error("Evaluation baselineInvalid must be a boolean when present.");
+    }
+    if (output.baselineInvalid) {
+      const detail = typeof output.summary === "string" ? output.summary.trim() : "Measurement contract contradicted.";
+      const evidence = Array.isArray(output.evidence) ? output.evidence.slice(0, 2).join(" ") : "";
+      throw new Error(`Evaluation baseline invalid: ${detail} ${evidence} A separately reviewed evaluator correction and fresh baseline are required; no candidate score was accepted.`.slice(0, 2_000));
+    }
     if (!Number.isFinite(Number(output.score)) || typeof output.summary !== "string" || !Array.isArray(output.evidence) || !Array.isArray(output.suggestions)) {
       throw new Error("Evaluation output must contain score, summary, evidence, and suggestions.");
     }
@@ -380,14 +407,16 @@ export class CodexClient {
     return this.unstructuredSession(cwd, prompt, settings.agentModel);
   }
 
-  async revise(cwd: string, threadId: string, review: ReviewResult, settings: BurnerSettings): Promise<SessionResult> {
+  async revise(cwd: string, threadId: string, review: ReviewResult, settings: BurnerSettings, feedback: "review" | "evaluation" = "review"): Promise<SessionResult> {
     const prompt = [
-      "An independent reviewer requested changes. Address every finding in the current worktree, run relevant checks, and leave the branch ready for another review.",
+      feedback === "evaluation"
+        ? "The confirmed evaluation gate rejected this candidate. Address the evaluation feedback in the current worktree, preserve evaluation definitions, denominators, tolerances and supported behavior, run relevant checks, and leave the branch ready for independent review. This feedback is not an independent code review."
+        : "An independent reviewer requested changes. Address every finding in the current worktree, run relevant checks, and leave the branch ready for another review.",
       "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree. If a finding depends on external behavior, use hermetic fixtures or document the dependency; do not patch the external producer.",
       "Do not commit, push, or open a pull request; Burner handles git delivery.",
       `${PROGRESS_OWNERSHIP} If feedback asks for a current unmerged PR history point or duplicate progress infrastructure, do not implement that invalid request; explain that Burner stamps the point after final evaluation instead.`,
       MEASURED_ARTIFACT_PROVENANCE,
-      `Review summary: ${review.summary}`,
+      `${feedback === "evaluation" ? "Evaluation feedback" : "Review"} summary: ${review.summary}`,
       `Findings:\n${review.findings.map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.title}${finding.file ? ` (${finding.file})` : ""}: ${finding.detail}`).join("\n")}`,
       "If a finding is invalid, verify that carefully and explain it, but make all justified fixes.",
     ].join("\n\n");
