@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EventHub } from "./lib/events.js";
-import { canRetryAgent, Orchestrator, validateAgentRetryOptions, validateLeafAdmissionOptions, type AgentRetryOptions, type LeafAdmissionOptions } from "./lib/orchestrator.js";
+import { canRetryAgent, Orchestrator, validateAgentRetryOptions, validateLeafAdmissionOptions, type AgentRetryOptions, type AgentWithdrawalInput, type LeafAdmissionOptions } from "./lib/orchestrator.js";
 import { StateStore, validateEvaluation } from "./lib/store.js";
 import type { BurnerSettings, Idea } from "./types.js";
 import { errorMessage, id, now } from "./lib/utils.js";
@@ -219,6 +219,11 @@ export async function createBurnerServer(options: BurnerServerOptions) {
       if (!found) return json(response, 404, { error: "Idea not found or cannot be changed." });
       events.emit("state", store.get());
       json(response, 200, { ok: true });
+    }),
+    route("POST", "/api/agents/:runId/withdraw", async (_request, response, params, body) => {
+      if (!store.get().agentRuns.some((run) => run.id === params.runId)) return json(response, 404, { error: "Agent run not found." });
+      const run = await orchestrator.withdrawAgent(params.runId, body as AgentWithdrawalInput);
+      json(response, 200, run);
     }),
     route("POST", "/api/agents/:runId/retry", (_request, response, params, body) => {
       const run = store.get().agentRuns.find((item) => item.id === params.runId);

@@ -190,11 +190,13 @@ export type LegacyLeafPrProofInput = {
 };
 
 export type LeafTerminalReason = {
-  kind: "review-limit" | "no-changes" | "rejected" | "absorbed" | "superseded" | "abandoned";
   continuationId: string;
   /** Transfer identity, not proof that a source has landed. */
   compositeId?: string;
-};
+} & (
+  | { kind: "review-limit" | "no-changes" | "rejected" | "absorbed" | "superseded" | "abandoned" }
+  | { kind: "withdrawn"; head: string; detail: string }
+);
 
 export type LeafPrSemanticOwner =
   | { kind: "delivery" | "review-checkpoint"; continuationId: string }
