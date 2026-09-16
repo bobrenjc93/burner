@@ -14,7 +14,7 @@ import { LockManager } from "./locks.js";
 import { commandExists, runCommand } from "./process.js";
 import { planProgressArtifacts, planProgressRestore, updateProgressArtifacts, type ProgressPoint } from "./progress.js";
 import { StateStore, validateEvaluation } from "./store.js";
-import { errorMessage, id, mapLimit, now, slugify, weightedScore } from "./utils.js";
+import { errorMessage, id, mapLimit, now, slugify, weightedScore, wellFormedText } from "./utils.js";
 
 type AgentBase = {
   ref: string;
@@ -28,6 +28,17 @@ type AgentClaim = { token: symbol; runIds: readonly string[]; release: () => voi
 type LeafEvaluationExecution = { run: AgentRun; receiptId: string; claim: AgentClaim; side: "candidate" | "baseline"; index: number };
 export type LeafAdmissionOptions = { legacyPrProof?: LegacyLeafPrProofInput; retainWorktree?: true };
 export type AgentRetryOptions = LeafAdmissionOptions & { repairNotes?: string };
+export type AgentWithdrawalInput = { expectedHead: string; expectedContinuationId: string; reason: string };
+
+function withdrawalReason(input: AgentWithdrawalInput): Extract<LeafTerminalReason, { kind: "withdrawn" }> {
+  if (!input || typeof input !== "object" || Array.isArray(input) ||
+    typeof input.expectedHead !== "string" || !input.expectedHead.trim() ||
+    typeof input.expectedContinuationId !== "string" || !input.expectedContinuationId.trim() ||
+    typeof input.reason !== "string" || !input.reason.trim() || input.reason.length > 12_000) {
+    throw new Error("Withdrawal requires exact expectedHead and expectedContinuationId strings and a nonempty reason of at most 12000 characters.");
+  }
+  return { kind: "withdrawn", continuationId: input.expectedContinuationId, head: input.expectedHead, detail: wellFormedText(input.reason.trim()) };
+}
 
 /** Every fan-out owner must drain its writers before its resource/claim unwinds. */
 async function settleEvaluationWork<T>(work: Promise<T>[]): Promise<T[]> {
@@ -661,6 +672,7 @@ function eligibleYoloLeaves(state: BurnerState, baseCommit: string): AgentRun[] 
     .filter((run) =>
       run.status === "completed" &&
       run.prState === "open" &&
+      !run.leafPr?.terminal &&
       run.prNumber !== undefined &&
       run.baseCommit === baseCommit &&
       !run.quarantinedAt &&
@@ -754,6 +766,7 @@ export function selectYoloMergeCandidate(state: BurnerState, baseCommit: string,
     .filter((run) =>
       run.status === "completed" &&
       run.prState === "open" &&
+      !run.leafPr?.terminal &&
       run.prNumber !== undefined &&
       run.baseCommit === baseCommit &&
       !run.quarantinedAt &&
@@ -1409,7 +1422,7 @@ export class Orchestrator {
     if (lastAlert && alertHasRecoveryWindow && Date.now() - new Date(lastAlert).getTime() < state.settings.mergeCadenceMinutes * 60_000) return;
     const baseCommit = await this.git.resolveRef(state.settings.baseBranch);
     const reviewedLeaves = state.agentRuns.filter((run) =>
-      run.status === "completed" && run.prState === "open" && run.baseCommit === baseCommit && finalReviewApproved(run.reviewApproved, run.reviewRounds));
+      run.status === "completed" && run.prState === "open" && !run.leafPr?.terminal && run.baseCommit === baseCommit && finalReviewApproved(run.reviewApproved, run.reviewRounds));
     const eligibleLeaves = eligibleYoloLeaves(state, baseCommit);
     const breachedAt = now();
     await this.store.update((draft) => {
@@ -1802,7 +1815,7 @@ export class Orchestrator {
     let state = this.store.get();
     let run = state.agentRuns.find((item) => item.id === runId)!;
     validateLeafAdmissionOptions(run, options);
-    if (!run?.prNumber || run.prState !== "open" || !run.baseRef || run.baseCommit !== baseCommit) return false;
+    if (!run?.prNumber || run.prState !== "open" || run.leafPr?.terminal || !run.baseRef || run.baseCommit !== baseCommit) return false;
     const admission = await this.admitLeafOptions(run, claim, options);
     run = admission.run;
     if ((await this.observeOwnedLeafPr(run, claim, { merged: true }))?.state === "MERGED") {
@@ -3902,7 +3915,7 @@ export class Orchestrator {
     try {
       const foundationalDeliveryPending = state.agentRuns.some((run) => {
         const idea = state.ideas.find((candidate) => candidate.id === run.ideaId);
-        return idea?.lane === "foundational" && run.status === "completed" && run.prNumber !== undefined && (!run.prState || run.prState === "open");
+        return idea?.lane === "foundational" && run.status === "completed" && !run.leafPr?.terminal && run.prNumber !== undefined && (!run.prState || run.prState === "open");
       });
       planned = await this.codex.planIdeas(planningCwd, evaluations, latest, state.ideas, state.settings, foundationalDeliveryPending);
     } finally {
@@ -3970,7 +3983,7 @@ export class Orchestrator {
       const sources: CompositeSource[] = uniqueIds.map((runId) => {
         const run = state.agentRuns.find((item) => item.id === runId);
         const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
-        if (!run?.prNumber || !run.prUrl || (run.prState && run.prState !== "open")) throw new Error("Every composite source must be an open Burner pull request.");
+        if (!run?.prNumber || !run.prUrl || run.leafPr?.terminal || (run.prState && run.prState !== "open")) throw new Error("Every composite source must be an open, nonterminal Burner pull request.");
         if (this.activeAgents.has(run.ideaId)) throw new Error("A selected agent slot is already reserved.");
         return { agentRunId: run.id, prNumber: run.prNumber, title: idea?.title ?? run.branch, branch: run.branch, kind: "pull_request" as const, impact: run.impact };
       });
@@ -4110,10 +4123,45 @@ export class Orchestrator {
     await this.syncPullRequests(true);
   }
 
+  /** An operator decision is independent of the leaf's retained scientific outcome. */
+  async withdrawAgent(runId: string, input: AgentWithdrawalInput): Promise<AgentRun> {
+    const reason = withdrawalReason(input);
+    const claim = this.claimAgents([runId]);
+    try {
+      const run = this.store.get().agentRuns.find((item) => item.id === runId);
+      if (!run?.prNumber || !run.leafPr?.known || run.leafPr.known.number !== run.prNumber) {
+        throw new Error("Withdrawal requires an existing numbered leaf with established PR ownership.");
+      }
+      this.assertLeafTerminalReason(run, reason);
+      const owner = run.leafPr;
+      if ((owner.terminal && JSON.stringify(owner.terminal) !== JSON.stringify(reason)) ||
+        (owner.pending && (owner.pending.owner.kind !== "terminal-close" || JSON.stringify(owner.pending.owner.reason) !== JSON.stringify(reason)))) {
+        throw new Error("A different retained leaf PR intent or terminal reason prevents withdrawal.");
+      }
+      if (run.prState !== "open" && !(run.prState === "closed" && owner.terminal && owner.known!.fields.state === "CLOSED") &&
+        !(run.prState === "merged" && owner.merged)) {
+        throw new Error("Withdrawal requires an owned OPEN leaf or its matching acknowledged terminal result.");
+      }
+      if (owner.known!.fields.state === "CLOSED" && !owner.terminal) throw new Error("An unexplained CLOSED leaf is not withdrawal authority.");
+      return await this.closeTerminalLeaf(run, claim, reason);
+    } finally {
+      claim.release();
+      this.events.emit("state", this.store.get());
+    }
+  }
+
   private assertLeafTerminalReason(run: AgentRun, reason: LeafTerminalReason): void {
     const state = this.store.get(), cursor = run.continuation;
     if (!cursor || cursor.id !== reason.continuationId) throw new Error("Terminal retirement lacks its exact source continuation.");
-    if (reason.kind === "absorbed") {
+    if (reason.kind === "withdrawn") {
+      const validated = withdrawalReason({ expectedHead: reason.head, expectedContinuationId: reason.continuationId, reason: reason.detail });
+      if (JSON.stringify(validated) !== JSON.stringify(reason) || run.status !== "completed" || cursor.step !== "done" ||
+        cursor.outcome !== "completed" || cursor.head !== reason.head || cursor.identity.pullRequest?.head !== reason.head ||
+        cursor.publication || run.fullEvaluation || run.parentCompositeId || this.activeAgents.has(run.ideaId) ||
+        reservedCompositeSourceIds(state).has(run.id)) {
+        throw new Error("Withdrawal requires the exact idle completed source without competing publication or composite ownership.");
+      }
+    } else if (reason.kind === "absorbed") {
       const parent = state.composites.find((item) => item.id === reason.compositeId);
       if (run.status !== "absorbed" || cursor.step !== "done" || cursor.outcome !== "absorbed" || !run.absorbedAt ||
         run.parentCompositeId !== reason.compositeId || !parent?.sources.some((source) => source.agentRunId === run.id &&
@@ -4210,9 +4258,12 @@ export class Orchestrator {
       await this.git.proveLeafInclusion({ remote: this.store.get().settings.remote, repository: run.leafPr!.repository,
         baseBranch: run.leafPr!.baseBranch, sourceBase: run.baseCommit!, head });
     }
-    return this.acknowledgeLeafPrIntent(run, claim, run.leafPr!.pending!.id, (current) => {
+    return this.acknowledgeLeafPrIntent(run, claim, run.leafPr!.pending!.id, (current, state) => {
       current.prState = reason.kind === "superseded" ? "superseded" : "closed";
       delete current.supersededByCompositeId;
+      if (reason.kind === "withdrawn") state.activity.unshift({
+        id: id("activity"), createdAt: now(), type: "pr", message: `Leaf PR #${current.prNumber} withdrawn`, detail: reason.detail,
+      });
     });
   }
 

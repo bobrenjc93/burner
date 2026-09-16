@@ -4658,7 +4658,8 @@ test("YOLO cadence cooks a healthy partial batch and falls back to one reviewed 
       state.settings.mergeCadenceMinutes = 60;
       state.orchestrator.mergeWindowStartedAt = old;
       state.evaluations = [{ id: "speed", name: "Speed", prompt: "Measure speed", command: "./benchmark", weight: 1, enabled: true, createdAt: timestamp }];
-      state.agentRuns = [leaf("a", 1, 3), leaf("b", 2, 2)];
+      state.agentRuns = [leaf("a", 1, 3), leaf("b", 2, 2), { ...leaf("withdrawn", 3, 9),
+        leafPr: { terminal: { kind: "withdrawn", continuationId: "declined-source", head: "declined-head", detail: "Replacement selected" } } }];
       state.ideas.push(
         { id: "idea-a", title: "A", description: "", rationale: "", predictedImpact: 3, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "a" },
         { id: "idea-b", title: "B", description: "", rationale: "", predictedImpact: 2, evaluationIds: [], resources: [], status: "completed", createdAt: timestamp, updatedAt: timestamp, source: "manual", agentRunId: "b" },
@@ -4670,6 +4671,8 @@ test("YOLO cadence cooks a healthy partial batch and falls back to one reviewed 
     orchestrator.createComposite = async (...args) => { cooked = args; return {}; };
     assert.equal(orchestrator.mergeCadenceDue(), true);
     await orchestrator.recordCadenceBreach();
+    assert.match(store.get().activity[0].detail, /2 reviewed open leaf PRs are available; 2 are batch-eligible/,
+      "cadence availability excludes an OPEN source whose withdrawal is pending");
     assert.equal(orchestrator.mergeCadenceDue(), false, "the real tick opens a fresh bounded window before recovery work starts");
     assert.equal(await orchestrator.autoMergeNext(), false);
     assert.equal(await orchestrator.autoCookNext(), true);

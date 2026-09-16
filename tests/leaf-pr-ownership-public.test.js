@@ -8,7 +8,7 @@ import { delimiter, dirname, join, resolve, sep } from "node:path";
 import test from "node:test";
 import { CodexClient } from "../dist/lib/codex.js";
 import { GitService, TransientMergeGateError } from "../dist/lib/git.js";
-import { canRetryAgent, latestFullAssessment } from "../dist/lib/orchestrator.js";
+import { canRetryAgent, latestFullAssessment, selectYoloLeafBatch, selectYoloMergeCandidate } from "../dist/lib/orchestrator.js";
 import { runCommand } from "../dist/lib/process.js";
 import { StateStore } from "../dist/lib/store.js";
 import { createBurnerServer } from "../dist/server.js";
@@ -125,6 +125,7 @@ function installFakes(t, f) {
       if (evaluation.command) {
         assert.ok(evidence);
         evidence.startCommand();
+        if (f.commandArtifact) await writeFile(join(evidence.artifactDir, "fixture.bin"), f.commandArtifact);
         const stdout = JSON.stringify(output);
         evidence.append("stdout", stdout);
         await evidence.recordCommand({ stdout, stderr: "", exitCode: 0 });
@@ -268,13 +269,19 @@ function installFakes(t, f) {
       mutator(draft);
       const after = draft.agentRuns.find((item) => item.ideaId === "idea");
       const cut = f.stateCut;
-      if (cut && !cut.hit && cut.matches(before, after)) {
+      if (cut && !cut.hit && !cut.afterWrite && cut.matches(before, after)) {
         cut.hit = true;
         throw new Error("Fixture stopped before semantic acknowledgment was saved");
       }
     });
     const fault = f.fault;
     const run = this.get().agentRuns.find((item) => item.ideaId === "idea");
+    const cut = f.stateCut;
+    if (cut && !cut.hit && cut.afterWrite && cut.matches(before, run)) {
+      cut.hit = true;
+      cut.acknowledged = clone(run);
+      throw new Error("Fixture semantic acknowledgment was lost after state write");
+    }
     if (fault?.cut === "lost-state-ack" && fault.hit && !fault.ackHit &&
       run?.leafPr?.pending?.id === fault.call.pending.id && !run.leafPr.pending.effect &&
       equal(run.leafPr.known?.fields, fault.call.pending.effect.after)) {
@@ -351,6 +358,7 @@ async function fixture(t, options = {}) {
   f.retry = () => f.server.orchestrator.retryAgent(f.run().id);
   f.merge = () => f.server.orchestrator.mergeAgent(f.run().id);
   f.sync = () => f.server.orchestrator.syncPullRequests(true);
+  f.withdraw = (input = withdrawalInput(f)) => f.server.orchestrator.withdrawAgent(f.run().id, input);
   await f.restart();
   f.ready = true;
   return f;
@@ -1243,4 +1251,492 @@ test("history selection consumes original full and progress receipts under a gen
     assert.equal(f.calls.gitPushes.length, saved.pushes); assertTerminalEvidence(f, saved);
     if (kind === "progress push") await f.git.verifyGeneratedProgress(f.run().generatedProgress);
   }));
+});
+
+function withdrawalInput(f, reason = "Declined in favor of the independently evaluated replacement.") {
+  return { expectedHead: f.run().continuation.head, expectedContinuationId: f.run().continuation.id, reason };
+}
+
+function withdrawalActivities(f) {
+  return f.store.get().activity.filter((entry) => entry.message === "Leaf PR #42 withdrawn");
+}
+
+function withdrawalHistory(f) {
+  const { leafPr, prState, ...run } = clone(f.run());
+  return clone({ run, ideas: f.store.get().ideas, evaluationRuns: f.store.get().evaluationRuns,
+    evidence: evidenceSnapshot(f), pushes: f.calls.gitPushes, merges: f.calls.merges });
+}
+
+function postWithdrawal(f, input, runId = f.run().id) {
+  return fetch(`http://127.0.0.1:${f.server.server.address().port}/api/agents/${runId}/withdraw`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
+  });
+}
+
+test("public withdrawal preserves a positive leaf's exact history, artifacts, and source while closing once", async (t) => withFixture(t, {}, async (f) => {
+  f.commandArtifact = Buffer.from("retained command artifact\0\xff", "latin1");
+  await deliver(f);
+  f.phase = "full-before-withdrawal";
+  assert.equal(await f.full(), true);
+  assert.equal(latestFullAssessment(f.run()).qualified, true);
+  assert.ok(f.run().impact > 0);
+  assert.throws(() => lstatSync(f.run().worktree), { code: "ENOENT" }, "normal checkout cleanup must not prevent retirement");
+  const archives = [];
+  for (const row of f.store.get().evaluationRuns.filter((row) => row.commandEvidence?.manifest)) {
+    const reference = row.commandEvidence;
+    const manifestPath = join(f.root, reference.manifest), manifest = await readFile(manifestPath);
+    archives.push([manifestPath, manifest]);
+    for (const file of JSON.parse(manifest).files) {
+      const path = join(f.root, reference.directory, file.path);
+      archives.push([path, await readFile(path)]);
+    }
+  }
+  assert.ok(archives.some(([path]) => path.endsWith("/artifacts/fixture.bin")), "the fixture must contain a real archived export");
+  // A new current policy/base cannot retroactively replace the old experiment.
+  await f.store.update((state) => { Object.assign(state.evaluations[1], { definitionVersion: "v2", prompt: "Later policy", weight: 2 }); });
+  const targetPath = join(f.sandbox, "withdrawal-new-base");
+  await gitCommand(f.root, "worktree", "add", "--quiet", "-b", "fixture/withdrawal-new-base", targetPath, f.base);
+  await writeFile(join(targetPath, "later.txt"), "unrelated newer base\n");
+  f.world.target = await f.git.commit(targetPath, "fixture newer base before withdrawal");
+  await gitCommand(targetPath, "push", "origin", `${f.world.target}:refs/heads/main`);
+  const input = withdrawalInput(f, "  Replacement PR #43; preserve the measured source and archive.\n");
+  const decision = clone(input), before = withdrawalHistory(f), known = clone(f.run().leafPr.known);
+  const effects = f.calls.effects.length;
+  f.onObserve = async () => {
+    Object.assign(input, { expectedHead: f.base, expectedContinuationId: "mutated-caller", reason: "A different decision" });
+    f.onObserve = undefined;
+  };
+  const result = await f.withdraw(input);
+  assert.equal(result.prState, "closed");
+  assert.equal(result.status, "completed");
+  assert.deepEqual(result.leafPr.terminal, { kind: "withdrawn", head: decision.expectedHead,
+    continuationId: decision.expectedContinuationId, detail: decision.reason.trim() }, "the public method snapshots primitive decision fields before awaiting");
+  assert.equal(result.leafPr.pending, undefined);
+  assert.deepEqual(result.leafPr.known, { ...known, fields: { ...known.fields, state: "CLOSED" } });
+  assert.deepEqual(tuple(f.world.pr), result.leafPr.known.fields);
+  assert.deepEqual(f.calls.effects.slice(effects).map((call) => call.name), ["close"], "no presentation or readiness write accompanies withdrawal");
+  assert.deepEqual(withdrawalHistory(f), before);
+  assert.deepEqual(await f.persistedRun(), result);
+  assert.equal(withdrawalActivities(f).length, 1);
+  assert.equal(withdrawalActivities(f)[0].detail, decision.reason.trim());
+  const activity = clone(withdrawalActivities(f));
+  await f.restart();
+  assert.deepEqual(await f.withdraw(decision), result);
+  await f.sync();
+  assert.equal(canRetryAgent(f.run()), false);
+  await assert.rejects(f.retry);
+  assert.equal(await f.full(), false);
+  await assert.rejects(f.merge);
+  await assert.rejects(() => f.server.orchestrator.refreshAgentBaseAndRetry(f.run().id));
+  assert.deepEqual(withdrawalActivities(f), activity);
+  assert.equal(f.calls.effects.length, effects + 1);
+  assert.deepEqual(withdrawalHistory(f), before);
+  assert.equal(await f.git.resolveRef(f.run().branch), decision.expectedHead);
+  assert.equal(await f.git.remoteBranchHead(f.root, "origin", f.run().branch), decision.expectedHead);
+  for (const [path, bytes] of archives) assert.deepEqual(await readFile(path), bytes, `withdrawal preserves ${path}`);
+}));
+
+test("public and HTTP withdrawal reject malformed or stale decision fields without acquiring terminal authority", async (t) => withFixture(t, {}, async (f) => {
+  await deliver(f);
+  const input = withdrawalInput(f), before = clone(f.run()), history = withdrawalHistory(f), effects = f.calls.effects.length;
+  const malformed = [
+    ["missing body", undefined], ["null body", null], ["array body", []], ["primitive body", "withdraw"], ["missing fields", {}],
+    ...["expectedHead", "expectedContinuationId", "reason"].flatMap((field) =>
+      [undefined, null, false, 42, {}, [input[field]], "", " \n"].map((value) => [`${field}: ${JSON.stringify(value)}`, { ...input, [field]: value }])),
+    ["oversized reason", { ...input, reason: "r".repeat(12_001) }],
+    ["oversized untrimmed reason", { ...input, reason: `${"r".repeat(12_000)} ` }],
+    ["stale head", { ...input, expectedHead: f.base }],
+    ["stale continuation", { ...input, expectedContinuationId: "earlier-continuation" }],
+    ["head whitespace is not normalized", { ...input, expectedHead: ` ${input.expectedHead}` }],
+    ["continuation whitespace is not normalized", { ...input, expectedContinuationId: `${input.expectedContinuationId} ` }],
+  ];
+  for (const [name, value] of malformed) {
+    await scenario(t, f, name, async () => {
+      await assert.rejects(() => f.server.orchestrator.withdrawAgent(before.id, value), /Withdrawal|withdrawal|exact source continuation/);
+      const response = await postWithdrawal(f, value), body = await response.json();
+      assert.equal(response.status, 400, JSON.stringify(body));
+      assert.ok(body.error);
+      assert.deepEqual(f.run(), before);
+      assert.deepEqual(await f.persistedRun(), before);
+      assert.equal(f.server.orchestrator.agentClaims.size, 0);
+      assert.equal(f.calls.effects.length, effects);
+    });
+    if (f.failed) return;
+  }
+  await assert.rejects(() => f.server.orchestrator.withdrawAgent("missing", input), /existing numbered leaf/);
+  const missing = await postWithdrawal(f, input, "missing");
+  assert.equal(missing.status, 404);
+  assert.match((await missing.json()).error, /not found/i);
+  assert.deepEqual(withdrawalHistory(f), history);
+  assert.deepEqual(withdrawalActivities(f), []);
+}));
+
+test("public withdrawal refuses unknown, unfinished, active, and composite-owned sources", async (t) => withFixture(t, {}, async (f) => {
+  await deliver(f);
+  const original = clone(f.run()), input = withdrawalInput(f), effects = f.calls.effects.length;
+  // Admission fault states derived from a genuine delivery. Only the public
+  // method is invoked; none of these rows claim a completed terminal effect.
+  const variants = [
+    ["unknown legacy owner", (run) => { delete run.leafPr; }],
+    ["unknown numbered owner", (run) => { delete run.leafPr.known; }],
+    ["wrong owned number", (run) => { run.leafPr.known.number = 43; }],
+    ["unnumbered leaf", (run) => { delete run.prNumber; }],
+    ["missing continuation", (run) => { delete run.continuation; }],
+    ["unfinished run", (run) => { run.status = "running"; }],
+    ["failed run", (run) => { run.status = "failed"; }],
+    ["unfinished continuation", (run) => { run.continuation.step = "delivery"; }],
+    ["different outcome", (run) => { run.continuation.outcome = "no_changes"; }],
+    ["different published head", (run) => { run.continuation.identity.pullRequest.head = f.base; }],
+    ["unfinished publication", (run) => { run.continuation.publication = { branch: run.branch, head: input.expectedHead, prOwnerId: "unfinished" }; }],
+    ["unfinished evaluation", (run) => { run.fullEvaluation = { step: "sampling", evaluation: clone(run.continuation.evaluation) }; }],
+    ["parent composite experiment", (run) => { run.parentCompositeId = "parent"; }],
+    ["unrelated PR intent", (run) => { run.leafPr.pending = { id: "unrelated", owner: { kind: "review-checkpoint", continuationId: run.continuation.id }, target: clone(run.leafPr.known.fields) }; }],
+    ["unexplained closed owner", (run) => { run.prState = "closed"; run.leafPr.known.fields.state = "CLOSED"; }],
+    ["unexplained CLOSED tuple under stale OPEN display", (run) => { run.leafPr.known.fields.state = "CLOSED"; }],
+    ["terminal display without proof", (run) => { run.prState = "merged"; }],
+  ];
+  for (const [name, change] of variants) {
+    await f.store.update((state) => { state.agentRuns[0] = clone(original); change(state.agentRuns[0]); });
+    await scenario(t, f, name, async () => {
+      const before = clone(f.run());
+      await assert.rejects(() => f.withdraw(input));
+      assert.deepEqual(f.run(), before);
+      assert.deepEqual(await f.persistedRun(), before);
+      assert.equal(f.calls.effects.length, effects);
+      assert.equal(f.server.orchestrator.agentClaims.size, 0);
+    });
+    if (f.failed) return;
+  }
+  await f.store.update((state) => { state.agentRuns[0] = clone(original); });
+  f.server.orchestrator.activeAgents.add(original.ideaId);
+  try { await assert.rejects(() => f.withdraw(input), /idle completed source/); }
+  finally { f.server.orchestrator.activeAgents.delete(original.ideaId); }
+  assert.deepEqual(f.run(), original);
+  const source = { agentRunId: original.id, prNumber: original.prNumber, title: "Owned source", branch: original.branch, kind: "pull_request" };
+  for (const status of ["queued", "building", "reviewing", "revising", "evaluating", "rebuilding", "open"]) {
+    await f.store.update((state) => { state.composites = [{ id: "reservation", title: "Reserved source", description: "Admission fixture", status,
+      branch: "fixture/reservation", worktree: "", sources: [source], deltas: [], reviewRounds: [], isLiving: false,
+      createdAt: original.startedAt, updatedAt: original.startedAt }]; });
+    await scenario(t, f, `composite ${status}`, async () => {
+      const composite = clone(f.store.get().composites);
+      await assert.rejects(() => f.withdraw(input), /idle completed source/);
+      assert.deepEqual(f.run(), original);
+      assert.deepEqual(f.store.get().composites, composite);
+      assert.equal(f.calls.effects.length, effects);
+    });
+    if (f.failed) return;
+  }
+  await f.store.update((state) => { state.composites[0].status = "failed"; });
+  assert.equal((await f.withdraw(input)).prState, "closed", "a failed historical composite is not a live source reservation");
+  assert.equal(f.calls.effects.length, effects + 1);
+}));
+
+test("public withdrawal preserves dirty and foreign extant checkouts, then accepts the exact clean source", async (t) => withFixture(t, {}, async (f) => {
+  await deliver(f);
+  const input = withdrawalInput(f), before = clone(f.run()), effects = f.calls.effects.length;
+  await gitCommand(f.root, "worktree", "add", "--quiet", before.worktree, before.branch);
+  const code = join(before.worktree, "code.txt"), bytes = await readFile(code);
+  await writeFile(code, "operator's uncommitted changes\n");
+  await assert.rejects(() => f.withdraw(input), /dirty|mismatching/i);
+  assert.equal(await readFile(code, "utf8"), "operator's uncommitted changes\n");
+  assert.deepEqual(f.run(), before);
+  await writeFile(code, bytes);
+  await gitCommand(before.worktree, "switch", "-c", "fixture/foreign-withdrawal", f.base);
+  await assert.rejects(() => f.withdraw(input), /worktree|branch/i);
+  assert.equal(await gitCommand(before.worktree, "branch", "--show-current"), "fixture/foreign-withdrawal");
+  await gitCommand(f.root, "branch", "-f", before.branch, f.base);
+  await assert.rejects(() => f.withdraw(input), /local leaf branch changed/);
+  assert.equal(await f.git.resolveRef(before.branch), f.base);
+  assert.deepEqual(f.run(), before);
+  assert.equal(f.calls.effects.length, effects);
+  await gitCommand(f.root, "branch", "-f", before.branch, input.expectedHead);
+  await gitCommand(before.worktree, "switch", before.branch);
+  assert.equal((await f.withdraw(input)).prState, "closed");
+  assert.deepEqual(await readFile(code), bytes);
+  assert.equal(await f.git.head(before.worktree), input.expectedHead, "withdrawal does not remove a valid extant checkout");
+}));
+
+test("public withdrawal refuses every third remote identity/content tuple and unexplained external closure", async (t) => withFixture(t, {}, async (f) => {
+  await deliver(f);
+  const input = withdrawalInput(f), before = clone(f.run()), history = withdrawalHistory(f), effects = f.calls.effects.length;
+  const variants = [
+    ["title", { title: "foreign title" }], ["body", { body: "foreign body" }], ["draft", { isDraft: false }],
+    ["external close", { state: "CLOSED" }], ["unknown lifecycle", { state: undefined }],
+    ["repository", { repository: { ...repository, id: "other" } }],
+    ["head repository", { headRepository: { ...repository, id: "other" } }],
+    ["base repository", { baseRepository: { ...repository, id: "other" } }],
+    ["number", { number: 43 }], ["URL", { url: url(43) }], ["branch", { headRefName: "fixture/other" }],
+    ["head", { headRefOid: f.base }], ["base branch", { baseRefName: "other-main" }], ["unknown base", { baseRefOid: undefined }],
+  ];
+  for (const [name, patch] of variants) {
+    f.observationPatch = patch;
+    await scenario(t, f, name, async () => {
+      await assert.rejects(() => f.withdraw(input));
+      assert.deepEqual(f.run(), before);
+      assert.deepEqual(await f.persistedRun(), before);
+      assert.equal(f.calls.effects.length, effects);
+      assert.deepEqual(withdrawalActivities(f), []);
+    });
+    if (f.failed) return;
+  }
+  f.observationPatch = { state: "CLOSED" };
+  const response = await postWithdrawal(f, input), body = await response.json();
+  assert.equal(response.status, 400, JSON.stringify(body));
+  assert.match(body.error, /third.*tuple/);
+  assert.deepEqual(withdrawalHistory(f), history);
+  f.observationPatch = undefined;
+  assert.equal((await f.withdraw(input)).prState, "closed");
+}));
+
+test("public withdrawal does not overtake real unfinished full, progress, or readiness owners", async (t) => {
+  for (const owner of ["full publication", "progress push", "merge readiness"]) await t.test(owner, async (t) => withFixture(t, {}, async (f) => {
+    if (owner === "full publication") await pendingFullPublication(f);
+    else {
+      await deliver(f);
+      if (owner === "progress push") f.interruptProgressPush = true;
+      else f.fault = { name: "ready", cut: "request-error", hit: false };
+      await assert.rejects(f.merge);
+      if (owner === "progress push") assert.equal(f.run().continuation.step, "progress");
+      else { assert.equal(f.fault.hit, true); assert.equal(f.run().leafPr.pending.owner.kind, "merge-ready"); }
+      f.fault = undefined;
+    }
+    const before = clone(f.run()), history = withdrawalHistory(f), effects = f.calls.effects.length;
+    await assert.rejects(() => f.withdraw());
+    assert.deepEqual(f.run(), before);
+    assert.deepEqual(withdrawalHistory(f), history);
+    assert.equal(f.calls.effects.length, effects);
+    assert.equal(f.run().leafPr.terminal, undefined);
+  }));
+});
+
+test("public withdrawal recovers effect and semantic acknowledgment cuts with one completed activity", async (t) => {
+  for (const cut of ["request-error", "lost-response", "before-state-ack", "lost-state-ack", "before-semantic-ack", "lost-semantic-ack"]) {
+    await t.test(cut, async (t) => withFixture(t, {}, async (f) => {
+      await deliver(f);
+      const input = withdrawalInput(f), history = withdrawalHistory(f), known = clone(f.run().leafPr.known);
+      const effects = f.calls.effects.length;
+      if (["request-error", "lost-response", "lost-state-ack"].includes(cut)) f.fault = { name: "close", cut, hit: false };
+      else f.stateCut = { hit: false, afterWrite: cut === "lost-semantic-ack", matches: (before, after) =>
+        before?.leafPr?.pending?.owner.kind === "terminal-close" && (cut === "before-state-ack"
+          ? before.leafPr.pending.effect?.kind === "close" && !after?.leafPr?.pending?.effect && after?.leafPr?.known.fields.state === "CLOSED"
+          : !before.leafPr.pending.effect && before.leafPr.known.fields.state === "CLOSED" && !after?.leafPr?.pending) };
+      const result = await attempt(() => f.withdraw(input)), fault = f.fault ?? f.stateCut;
+      assert.equal(fault.hit, true, result.error?.stack);
+      const request = f.calls.effects.at(-1);
+      assert.equal(request.pending.owner.kind, "terminal-close");
+      assert.equal(request.pending.owner.reason.kind, "withdrawn");
+      assert.deepEqual(request.pending.effect.before, known.fields);
+      assert.deepEqual(request.pending.target, { ...known.fields, state: "CLOSED" });
+      if (cut === "lost-state-ack") {
+        assert.equal(fault.ackHit, true);
+        assert.equal(fault.acknowledged.leafPr.pending.effect, undefined);
+      }
+      if (cut === "lost-semantic-ack") {
+        assert.equal(fault.acknowledged.leafPr.pending, undefined);
+        assert.equal(fault.acknowledged.prState, "closed");
+      }
+      if (["lost-state-ack", "lost-semantic-ack"].includes(cut)) {
+        assert.equal(result.value?.prState, "closed", "a recognized durable successor may complete despite a lost acknowledgment");
+        assert.equal(withdrawalActivities(f).length, 1);
+      } else {
+        assert.ok(result.error, "an unfinished request cannot claim success");
+        assert.equal(f.run().prState, "open");
+        assert.equal(f.run().leafPr.pending.id, request.pending.id);
+        assert.deepEqual(f.run().leafPr.pending.owner, request.pending.owner);
+        assert.equal(f.run().leafPr.known.fields.state, cut === "before-semantic-ack" ? "CLOSED" : "OPEN");
+        assert.deepEqual(withdrawalActivities(f), []);
+      }
+      const decision = clone(f.run().leafPr.terminal), pending = clone(f.run());
+      await assert.rejects(() => f.withdraw({ ...input, reason: "Conflicting repeat" }), /different.*reason/i);
+      assert.deepEqual(f.run(), pending);
+      f.fault = f.stateCut = undefined;
+      await f.restart();
+      if (cut === "request-error") await f.withdraw(input); else await f.sync();
+      assert.equal(f.run().prState, "closed", JSON.stringify(f.store.get().activity.slice(0, 4)));
+      assert.equal(f.run().leafPr.pending, undefined);
+      assert.deepEqual(f.run().leafPr.terminal, decision);
+      assert.deepEqual(f.run().leafPr.known.fields, request.pending.target);
+      assert.equal(withdrawalActivities(f).length, 1);
+      assert.equal(withdrawalActivities(f)[0].detail, input.reason);
+      const activity = clone(withdrawalActivities(f)), settled = clone(f.run());
+      await f.restart();
+      assert.deepEqual(await f.withdraw(input), settled);
+      await f.sync();
+      assert.deepEqual(withdrawalActivities(f), activity);
+      assert.deepEqual(withdrawalHistory(f), history);
+      assert.equal(f.calls.effects.length - effects, cut === "request-error" ? 2 : 1);
+      assert.equal(f.calls.effects.slice(effects).filter((call) => call.applied).length, 1);
+    }));
+  }
+});
+
+test("pending public withdrawal excludes new qualification, merge selection, and composite admission while still OPEN", async (t) => withFixture(t, {}, async (f) => {
+  await deliver(f);
+  assert.equal(await f.full(), true, "a positive cache exists before the withdrawal latch");
+  const original = clone(f.run());
+  // A second display-only source makes the selection/admission checks sensitive
+  // to this leaf's terminal latch, not just a minimum-size or missing-ID error.
+  await f.store.update((state) => { state.agentRuns.push({ ...clone(original), id: "other-leaf", ideaId: "other-idea", prNumber: 43,
+    prUrl: url(43), branch: "fixture/other-leaf", impact: original.impact - 1 }); state.ideas[0].lane = "foundational"; });
+  const planningFlags = [];
+  t.mock.method(f.server.orchestrator.codex, "planIdeas", async (cwd, _evaluations, _latest, _ideas, _settings, pending) => {
+    f.modelBoundary(cwd); f.calls.models.push("planIdeas"); planningFlags.push(pending); return [];
+  });
+  await f.server.orchestrator.plan();
+  assert.deepEqual(planningFlags, [true]);
+  assert.equal(selectYoloMergeCandidate(f.store.get(), f.base).id, original.id);
+  assert.deepEqual(selectYoloLeafBatch(f.store.get(), f.base, 2), [original.id, "other-leaf"]);
+  f.fault = { name: "close", cut: "request-error", hit: false };
+  const input = withdrawalInput(f);
+  await assert.rejects(() => f.withdraw(input), /request failed/);
+  assert.equal(f.fault.hit, true);
+  f.fault = undefined;
+  assert.equal(f.run().prState, "open");
+  assert.equal(f.world.pr.state, "OPEN");
+  assert.equal(f.run().leafPr.terminal.kind, "withdrawn");
+  const before = clone(f.run()), history = withdrawalHistory(f), effects = f.calls.effects.length;
+  assert.equal(await f.full(), false, "cached positive qualification cannot bypass terminal ownership");
+  assert.equal(selectYoloMergeCandidate(f.store.get(), f.base).id, "other-leaf");
+  assert.deepEqual(selectYoloLeafBatch(f.store.get(), f.base, 2), []);
+  for (const kind of ["review-limit", "superseded"]) {
+    const projected = clone(f.store.get());
+    projected.agentRuns.find((run) => run.id === original.id).leafPr.terminal = { kind, continuationId: input.expectedContinuationId };
+    assert.equal(selectYoloMergeCandidate(projected, f.base).id, "other-leaf", "selection obeys the generic terminal latch");
+    assert.deepEqual(selectYoloLeafBatch(projected, f.base, 2), []);
+  }
+  await assert.rejects(() => f.server.orchestrator.createComposite([original.id, "other-leaf"]), /nonterminal/);
+  assert.deepEqual(f.store.get().composites, []);
+  assert.equal(f.server.orchestrator.agentClaims.size, 0);
+  assert.deepEqual(f.run(), before);
+  assert.deepEqual(withdrawalHistory(f), history);
+  assert.equal(f.calls.effects.length, effects);
+  await f.server.orchestrator.plan();
+  assert.deepEqual(planningFlags, [true, false], "a pending withdrawal frees the foundational delivery slot without changing idea history");
+  // A changed after-image must keep this same immutable pending owner unresolved.
+  f.observationPatch = { body: "foreign edit while withdrawal is pending" };
+  await assert.rejects(() => f.withdraw(input), /third.*tuple/);
+  assert.deepEqual(f.run(), before);
+  assert.equal(f.calls.effects.length, effects);
+  f.observationPatch = undefined;
+  await assert.rejects(f.merge, /closed|open/i);
+  assert.equal(f.run().prState, "closed", "manual merge may settle the pending close, but cannot revive it");
+  assert.equal(f.calls.merges.length, 0);
+}));
+
+test("HTTP withdrawal reports failures, awaits actual settlement, and serializes a competing public request", async (t) => withFixture(t, {}, async (f) => {
+  await deliver(f);
+  const input = withdrawalInput(f, "r".repeat(12_000));
+  f.fault = { name: "close", cut: "request-error", hit: false };
+  const failed = await postWithdrawal(f, input), failure = await failed.json();
+  assert.equal(failed.status, 400, JSON.stringify(failure));
+  assert.match(failure.error, /request failed before effect/);
+  assert.equal(f.run().prState, "open");
+  assert.deepEqual(withdrawalActivities(f), []);
+  f.fault = undefined;
+  let entered, release;
+  const observed = new Promise((done) => { entered = done; }), paused = new Promise((done) => { release = done; });
+  f.onObserve = async () => { f.onObserve = undefined; entered(); await paused; };
+  let returned = false;
+  const responsePromise = postWithdrawal(f, input).then((response) => { returned = true; return response; });
+  try {
+    await Promise.race([observed, responsePromise.then(() => assert.fail("HTTP returned before observing the exact source"))]);
+    assert.equal(returned, false, "the route must not send a premature 202 response");
+    assert.equal(f.world.pr.state, "OPEN");
+    await assert.rejects(() => f.withdraw(input), /already reserved/);
+    assert.equal(await f.full(), false);
+  } finally { release(); }
+  const response = await responsePromise, result = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(result));
+  assert.equal(result.prState, "closed");
+  assert.equal(result.status, "completed");
+  assert.equal(result.leafPr.terminal.detail, input.reason, "the exact 12000-character boundary is accepted");
+  assert.deepEqual(result, await f.persistedRun());
+  assert.equal(f.server.orchestrator.agentClaims.size, 0);
+  const repeated = await postWithdrawal(f, input);
+  assert.equal(repeated.status, 200);
+  assert.deepEqual(await repeated.json(), result);
+  assert.equal(withdrawalActivities(f).length, 1);
+  assert.equal(f.calls.effects.filter((call) => call.name === "close" && call.applied).length, 1);
+}));
+
+test("Unicode withdrawal reasons survive direct admission, HTTP recovery, and identical retries after restart", async (t) => {
+  for (const [name, reason, expected] of [
+    ["lone high surrogate", "  Archive \ud800 before replacement.\n", "Archive \ufffd before replacement."],
+    ["lone low surrogate", "\tArchive \udfff before replacement.  ", "Archive \ufffd before replacement."],
+    ["valid pair and international text", "  Use \ud83d\udd25 replacement; retain 実測 and café.  ", "Use \ud83d\udd25 replacement; retain 実測 and café."],
+  ]) await t.test(name, async (t) => withFixture(t, {}, async (f) => {
+    await deliver(f);
+    const input = withdrawalInput(f, reason), history = withdrawalHistory(f), effects = f.calls.effects.length;
+    f.fault = { name: "close", cut: "request-error", hit: false };
+    await assert.rejects(() => f.withdraw(input), /request failed before effect/);
+    assert.equal(f.fault.hit, true, "normalization must not break ownership before the admitted close request");
+    assert.deepEqual(f.run().leafPr.terminal, { kind: "withdrawn", continuationId: input.expectedContinuationId, head: input.expectedHead, detail: expected });
+    assert.deepEqual(await f.persistedRun(), f.run(), "the in-memory owner and serialized owner agree before recovery");
+    assert.deepEqual(withdrawalActivities(f), []);
+    f.fault = undefined;
+    await f.restart();
+    const response = await postWithdrawal(f, input), result = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(result));
+    assert.equal(result.prState, "closed");
+    assert.equal(result.leafPr.terminal.detail, expected);
+    assert.deepEqual(result, await f.persistedRun());
+    assert.equal(withdrawalActivities(f).length, 1);
+    assert.equal(withdrawalActivities(f)[0].detail, expected);
+    const activity = clone(withdrawalActivities(f));
+    await f.restart();
+    assert.deepEqual(await f.withdraw(input), result, "the identical original Unicode input resumes the canonical decision");
+    assert.deepEqual(await f.withdraw({ ...input, reason: expected }), result, "the stored human-readable reason is the same decision");
+    const repeated = await postWithdrawal(f, input);
+    assert.equal(repeated.status, 200);
+    assert.deepEqual(await repeated.json(), result);
+    await f.sync();
+    assert.deepEqual(withdrawalActivities(f), activity);
+    assert.deepEqual(withdrawalHistory(f), history);
+    assert.deepEqual(f.calls.effects.slice(effects).map((call) => [call.name, call.applied]), [["close", false], ["close", true]]);
+  }));
+});
+
+test("public withdrawal reports a proved merge race but refuses squash-equivalent and detached landings", async (t) => {
+  for (const [kind, timing] of [["first-parent", "before intent"], ["first-parent", "close request"], ["squash", "close request"], ["detached-landing", "close request"]]) {
+    await t.test(`${kind}: ${timing}`, async (t) => withFixture(t, {}, async (f) => {
+      await deliver(f);
+      const input = withdrawalInput(f), known = clone(f.run().leafPr.known), saved = terminalSnapshot(f);
+      if (timing === "before intent") await landFixturePr(f, kind);
+      else f.closeRace = async () => {
+        await landFixturePr(f, kind);
+        throw new TransientMergeGateError("Fixture withdrawal raced with MERGED before its close effect");
+      };
+      const result = await attempt(() => f.withdraw(input));
+      f.closeRace = undefined;
+      assert.deepEqual(f.run().leafPr.known, known, "MERGED does not invent a CLOSED after-image");
+      assert.deepEqual(withdrawalActivities(f), []);
+      assertTerminalEvidence(f, saved);
+      const effects = f.calls.effects.length, pushes = f.calls.gitPushes.length;
+      assert.equal(effects - saved.effects, timing === "before intent" ? 0 : 1);
+      if (timing === "close request") assert.equal(f.calls.effects.at(-1).applied, false);
+      if (kind === "first-parent") {
+        assert.equal(result.value?.prState, "merged", result.error?.stack);
+        assert.equal(f.run().leafPr.pending, undefined);
+        assert.deepEqual(f.run().leafPr.merged, { sourceBase: f.base, head: input.expectedHead, landing: f.graph.landing, targetCommit: f.graph.target });
+        if (timing === "before intent") assert.equal(f.run().leafPr.terminal, undefined, "an already-won merge cannot gain invented withdrawal proof");
+        else assert.equal(f.run().leafPr.terminal.kind, "withdrawn");
+      } else {
+        assert.match(result.error?.message ?? "", /ancestry|inclusion/i);
+        assert.equal(f.run().prState, "open");
+        assert.equal(f.run().leafPr.merged, undefined);
+        assert.equal(f.run().leafPr.pending.effect.kind, "close");
+      }
+      const prior = clone(f.run());
+      await f.restart();
+      await f.sync();
+      assert.deepEqual(f.run(), prior);
+      if (kind === "first-parent") assert.equal((await f.withdraw(input)).prState, "merged");
+      else await assert.rejects(() => f.withdraw(input), /ancestry|inclusion/i);
+      assert.equal(f.calls.effects.length, effects);
+      assert.equal(f.calls.gitPushes.length, pushes, "recovery must not rewrite either actual fixture graph");
+      assert.equal(f.calls.merges.length, saved.merges);
+      assert.deepEqual(withdrawalActivities(f), []);
+      assertTerminalEvidence(f, saved);
+    }));
+  }
 });
