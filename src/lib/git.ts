@@ -6,6 +6,10 @@ import type { CompositeSource, GeneratedLeafProgress, LeafManagedPlan, LeafPrCon
 import { runCommand } from "./process.js";
 import { MANAGED_PROGRESS_FILES, progressReadmeBlock, replaceProgressReadmeBlock } from "./progress.js";
 
+// Retained evidence packs can still be transferring after ten minutes. This
+// bounds each push command, not the surrounding publication or its shutdown.
+const GIT_PUSH_TIMEOUT_MS = 30 * 60 * 1000;
+
 export type PullRequestDisposition = "merged" | "unmerged";
 
 export type PreparedLeafCommit = { inputHead: string; tree: string; parents?: string[] };
@@ -1246,7 +1250,7 @@ export class GitService {
   async push(cwd: string, remote: string, branch: string): Promise<void> {
     // Pin both refs: source-only pushes can inherit upstream destinations and forced remote mappings.
     const fullBranch = branch.startsWith("refs/heads/") ? branch : `refs/heads/${branch}`;
-    const result = await runCommand("git", ["push", "-u", remote, `${fullBranch}:${fullBranch}`], { cwd, timeoutMs: 10 * 60 * 1000 });
+    const result = await runCommand("git", ["push", "-u", remote, `${fullBranch}:${fullBranch}`], { cwd, timeoutMs: GIT_PUSH_TIMEOUT_MS });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not push branch");
   }
 
@@ -1284,7 +1288,7 @@ export class GitService {
     // during the command must never publish a different, unreceipted commit.
     const result = await runCommand("git", [
       "push", `--force-with-lease=${destination}:${savedExpectedRemoteHead ?? ""}`, remote, `${desiredHead}:${destination}`,
-    ], { cwd, timeoutMs: 10 * 60 * 1000 });
+    ], { cwd, timeoutMs: GIT_PUSH_TIMEOUT_MS });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not publish the saved leaf head");
     await this.assertWorktree(cwd, branch);
     if (await this.head(cwd) !== desiredHead || await this.remoteBranchHead(cwd, remote, branch) !== desiredHead) {
@@ -1300,13 +1304,13 @@ export class GitService {
     const result = await runCommand(
       "git",
       ["push", `--force-with-lease=${destination}:${expected}`, "-u", remote, `${destination}:${destination}`],
-      { cwd, timeoutMs: 10 * 60 * 1000 },
+      { cwd, timeoutMs: GIT_PUSH_TIMEOUT_MS },
     );
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not update composite branch");
   }
 
   async pushCheckpoint(cwd: string, remote: string, checkpointBranch: string): Promise<void> {
-    const result = await runCommand("git", ["push", "--force", remote, `HEAD:refs/heads/${checkpointBranch}`], { cwd, timeoutMs: 10 * 60 * 1000 });
+    const result = await runCommand("git", ["push", "--force", remote, `HEAD:refs/heads/${checkpointBranch}`], { cwd, timeoutMs: GIT_PUSH_TIMEOUT_MS });
     if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Could not persist the living-line checkpoint");
   }
 
