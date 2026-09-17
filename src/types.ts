@@ -356,6 +356,8 @@ export type LeafReauthorRequest = {
   source: Extract<LeafContinuation, { step: "evidence" | "review" | "done" }>;
   previousAuthorMessage?: string;
   assessment?: FullAssessmentIdentity;
+  /** Confirmed failures observed at admission, not live CI status or qualification. */
+  checkFailures?: string[];
   admittedAt: string;
   output?: { continuationId: string; head: string };
   releasedAt?: string;
