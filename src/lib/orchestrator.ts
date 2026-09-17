@@ -1,7 +1,7 @@
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import type { AgentRun, BurnerState, CompositePr, CompositeSource, Evaluation, EvaluationRun, FullAssessmentIdentity, FullEvaluationHistoryEntry, FullMergeValidation, GeneratedLeafProgress, Idea, LeafContinuation, LeafContinuationIdentity, LeafEvaluationReceipt, LeafEvidenceReference, LeafQualificationPolicy, LeafSampleSlot, LeafPublication, LegacyLeafPublication, LegacyLeafPrProofInput, LeafPrFields, LeafPrContent, LeafPrOwnership, LeafPrEffect, LeafPrSemanticOwner, LeafRepositoryIdentity, LeafTerminalReason, ReviewRound, RuntimeStatus, ScoreDelta } from "../types.js";
+import type { AgentRun, BurnerState, CompositePr, CompositeSource, Evaluation, EvaluationRun, FullAssessmentIdentity, FullEvaluationHistoryEntry, FullMergeValidation, GeneratedLeafProgress, Idea, LeafContinuation, LeafContinuationIdentity, LeafEvaluationReceipt, LeafEvidenceReference, LeafQualificationPolicy, LeafReauthorRequest, LeafSampleSlot, LeafPublication, LegacyLeafPublication, LegacyLeafPrProofInput, LeafPrFields, LeafPrContent, LeafPrOwnership, LeafPrEffect, LeafPrSemanticOwner, LeafRepositoryIdentity, LeafTerminalReason, ReviewRound, RuntimeStatus, ScoreDelta } from "../types.js";
 import { CodexClient, type CompositeIntegrationContext, type ReviewResult, type SessionResult } from "./codex.js";
 import { EventHub } from "./events.js";
 import { CommandEvidenceArchive } from "./command-evidence.js";
@@ -27,8 +27,54 @@ type ResourceLease = { locks: HeldLock[]; release: () => Promise<void> };
 type AgentClaim = { token: symbol; runIds: readonly string[]; release: () => void };
 type LeafEvaluationExecution = { run: AgentRun; receiptId: string; claim: AgentClaim; side: "candidate" | "baseline"; index: number };
 export type LeafAdmissionOptions = { legacyPrProof?: LegacyLeafPrProofInput; retainWorktree?: true };
-export type AgentRetryOptions = LeafAdmissionOptions & { repairNotes?: string };
+export type AgentRetryOptions = LeafAdmissionOptions & {
+  repairNotes?: string;
+  continueReauthor?: { requestId: string; continuationId: string; head: string };
+};
+export type AgentReauthorInput = {
+  requestId: string;
+  expectedContinuationId: string;
+  expectedHead: string;
+  expectedPublishedHead: string;
+  guidance: string;
+};
 export type AgentWithdrawalInput = { expectedHead: string; expectedContinuationId: string; reason: string };
+
+function heldReauthorRequest(run: AgentRun | undefined): LeafReauthorRequest | undefined {
+  const request = run?.reauthorRequests?.at(-1);
+  return request && !request.releasedAt ? request : undefined;
+}
+
+function atReauthorOutput(run: AgentRun | undefined): boolean {
+  const output = run?.reauthorRequests?.at(-1)?.output;
+  return Boolean(output && run?.continuation?.step === "evidence" &&
+    run.continuation.id === output.continuationId && run.continuation.head === output.head);
+}
+
+const exactRequestString = (value: unknown): value is string => typeof value === "string" && Boolean(value.trim()) &&
+  value === value.trim() && value.length <= 200 && wellFormedText(value) === value;
+
+export function validateAgentReauthorInput(input: AgentReauthorInput): void {
+  if (!input || typeof input !== "object" || Array.isArray(input) ||
+    !exactRequestString(input.requestId) || !exactRequestString(input.expectedContinuationId) ||
+    !exactRequestString(input.expectedHead) || !exactRequestString(input.expectedPublishedHead) ||
+    typeof input.guidance !== "string" || !input.guidance.trim() || input.guidance.length > 12_000) {
+    throw new Error("Re-authoring requires exact requestId, expectedContinuationId, expectedHead and expectedPublishedHead strings, and nonempty guidance of at most 12000 characters.");
+  }
+}
+
+export function validateContinueReauthorInput(release: NonNullable<AgentRetryOptions["continueReauthor"]>): void {
+  if (!release || typeof release !== "object" || Array.isArray(release) ||
+    !exactRequestString(release.requestId) || !exactRequestString(release.continuationId) || !exactRequestString(release.head)) {
+    throw new Error("continueReauthor requires exact requestId, continuationId and head strings.");
+  }
+}
+
+function sameReauthorInput(request: LeafReauthorRequest, input: AgentReauthorInput): boolean {
+  return request.id === input.requestId && request.guidance === input.guidance &&
+    request.source.id === input.expectedContinuationId && request.source.head === input.expectedHead &&
+    request.source.identity.pullRequest?.head === input.expectedPublishedHead;
+}
 
 function withdrawalReason(input: AgentWithdrawalInput): Extract<LeafTerminalReason, { kind: "withdrawn" }> {
   if (!input || typeof input !== "object" || Array.isArray(input) ||
@@ -131,6 +177,18 @@ export function validateLeafAdmissionOptions(run: AgentRun | undefined, options:
 
 export function validateAgentRetryOptions(run: AgentRun, options: AgentRetryOptions): void {
   validateLeafAdmissionOptions(run, options);
+  if (options.continueReauthor !== undefined) {
+    const release = options.continueReauthor;
+    validateContinueReauthorInput(release);
+    if (options.repairNotes !== undefined) throw new Error("continueReauthor cannot be combined with repairNotes.");
+    if (options.legacyPrProof !== undefined || options.retainWorktree !== undefined) {
+      throw new Error("continueReauthor cannot be combined with other leaf admission options; establish ownership or retention separately.");
+    }
+    const request = run.reauthorRequests?.at(-1);
+    if (!request?.output || request.id !== release.requestId || request.output.continuationId !== release.continuationId || request.output.head !== release.head) {
+      throw new Error("continueReauthor must identify the latest re-author request's exact committed output.");
+    }
+  }
   if (options.repairNotes === undefined) return;
   if (typeof options.repairNotes !== "string" || !options.repairNotes.trim() || options.repairNotes.length > 12_000) {
     throw new Error("repairNotes must be a nonempty string of at most 12000 characters.");
@@ -1815,6 +1873,7 @@ export class Orchestrator {
     let state = this.store.get();
     let run = state.agentRuns.find((item) => item.id === runId)!;
     validateLeafAdmissionOptions(run, options);
+    if (heldReauthorRequest(run)) return false;
     if (!run?.prNumber || run.prState !== "open" || run.leafPr?.terminal || !run.baseRef || run.baseCommit !== baseCommit) return false;
     const admission = await this.admitLeafOptions(run, claim, options);
     run = admission.run;
@@ -1979,7 +2038,7 @@ export class Orchestrator {
     const idea = state.ideas.find((item) => item.id === run.ideaId);
     run = await this.ensureLeafPrOwnership(run, claim);
     run = await this.beginLeafPrIntent(run, claim, { kind: "full-publication", assessment: receipt.identity }, {
-      title: idea?.title ?? run.branch, body: leafPrBody(buildPrBody(idea?.description ?? "", run.lastMessage ?? "", deltas, impact, run.reviewRounds), run.leafPr!),
+      title: idea?.title ?? run.branch, body: leafPrBody(buildPrBody(this.leafTaskScope(run, idea?.description ?? ""), run.lastMessage ?? "", deltas, impact, run.reviewRounds), run.leafPr!),
       isDraft: true, state: "OPEN",
     });
     scope.run = run;
@@ -2157,6 +2216,7 @@ export class Orchestrator {
   }
 
   private async beginLeafPrIntent(run: AgentRun, claim: AgentClaim, semantic: LeafPrSemanticOwner, target: LeafPrFields): Promise<AgentRun> {
+    if (heldReauthorRequest(run)) throw new Error("A held author-only request cannot admit PR effects.");
     run = await this.ensureLeafPrOwnership(run, claim);
     const owner = run.leafPr!;
     if (owner.pending) {
@@ -2190,6 +2250,7 @@ export class Orchestrator {
 
   private async assertLeafPrSemantic(run: AgentRun, claim: AgentClaim): Promise<void> {
     this.assertLeafOwnerSnapshot(run, claim);
+    if (heldReauthorRequest(run)) throw new Error("A held author-only request cannot execute PR effects.");
     const pending = run.leafPr?.pending;
     if (!pending) throw new Error("No leaf PR intent is pending.");
     const semantic = pending.owner;
@@ -2817,8 +2878,12 @@ export class Orchestrator {
 
   async retryAgent(runId: string, options: AgentRetryOptions = {}): Promise<AgentRun> {
     const state = this.store.get();
-    if (this.activeAgents.size + this.activeComposites.size >= state.settings.parallelism) throw new Error("All configured agent slots are currently in use.");
     let run = state.agentRuns.find((item) => item.id === runId);
+    if (run && options.continueReauthor !== undefined) {
+      validateAgentRetryOptions(run, options);
+      if (run.reauthorRequests?.at(-1)?.releasedAt && (run.continuation?.step === "done" || !canRetryAgent(run))) return run;
+    }
+    if (this.activeAgents.size + this.activeComposites.size >= state.settings.parallelism) throw new Error("All configured agent slots are currently in use.");
     if (!run || !canRetryAgent(run)) throw new Error("Only a failed run or an approved full-evaluation-rejected leaf can be retried.");
     if (this.activeAgents.has(run.ideaId)) throw new Error("The agent slot for this idea is already reserved.");
     validateAgentRetryOptions(run, options);
@@ -2827,6 +2892,69 @@ export class Orchestrator {
     const claim = this.claimAgents([runId]);
     this.activeAgents.add(run.ideaId);
     return this.retryAgentWithClaim(runId, options, claim);
+  }
+
+  async reauthorAgent(runId: string, rawInput: AgentReauthorInput): Promise<AgentRun> {
+    validateAgentReauthorInput(rawInput);
+    const input = { ...rawInput, guidance: wellFormedText(rawInput.guidance.trim()) };
+    const state = this.store.get();
+    const run = state.agentRuns.find((item) => item.id === runId);
+    if (!run) throw new Error("Agent run not found.");
+    const previous = run.reauthorRequests?.find((request) => request.id === input.requestId);
+    if (previous && !sameReauthorInput(previous, input)) throw new Error("The re-author request ID already identifies different source or guidance.");
+    // A lost return, including one from a superseded request, is not authority
+    // to drive today's cursor. Its immutable output is the acknowledgement.
+    if (previous?.output) return run;
+    this.assertReauthorSource(run, input);
+    if (this.activeAgents.size + this.activeComposites.size >= state.settings.parallelism) throw new Error("All configured agent slots are currently in use.");
+    if (this.activeAgents.has(run.ideaId)) throw new Error("The agent slot for this idea is already reserved.");
+    if (reservedCompositeSourceIds(state).has(runId)) throw new Error("The candidate is reserved by a composite.");
+    const claim = this.claimAgents([runId]);
+    this.activeAgents.add(run.ideaId);
+    return this.retryAgentWithClaim(runId, {}, claim, undefined, input);
+  }
+
+  private assertReauthorSource(run: AgentRun, input?: AgentReauthorInput): void {
+    const cursor = run.continuation;
+    const held = heldReauthorRequest(run);
+    if (!cursor || !run.authorThreadId || run.parentCompositeId || !run.leafPr?.known ||
+      run.prNumber !== run.leafPr.known.number || !cursor.identity.pullRequest ||
+      run.leafPr.terminal || run.leafPr.known.fields.state !== "OPEN" || run.prState !== "open" ||
+      run.fullEvaluation || cursor.publication || run.leafPr.pending) {
+      throw new Error("Re-authoring requires an unfinished standalone leaf with established OPEN PR ownership and no pending publication, full evaluation or terminal work.");
+    }
+    if (!input) {
+      if (!held) throw new Error("The leaf has no held re-author request.");
+      if (JSON.stringify(cursor.identity) !== JSON.stringify(held.source.identity)) throw new Error("The held re-author request's recorded source identity changed.");
+      const ownsAuthor = !held.output && cursor.step === "author" && cursor.head === held.source.head && cursor.reason.kind === "operator" && cursor.reason.requestId === held.id;
+      const ownsCommit = !held.output && cursor.step === "commit" && cursor.head === held.source.head && cursor.source.kind === "author" && cursor.source.reason.kind === "operator" && cursor.source.reason.requestId === held.id;
+      const ownsOutput = atReauthorOutput(run);
+      if (!ownsAuthor && !ownsCommit && !ownsOutput) throw new Error("The held re-author request does not own this continuation.");
+      return;
+    }
+    const previous = run.reauthorRequests?.find((request) => request.id === input.requestId);
+    if (previous) {
+      if (!sameReauthorInput(previous, input) || held?.id !== previous.id) throw new Error("The re-author request no longer owns this continuation.");
+      this.assertReauthorSource(run);
+      return;
+    }
+    if (run.status !== "failed" || (cursor.step !== "evidence" && cursor.step !== "review") ||
+      (held && !held.output) || cursor.id !== input.expectedContinuationId || cursor.head !== input.expectedHead ||
+      cursor.identity.pullRequest.head !== input.expectedPublishedHead) {
+      throw new Error("New re-authoring requires the exact idle failed committed evidence/review checkpoint and recorded published head.");
+    }
+  }
+
+  private leafTaskScope(run: AgentRun, original: string): string {
+    const request = run.reauthorRequests?.at(-1);
+    if (!request) return original;
+    return [
+      "Current operator requirements supersede earlier procedural task scope. They are instructions, not evidence or approval; all existing evaluator, numerical, supported-behavior and full-diff review contracts still apply.",
+      `Request ${request.id}, admitted from ${request.source.head} against pinned base ${request.source.identity.baseCommit}. ${request.releasedAt
+        ? `Its author-only boundary was explicitly released at output ${request.output!.head}; the current evidence/review workflow is authorized.`
+        : "Only authoring and its commit are admitted; stop at the committed author output."}`,
+      request.guidance,
+    ].join("\n\n");
   }
 
   private leafReviewLimit(run: AgentRun, settings: BurnerState["settings"]): number {
@@ -3168,20 +3296,49 @@ export class Orchestrator {
     return remote;
   }
 
-  private async transitionLeaf(run: AgentRun, claim: AgentClaim, successor: LeafContinuation, patch: Partial<AgentRun> = {}): Promise<AgentRun> {
+  private async transitionLeaf(run: AgentRun, claim: AgentClaim, successor: LeafContinuation, patch: Partial<AgentRun> = {}, ideaStatus?: Idea["status"]): Promise<AgentRun> {
     let saved: AgentRun | undefined;
     await this.persistLeafUpdate((state) => {
       const current = this.assertLeafSnapshot(run, state, claim);
       Object.assign(current, patch, { continuation: successor });
+      if (ideaStatus) {
+        const idea = state.ideas.find((item) => item.id === run.ideaId);
+        if (idea) Object.assign(idea, { status: ideaStatus, updatedAt: now() });
+      }
       saved = structuredClone(current);
-    }, (state) => Boolean(saved && leafIdentity(state.agentRuns.find((item) => item.id === run.id)) === leafIdentity(saved)));
+    }, (state) => Boolean(saved && leafIdentity(state.agentRuns.find((item) => item.id === run.id)) === leafIdentity(saved) &&
+      (!ideaStatus || state.ideas.find((item) => item.id === run.ideaId)?.status === ideaStatus)));
     return saved!;
   }
 
-  private async admitLeafContinuation(run: AgentRun, worktree: string, options: AgentRetryOptions, claim: AgentClaim): Promise<{
-    continuation: LeafContinuation; full?: FullMergeValidation; history?: FullEvaluationHistoryEntry[];
+  private async admitLeafContinuation(run: AgentRun, worktree: string, options: AgentRetryOptions, claim: AgentClaim, reauthorInput?: AgentReauthorInput): Promise<{
+    continuation: LeafContinuation; full?: FullMergeValidation; history?: FullEvaluationHistoryEntry[]; reauthorRequest?: LeafReauthorRequest;
   }> {
     const state = this.store.get();
+    if (reauthorInput) {
+      this.assertReauthorSource(run, reauthorInput);
+      if (run.reauthorRequests?.some((request) => request.id === reauthorInput.requestId)) return { continuation: run.continuation! };
+      this.assertReviewHeadroom(run, state);
+      if (worktree !== run.worktree) throw new Error("New re-authoring requires its existing exact worktree.");
+      await this.assertLeafCheckpoint(run, claim);
+      await this.assertLeafRemote(run, claim);
+      await this.assertLeafCheckpoint(run, claim);
+      const source = run.continuation;
+      if (source?.step !== "evidence" && source?.step !== "review") throw new Error("Re-author source is not a committed checkpoint.");
+      const full = latestFullAssessment(run);
+      let assessment: FullAssessmentIdentity | undefined;
+      if (full?.qualified === false && full.baseCommit === source.identity.baseCommit && full.evaluationFingerprint === source.identity.evaluationFingerprint) {
+        if (!this.completeFullFeedback(full, state)) throw new Error("The re-author source has incomplete historical negative feedback.");
+        if (full.evaluation) verifyCurrentLeafReceipt(state, this.assertFullAssessmentReceipt(run, full, state));
+        assessment = { baseCommit: full.baseCommit, candidateCommit: full.candidateCommit, evaluationFingerprint: full.evaluationFingerprint };
+      }
+      return {
+        continuation: { id: id("leaf"), identity: source.identity, head: source.head, step: "author", reason: { kind: "operator", requestId: reauthorInput.requestId } },
+        reauthorRequest: { id: reauthorInput.requestId, guidance: reauthorInput.guidance, source: structuredClone(source),
+          ...(run.lastMessage !== undefined ? { previousAuthorMessage: run.lastMessage } : {}),
+          ...(assessment ? { assessment } : {}), admittedAt: now() },
+      };
+    }
     if (run.continuation && run.continuation.step !== "done") {
       if (options.repairNotes !== undefined) throw new Error("repairNotes cannot replace an admitted continuation.");
       this.assertLeafSnapshot(run, state, claim);
@@ -3272,28 +3429,63 @@ export class Orchestrator {
     return { continuation, ...(full ? { full } : {}), ...(history.length ? { history } : {}) };
   }
 
+  private async releaseReauthor(run: AgentRun, claim: AgentClaim, release: NonNullable<AgentRetryOptions["continueReauthor"]>): Promise<AgentRun> {
+    validateAgentRetryOptions(run, { continueReauthor: release });
+    const request = run.reauthorRequests!.at(-1)!;
+    if (request.releasedAt) return run;
+    this.assertReauthorSource(run);
+    const output = request.output;
+    if (!output || !atReauthorOutput(run)) {
+      throw new Error("Release requires the exact held evidence checkpoint.");
+    }
+    // Release authorizes a saved output, not a new-base experiment. A moved
+    // named base must not strand it behind a refresh that the hold forbids.
+    await this.assertLeafCheckpoint(run, claim, false, output.head, true);
+    await this.assertLeafRemote(run, claim);
+    await this.assertLeafCheckpoint(run, claim, false, output.head, true);
+    return this.updateLeafOwner(run, claim, (current) => { current.reauthorRequests!.at(-1)!.releasedAt = now(); });
+  }
+
   // Only the base-refresh owner may hand this continuation an existing claim
   // and lease. A public caller cannot use an arbitrary lease to bypass claims.
-  private async retryAgentWithClaim(runId: string, options: AgentRetryOptions, claim: AgentClaim, heldLease?: ResourceLease): Promise<AgentRun> {
+  private async retryAgentWithClaim(runId: string, options: AgentRetryOptions, claim: AgentClaim, heldLease?: ResourceLease, reauthorInput?: AgentReauthorInput): Promise<AgentRun> {
     let lease = heldLease;
     let started = false;
     let state = this.store.get();
     let run = state.agentRuns.find((item) => item.id === runId)!;
     const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
     let worktree = run?.worktree ?? "";
+    const bounded = () => Boolean(reauthorInput || heldReauthorRequest(this.store.get().agentRuns.find((item) => item.id === runId)));
     try {
       this.assertAgentClaim(claim, runId);
       if (!run || !canRetryAgent(run) || !idea) throw new Error("Only a failed run or an approved full-evaluation-rejected leaf can be retried.");
       validateAgentRetryOptions(run, options);
+      if (bounded()) this.assertReauthorSource(run, reauthorInput);
+      if (options.continueReauthor) {
+        lease ??= await this.locks.tryAcquireAll(run.resources, `${run.id}-release-reauthor`);
+        if (!lease) throw new Error("A required resource is currently locked.");
+        run = await this.releaseReauthor(run, claim, options.continueReauthor);
+        if (await this.git.resolveRef(run.baseRef!) !== run.baseCommit || await this.git.resolveRef(state.settings.baseBranch) !== run.baseCommit) {
+          return await this.updateLeafOwner(run, claim, (current) => {
+            current.status = "failed";
+            current.error = "Re-author output released; explicit base refresh is required before continuation.";
+          });
+        }
+      }
       const optionsAdmission = await this.admitLeafOptions(run, claim, options);
       run = optionsAdmission.run;
-      if (run.leafPr?.known && (await this.observeOwnedLeafPr(run, claim, { merged: true }))?.state === "MERGED") {
-        return await this.settleLeafPr(run, claim, false);
+      if (!bounded()) {
+        if (run.leafPr?.known && (await this.observeOwnedLeafPr(run, claim, { merged: true }))?.state === "MERGED") {
+          return await this.settleLeafPr(run, claim, false);
+        }
+        run = await this.finishFullPublication(run, claim);
+        const hadDeliveryPublication = run.continuation?.step === "delivery" && Boolean(run.continuation.publication);
+        run = await this.finishLeafCheckpointPublication(run, claim);
+        if (hadDeliveryPublication && run.continuation?.step === "done") return run;
+      } else {
+        await this.assertLeafRemote(run, claim);
+        await this.git.assertWorktree(run.worktree, run.branch);
       }
-      run = await this.finishFullPublication(run, claim);
-      const hadDeliveryPublication = run.continuation?.step === "delivery" && Boolean(run.continuation.publication);
-      run = await this.finishLeafCheckpointPublication(run, claim);
-      if (hadDeliveryPublication && run.continuation?.step === "done") return run;
       state = this.store.get();
       if (!canRetryAgent(run)) return run;
       if (run.fullEvaluation?.step === "sampling") throw new Error("An unfinished full evaluation must resume through full qualification before candidate repair.");
@@ -3304,8 +3496,9 @@ export class Orchestrator {
       }
       const initialIdentity = agentIdentity(run);
       const fingerprint = fullMergeValidationFingerprint(state);
+      const pinnedCompletion = Boolean(heldReauthorRequest(run) && (!reauthorInput || run.reauthorRequests!.at(-1)!.id === reauthorInput.requestId));
       if (!run.baseRef || !run.baseCommit) throw new Error("This run failed before it produced a resumable candidate.");
-      if (run.continuation?.step !== "progress" && (await this.git.resolveRef(run.baseRef) !== run.baseCommit ||
+      if (!pinnedCompletion && run.continuation?.step !== "progress" && (await this.git.resolveRef(run.baseRef) !== run.baseCommit ||
         (!run.parentCompositeId && await this.git.resolveRef(state.settings.baseBranch) !== run.baseCommit))) {
         throw new Error("The candidate base has moved; refresh it explicitly before retrying.");
       }
@@ -3318,7 +3511,13 @@ export class Orchestrator {
         if (worktree !== run.worktree) run = await this.transitionLeaf(run, claim, run.continuation, { worktree });
         return await this.continueLeafProgress(run, claim);
       }
-      const admission = await this.admitLeafContinuation(run, worktree, options, claim);
+      if (pinnedCompletion && heldReauthorRequest(run)?.output) {
+        await this.assertLeafCheckpoint(run, claim, false, run.continuation!.head, true);
+        await this.assertLeafRemote(run, claim);
+        await this.assertLeafCheckpoint(run, claim, false, run.continuation!.head, true);
+        return run;
+      }
+      const admission = await this.admitLeafContinuation(run, worktree, options, claim, reauthorInput);
       const cursor = admission.continuation;
       const resumeDelivery = cursor.step === "delivery";
       const baseline = run.parentCompositeId
@@ -3327,11 +3526,11 @@ export class Orchestrator {
       const completedEvaluation = resumeDelivery && (cursor.evaluation || sameAssessment(admission.full ?? latestFullAssessment(run), {
         baseCommit: run.baseCommit, candidateCommit: cursor.head, evaluationFingerprint: fingerprint,
       }));
-      const missingBaseline = !completedEvaluation && state.evaluations.find((evaluation) => evaluation.enabled && baseline.get(evaluation.id)?.commit !== run.baseCommit);
+      const missingBaseline = !pinnedCompletion && !completedEvaluation && state.evaluations.find((evaluation) => evaluation.enabled && baseline.get(evaluation.id)?.commit !== run.baseCommit);
       if (missingBaseline) throw new Error(`Refresh '${missingBaseline.name}' at the candidate base before retrying.`);
       await this.git.assertWorktree(worktree, run.branch);
-      if (await this.git.resolveRef(run.baseRef) !== run.baseCommit ||
-        (!run.parentCompositeId && await this.git.resolveRef(state.settings.baseBranch) !== run.baseCommit)) throw new Error("The candidate base moved while preparing retry.");
+      if (!pinnedCompletion && (await this.git.resolveRef(run.baseRef) !== run.baseCommit ||
+        (!run.parentCompositeId && await this.git.resolveRef(state.settings.baseBranch) !== run.baseCommit))) throw new Error("The candidate base moved while preparing retry.");
       this.assertAgentClaim(claim, runId);
       if (agentIdentity(this.store.get().agentRuns.find((item) => item.id === runId)) !== initialIdentity ||
         fullMergeValidationFingerprint(this.store.get()) !== fingerprint) throw new Error("The candidate or evaluation identity changed while preparing retry.");
@@ -3352,8 +3551,8 @@ export class Orchestrator {
           throw new Error("The candidate remote PR identity changed during retry preparation.");
         }
       }
-      if (await this.git.resolveRef(run.baseRef) !== run.baseCommit ||
-        (!run.parentCompositeId && await this.git.resolveRef(state.settings.baseBranch) !== run.baseCommit) ||
+      if ((!pinnedCompletion && (await this.git.resolveRef(run.baseRef) !== run.baseCommit ||
+        (!run.parentCompositeId && await this.git.resolveRef(state.settings.baseBranch) !== run.baseCommit))) ||
         await this.git.head(worktree) !== head || await this.git.resolveRef(run.branch) !== head) {
         throw new Error("The candidate base or head changed during retry preparation.");
       }
@@ -3364,7 +3563,8 @@ export class Orchestrator {
           throw new Error("The candidate or evaluation identity changed before retry admission.");
         }
         this.assertAgentClaim(claim, runId);
-        if (cursor.step !== "delivery" && cursor.step !== "commit") this.assertReviewHeadroom(currentRun, draft);
+        if (reservedCompositeSourceIds(draft).has(runId)) throw new Error("The candidate became reserved by a composite before retry admission.");
+        if (!pinnedCompletion && cursor.step !== "delivery" && cursor.step !== "commit") this.assertReviewHeadroom(currentRun, draft);
         Object.assign(currentRun, {
           worktree,
           continuation: cursor,
@@ -3373,6 +3573,7 @@ export class Orchestrator {
           ...(cursor.identity.pullRequest ? { prNumber: cursor.identity.pullRequest.number, prUrl: cursor.identity.pullRequest.url ?? run.prUrl } : {}),
           ...(!resumeDelivery ? { reviewApproved: false } : {}),
         });
+        if (admission.reauthorRequest) (currentRun.reauthorRequests ??= []).push(admission.reauthorRequest);
         this.adoptFullHistory(currentRun, admission.history ?? []);
         admitted = structuredClone(currentRun);
         const currentIdea = draft.ideas.find((item) => item.id === idea.id);
@@ -3385,7 +3586,7 @@ export class Orchestrator {
       await this.continueLeaf(idea, base, run.id, claim, lease);
     } catch (error) {
       if (!started || !run || !idea) {
-        if (run?.leafPr?.known && (error instanceof LeafReviewLimitError || error instanceof PortfolioReviewLimitError)) {
+        if (!bounded() && run?.leafPr?.known && (error instanceof LeafReviewLimitError || error instanceof PortfolioReviewLimitError)) {
           // A refusal to start new review work still owns terminal cleanup.
           // Other admission errors (foreign source, tuple, or evidence) never
           // acquire this authority, and settlement rechecks the exact reason.
@@ -3400,9 +3601,9 @@ export class Orchestrator {
       if (this.store.get().agentRuns.find((item) => item.id === runId)?.continuation?.step === "done") return this.store.get().agentRuns.find((item) => item.id === runId)!;
       const message = errorMessage(error);
       const failedRun = this.store.get().agentRuns.find((item) => item.id === runId)!;
-      const reviewLimited = error instanceof PortfolioReviewLimitError || (!failedRun.reviewApproved &&
-        failedRun.continuation?.step !== "delivery" && failedRun.reviewRounds.length >= this.leafReviewLimit(failedRun, this.store.get().settings));
-      const cadenceYield = error instanceof PortfolioCadenceYieldError ? error : undefined;
+      const reviewLimited = !bounded() && (error instanceof PortfolioReviewLimitError || (!failedRun.reviewApproved &&
+        failedRun.continuation?.step !== "delivery" && failedRun.reviewRounds.length >= this.leafReviewLimit(failedRun, this.store.get().settings)));
+      const cadenceYield = !bounded() && error instanceof PortfolioCadenceYieldError ? error : undefined;
       const quarantined = reviewLimited || Boolean(cadenceYield);
       const completedAt = now();
       await this.updateAgent(run.id, {
@@ -3429,7 +3630,7 @@ export class Orchestrator {
         if (run) this.activeAgents.delete(run.ideaId);
         this.runtimeCache = undefined;
         this.events.emit("state", this.store.get());
-        if (started && this.store.get().orchestrator.enabled) {
+        if (started && !bounded() && this.store.get().orchestrator.enabled) {
           if (this.yolo) void this.tick(false);
           else void this.scheduleComposites(true);
         }
@@ -4091,7 +4292,7 @@ export class Orchestrator {
         const idea = live.ideas.find((item) => item.id === current.ideaId);
         current = await this.beginLeafPrIntent(current, claim, { kind: "weight-presentation", fingerprint: fullMergeValidationFingerprint(live) }, {
           ...current.leafPr.known.fields, title: idea?.title ?? current.branch,
-          body: leafPrBody(buildPrBody(idea?.description ?? "", current.lastMessage ?? "", current.deltas, impact, current.reviewRounds), current.leafPr),
+          body: leafPrBody(buildPrBody(this.leafTaskScope(current, idea?.description ?? ""), current.lastMessage ?? "", current.deltas, impact, current.reviewRounds), current.leafPr),
         });
         current = await this.finishLeafPrIntent(current, claim);
         await this.acknowledgeLeafPrIntent(current, claim, current.leafPr!.pending!.id, (item) => { item.impact = impact; });
@@ -4279,6 +4480,7 @@ export class Orchestrator {
   private async settleLeafPr(initial: AgentRun, claim: AgentClaim, nominateInclusion: boolean): Promise<AgentRun> {
     let run = initial;
     this.assertLeafOwnerSnapshot(run, claim);
+    if (heldReauthorRequest(run)) return run;
     if (!run.leafPr?.known || this.leafPrReconciliationSettled(run)) return run;
     const head = await this.leafTerminalHead(run, claim);
     let observed = (await this.observeOwnedLeafPr(run, claim, { heads: [head], merged: true }))!;
@@ -4769,6 +4971,7 @@ export class Orchestrator {
   async refreshAgentBaseAndRetry(runId: string, options: LeafAdmissionOptions = {}): Promise<AgentRun> {
     const state = this.store.get();
     let run = state.agentRuns.find((item) => item.id === runId)!;
+    if (heldReauthorRequest(run)) throw new Error("Release the exact author-only output before explicit base refresh.");
     validateLeafAdmissionOptions(run, options);
     const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
     if (!run || !idea || !["completed", "failed", "rejected"].includes(run.status)) {
@@ -4972,7 +5175,8 @@ export class Orchestrator {
         await this.git.assertLeafMergeInProgress(run.worktree, run.branch, cursor.head, cursor.targetCommit);
         const result = await this.codex.revise(run.worktree, run.authorThreadId!, { approved: false,
           summary: `Refresh this same pull request onto ${cursor.targetRef} at ${cursor.targetCommit}.`, findings: [{ severity: "high", title: "Resolve latest-base merge conflicts",
-            detail: `Preserve the intended change and resolve the pinned merge against ${cursor.targetCommit}; do not commit or push.`, file: "" }] }, this.store.get().settings);
+            detail: `Preserve the intended change and resolve the pinned merge against ${cursor.targetCommit}; do not commit or push.`, file: "" }] }, this.store.get().settings, "review",
+          run.reauthorRequests?.length ? this.leafTaskScope(run, "") : undefined);
         const parents = [cursor.head, cursor.targetCommit];
         const prepared = await this.git.prepareLeafCommit(run.worktree, run.branch, cursor.head, parents);
         run = await this.transitionLeaf(run, claim, { ...common, phase: "commit", tree: prepared.tree, parents, result });
@@ -5056,6 +5260,7 @@ export class Orchestrator {
         Boolean(run.authorThreadId && run.baseRef && run.baseCommit) &&
         (!run.parentCompositeId || parent?.status === "open" || parent?.status === "merged");
       return run.status === "failed" &&
+        !heldReauthorRequest(run) &&
         !reserved.has(run.id) &&
         (publishedRefresh || unpublishedRefresh || run.continuation?.step === "refresh") &&
         (finalReviewApproved(run.reviewApproved, run.reviewRounds) || Boolean(run.continuation && run.continuation.step !== "done")) &&
@@ -5183,7 +5388,7 @@ export class Orchestrator {
     const dispositionUpdates: Array<{ number: number; disposition: "merged" | "unmerged" }> = [];
     let baseChanged = Boolean(state.orchestrator.baseSyncPending);
     let syncedBaseCommit: string | undefined;
-    for (const observedRun of state.agentRuns.filter((run) => run.leafPr && !this.leafPrReconciliationSettled(run))) {
+    for (const observedRun of state.agentRuns.filter((run) => run.leafPr && !heldReauthorRequest(run) && !this.leafPrReconciliationSettled(run))) {
       const claim = claimObservedAgent(observedRun.id);
       if (!claim) continue;
       try {
@@ -5344,6 +5549,7 @@ export class Orchestrator {
       const reserved = reservedCompositeSourceIds(current);
       const staleLeaves = current.agentRuns.filter((run) =>
         run.prState === "open" &&
+        !heldReauthorRequest(run) && !atReauthorOutput(run) &&
         run.prNumber !== undefined &&
         run.leafPr?.known !== undefined &&
         !run.leafPr.pending &&
@@ -5761,7 +5967,7 @@ export class Orchestrator {
     const body = [
       "## Burner review checkpoint",
       "",
-      idea.description,
+      this.leafTaskScope(run, idea.description),
       "",
       `This checkpoint preserves substantial agent work after ${run.reviewRounds.length} review rounds. It is **not approved, fully evaluated, or eligible for YOLO merge**. Burner retained the author session and final findings. Only a tracked OPEN checkpoint with remaining review capacity can resume; an exhausted checkpoint is closed after exact verification and is not retryable.`,
       "",
@@ -6035,7 +6241,7 @@ export class Orchestrator {
       if (!cursor.publication) {
         run = await this.ensureLeafPrOwnership(run, claim);
         run = await this.beginLeafPrIntent(run, claim, { kind: "delivery", continuationId: cursor.id }, {
-          title: idea.title, body: leafPrBody(buildPrBody(idea.description, run.lastMessage ?? "", deltas, impact, run.reviewRounds), run.leafPr!),
+          title: idea.title, body: leafPrBody(buildPrBody(this.leafTaskScope(run, idea.description), run.lastMessage ?? "", deltas, impact, run.reviewRounds), run.leafPr!),
           isDraft: true, state: "OPEN",
         });
         const previousRemoteHead = cursor.identity.pullRequest?.head ?? await this.git.remoteBranchHead(worktree, settings.remote, branch);
@@ -6220,7 +6426,7 @@ export class Orchestrator {
           const merge = await this.git.mergeBranch(worktree, sourceRef);
           if (merge.conflict) {
             const resolver = await this.codex.integrateComposite(worktree, composite.title, [source.title], settings, {
-              phase: "resolve-conflicts", description: composite.description,
+              phase: "resolve-conflicts", description: this.compositeTaskScope(composite, this.store.get()),
               sourceRegressions: compositeSourceRegressions(this.store.get(), [source], baseCommit),
             });
             if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: resolve composite conflict for ${source.prNumber ? `#${source.prNumber}` : source.title}`);
@@ -6244,7 +6450,7 @@ export class Orchestrator {
       await this.publishCompositeDraft(worktree, compositeId, "integrating the combined source branches", settings);
       const integrationStartCommit = await this.git.head(worktree);
       const author = await this.codex.integrateComposite(worktree, composite.title, composite.sources.map((source) => source.title), settings, {
-        description: composite.description,
+        description: this.compositeTaskScope(composite, this.store.get()),
         sourceRegressions: compositeSourceRegressions(this.store.get(), composite.sources, baseCommit),
       });
       await this.assertCandidateDoesNotOwnProgress(worktree, integrationStartCommit);
@@ -6341,7 +6547,7 @@ export class Orchestrator {
           approved: false,
           summary: "The combined code passed review but failed its recalculated monotonic evaluation gate.",
           findings,
-        }, settings);
+        }, settings, "evaluation", this.compositeTaskScope(composite, this.store.get()));
         integrationThreadId = revision.threadId;
         await this.assertCandidateDoesNotOwnProgress(worktree, revisionStartCommit);
         if (await this.git.hasChanges(worktree)) await this.git.commit(worktree, `burner: address composite evaluation pass ${evaluationRevision}`);
@@ -6452,12 +6658,14 @@ export class Orchestrator {
     }
     run = checkpointed;
     const cursor = run.continuation!;
+    const pinnedCompletion = Boolean(heldReauthorRequest(run));
+    if (pinnedCompletion) this.assertReauthorSource(run);
     await this.assertCandidateDoesNotOwnProgress(run.worktree, cursor.head);
-    await this.assertLeafCheckpoint(run, claim, true);
+    await this.assertLeafCheckpoint(run, claim, true, cursor.head, pinnedCompletion);
     const prepared = await this.git.prepareLeafCommit(run.worktree, run.branch, cursor.head);
-    await this.assertLeafCheckpoint(run, claim, true);
+    await this.assertLeafCheckpoint(run, claim, true, cursor.head, pinnedCompletion);
     await this.assertLeafRemote(run, claim);
-    await this.assertLeafCheckpoint(run, claim, true);
+    await this.assertLeafCheckpoint(run, claim, true, cursor.head, pinnedCompletion);
     if (prepared.inputHead !== cursor.head || !prepared.tree) throw new Error("The prepared author result has no exact input/tree identity.");
     return this.transitionLeaf(run, claim, {
       id: id("leaf"), identity: cursor.identity, head: cursor.head, step: "commit", tree: prepared.tree, result, source, commitMessage,
@@ -6468,6 +6676,11 @@ export class Orchestrator {
   private async consumeLeafCommit(run: AgentRun, claim: AgentClaim, allowStaleBase = false): Promise<AgentRun> {
     const cursor = run.continuation;
     if (cursor?.step !== "commit") throw new Error("The leaf has no author/evidence commit to consume.");
+    const held = heldReauthorRequest(run);
+    if (held) {
+      this.assertReauthorSource(run);
+      allowStaleBase = true;
+    }
     await this.assertLeafCheckpoint(run, claim, true, await this.git.head(run.worktree), allowStaleBase);
     await this.assertLeafRemote(run, claim);
     const head = await this.git.finalizeLeafCommit(run.worktree, run.branch, { inputHead: cursor.head, tree: cursor.tree }, cursor.commitMessage);
@@ -6482,6 +6695,14 @@ export class Orchestrator {
         patch.reviewRounds = run.reviewRounds.map((round) => round.id === roundId ? {
           ...round, authorResponse: cursor.result.message, completedAt: now(), authorCommit: head,
         } : round);
+      }
+      if (cursor.source.reason.kind === "operator") {
+        if (!held || cursor.source.reason.requestId !== held.id) throw new Error("The operator author result has no matching held request.");
+        patch.reauthorRequests = run.reauthorRequests!.map((request) => request.id === held.id
+          ? { ...request, output: { continuationId: common.id, head } } : request);
+        Object.assign(patch, { status: "failed", reviewApproved: false, completedAt: now(),
+          error: "Author-only output committed; explicit continueReauthor admission is required before evidence, review or evaluation." });
+        return this.transitionLeaf(run, claim, { ...common, step: "evidence" }, patch, "failed");
       }
       if (cursor.source.reason.kind === "initial" && head === cursor.head) {
         let successor: AgentRun | undefined;
@@ -6503,6 +6724,11 @@ export class Orchestrator {
       this.assertLeafSnapshot(run, state, claim);
       const cursor = run.continuation;
       if (!cursor) throw new Error("The leaf has no admitted continuation.");
+      const held = heldReauthorRequest(run);
+      if (held) {
+        this.assertReauthorSource(run);
+        if (cursor.step === "evidence") return;
+      }
       if (cursor.step === "done") return;
       if (cursor.step === "progress") {
         run = await this.continueLeafProgress(run, claim);
@@ -6519,19 +6745,27 @@ export class Orchestrator {
         run = await this.consumeLeafCommit(run, claim);
         continue;
       }
-      this.assertReviewHeadroom(run, state);
-      await this.assertAgentReviewCadence(state, runId, run.reviewRounds.at(-1)?.findings ?? []);
-      await this.assertLeafCheckpoint(run, claim, cursor.step === "author");
+      if (!held) {
+        this.assertReviewHeadroom(run, state);
+        await this.assertAgentReviewCadence(state, runId, run.reviewRounds.at(-1)?.findings ?? []);
+      }
+      await this.assertLeafCheckpoint(run, claim, cursor.step === "author", cursor.head, Boolean(held));
       await this.assertLeafRemote(run, claim);
       if (cursor.step === "author") {
         run = await this.updateLeafOwner(run, claim, (current) => { current.status = cursor.reason.kind === "initial" ? "running" : "revising"; });
         await this.assertLeafRemote(run, claim);
-        await this.assertLeafCheckpoint(run, claim, true);
+        await this.assertLeafCheckpoint(run, claim, true, cursor.head, Boolean(held));
         const live = this.store.get();
-        this.assertReviewHeadroom(run, live);
+        if (!held) this.assertReviewHeadroom(run, live);
         let result: SessionResult;
         if (cursor.reason.kind === "initial") {
           result = await this.codex.implement(run.worktree, idea, live.evaluations, live.settings, run.authorThreadId);
+        } else if (cursor.reason.kind === "operator") {
+          if (!held || held.id !== cursor.reason.requestId || !run.authorThreadId) throw new Error("The operator author request lost its owned session.");
+          const full = held.assessment ? fullAssessmentForIdentity(run, held.assessment) : undefined;
+          if (held.assessment && (!full || !this.completeFullFeedback(full, live))) throw new Error("The operator request's recorded historical feedback is no longer authoritative.");
+          result = await this.codex.reauthor(run.worktree, run.authorThreadId, this.leafTaskScope(run, idea.description), live.settings,
+            full ? this.evaluationRepairFeedback(full) : undefined);
         } else {
           if (!run.authorThreadId) throw new Error("A revision must reuse its existing author session.");
           let feedback: ReviewResult;
@@ -6553,9 +6787,11 @@ export class Orchestrator {
               severity: "high", title: "Repair the failed merge gate", detail: cursor.reason.feedback, file: "",
             }] };
           }
-          result = await this.codex.revise(run.worktree, run.authorThreadId, feedback, live.settings, cursor.reason.kind === "evaluation" ? "evaluation" : "review");
+          result = await this.codex.revise(run.worktree, run.authorThreadId, feedback, live.settings, cursor.reason.kind === "evaluation" ? "evaluation" : "review",
+            run.reauthorRequests?.length ? this.leafTaskScope(run, idea.description) : undefined);
         }
         const commitMessage = cursor.reason.kind === "initial" ? `burner: ${idea.title}`
+          : cursor.reason.kind === "operator" ? "burner: apply explicit author-only guidance"
           : cursor.reason.kind === "evaluation" ? "burner: repair confirmed evaluation feedback"
           : cursor.reason.kind === "review" ? "burner: address independent review feedback" : "burner: repair required checks";
         run = await this.saveLeafResult(run, claim, result, { kind: "author", reason: cursor.reason }, commitMessage);
@@ -6570,7 +6806,7 @@ export class Orchestrator {
         await this.assertLeafRemote(run, claim);
         await this.assertLeafCheckpoint(run, claim);
         this.assertReviewHeadroom(run, this.store.get());
-        const result = await this.codex.refreshAgentEvidence(run.worktree, cursor.identity.baseRef, idea.title, run.authorThreadId!, cursor.head, this.store.get().settings, idea.description);
+        const result = await this.codex.refreshAgentEvidence(run.worktree, cursor.identity.baseRef, idea.title, run.authorThreadId!, cursor.head, this.store.get().settings, this.leafTaskScope(run, idea.description));
         run = await this.saveLeafResult(run, claim, result, { kind: "evidence", implementationCommit: cursor.head }, "burner: refresh committed candidate evidence");
         continue;
       }
@@ -6578,7 +6814,7 @@ export class Orchestrator {
       await this.assertLeafRemote(run, claim);
       await this.assertLeafCheckpoint(run, claim);
       const reviewScope = [idea.title,
-        `Original task scope (requirements, not proof that the implementation satisfies them):\n${idea.description}`,
+        `${run.reauthorRequests?.length ? "Current operator task scope" : "Original task scope"} (requirements, not proof that the implementation satisfies them):\n${this.leafTaskScope(run, idea.description)}`,
         `Author's post-commit evidence handoff (unverified context, not approval): ${cursor.evidence.slice(0, 4_000)}`,
       ].join("\n\n");
       this.assertReviewHeadroom(run, this.store.get());
@@ -6602,6 +6838,18 @@ export class Orchestrator {
     }
   }
 
+  private compositeTaskScope(composite: CompositePr, state: BurnerState): string {
+    return [
+      "Authoritative composite scope: only the currently included sources below apply. Do not require omitted, removed, or quarantined changes, even if earlier author context mentions them.",
+      ...composite.sources.map((source) => {
+        const run = state.agentRuns.find((item) => item.id === source.agentRunId);
+        const description = state.ideas.find((idea) => idea.id === run?.ideaId)?.description;
+        return [`${source.prNumber ? `PR #${source.prNumber}: ` : ""}${source.title}`, run ? this.leafTaskScope(run, description ?? "") : description].filter(Boolean).join("\n");
+      }),
+      composite.description ? `Integration requirements: ${composite.description}` : "",
+    ].filter(Boolean).join("\n\n");
+  }
+
   private async refreshCompositeEvidence(cwd: string, compositeId: string, title: string, baseBranch: string, threadId: string, settings: BurnerState["settings"]): Promise<SessionResult> {
     if (await this.git.hasChanges(cwd)) throw new Error("Composite evidence refresh requires a clean, committed implementation.");
     const implementationCommit = await this.git.head(cwd);
@@ -6609,15 +6857,7 @@ export class Orchestrator {
     await this.store.addActivity({ type: "agent", message: `Checking committed composite evidence: ${title}`, detail: `Implementation ${implementationCommit}; independent review and all evaluation gates still follow.` });
     const state = this.store.get();
     const composite = state.composites.find((item) => item.id === compositeId);
-    const taskScope = composite ? [
-      "Authoritative composite scope: only the currently included sources below apply. Do not require omitted, removed, or quarantined changes, even if earlier author context mentions them.",
-      ...composite.sources.map((source) => {
-        const run = state.agentRuns.find((item) => item.id === source.agentRunId);
-        const description = state.ideas.find((idea) => idea.id === run?.ideaId)?.description;
-        return [`${source.prNumber ? `PR #${source.prNumber}: ` : ""}${source.title}`, description].filter(Boolean).join("\n");
-      }),
-      composite.description ? `Integration requirements: ${composite.description}` : "",
-    ].filter(Boolean).join("\n\n") : undefined;
+    const taskScope = composite ? this.compositeTaskScope(composite, state) : undefined;
     const evidence = await this.codex.refreshCompositeEvidence(cwd, baseBranch, title, threadId, implementationCommit, settings, taskScope);
     if (await this.git.head(cwd) !== implementationCommit) throw new Error("The composite evidence agent changed HEAD; Burner must own the evidence commit.");
     await this.assertCandidateDoesNotOwnProgress(cwd, implementationCommit);
@@ -6646,12 +6886,11 @@ export class Orchestrator {
       if (roundsUsed >= this.portfolioReviewLimit(reviewSettings)) break;
       const roundNumber = roundsUsed + 1;
       await this.updateComposite(compositeId, { status: "reviewing", updatedAt: now() });
-      const liveComposite = this.store.get().composites.find((item) => item.id === compositeId);
+      const reviewState = this.store.get();
+      const liveComposite = reviewState.composites.find((item) => item.id === compositeId);
       const reviewScope = liveComposite ? [
         title,
-        "Authoritative composite scope: review only the included changes below. Do not require omitted, removed, or quarantined changes, even if an earlier generation title or commit history mentions them.",
-        ...liveComposite.sources.map((source) => `- ${source.prNumber ? `PR #${source.prNumber}: ` : ""}${source.title}`),
-        liveComposite.description ? `Recovery context: ${liveComposite.description.slice(0, 2_000)}` : "",
+        this.compositeTaskScope(liveComposite, reviewState),
         `Author's post-commit evidence handoff (unverified context, not approval): ${evidence.message.slice(0, 4_000)}`,
       ].filter(Boolean).join("\n") : title;
       const review = await this.codex.review(cwd, baseBranch, reviewScope, reviewSettings);
@@ -6673,7 +6912,8 @@ export class Orchestrator {
       if (currentRounds >= this.portfolioReviewLimit(revisionSettings)) break;
       await this.updateComposite(compositeId, { status: "revising", updatedAt: now() });
       const revisionStartCommit = await this.git.head(cwd);
-      const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), revisionSettings);
+      const revision = await this.codex.revise(cwd, currentThreadId, this.normalizeReview(review), revisionSettings, "review",
+        liveComposite ? this.compositeTaskScope(liveComposite, reviewState) : undefined);
       currentThreadId = revision.threadId;
       message = revision.message;
       await this.assertCandidateDoesNotOwnProgress(cwd, revisionStartCommit);

@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createBurnerServer } from "./server.js";
 import { EventHub } from "./lib/events.js";
-import { Orchestrator } from "./lib/orchestrator.js";
+import { Orchestrator, validateAgentReauthorInput, validateContinueReauthorInput, type AgentReauthorInput, type AgentRetryOptions } from "./lib/orchestrator.js";
 import { validateLegacyLeafPrProofInput } from "./lib/legacy-leaf-pr.js";
 import { StateStore, validateEvaluation } from "./lib/store.js";
 import { errorMessage, id, now } from "./lib/utils.js";
@@ -37,6 +37,7 @@ Commands:
   idea list      List improvement ideas
   queue run-next Run exactly one queued idea through review and delivery
   queue retry    Resume a failed or full-score-rejected candidate (--run)
+  queue reauthor Author and commit only; await explicit continuation (--run, --request-file)
   pr merge       Merge an open agent PR and synchronize the base (--run)
   settings set   Update automation settings
   status         Print project state and runtime readiness as JSON
@@ -57,6 +58,8 @@ Command options:
   --portfolio-review-rounds <n> cumulative YOLO rounds before quarantine/recovery (default: 12)
   --legacy-pr-proof <file> explicit archived-writer proof JSON for queue retry
   --retain-worktree      retain this numbered leaf's canonical checkout on retry
+  --request-file <file>  exact-source re-author request JSON
+  --continue-reauthor <file> exact-output release JSON for queue retry
   --json                  JSON output (commands already default to JSON)
   -V, --version           output the version number
   -h, --help              display help`;
@@ -210,13 +213,32 @@ async function runHeadless(args: string[]): Promise<boolean> {
     const proofPath = option(args, "--legacy-pr-proof");
     const legacyPrProof = proofPath === undefined ? undefined : JSON.parse(await readFile(resolve(proofPath), "utf8")) as LegacyLeafPrProofInput;
     if (legacyPrProof !== undefined) validateLegacyLeafPrProofInput(legacyPrProof);
+    const releasePath = option(args, "--continue-reauthor");
+    const continueReauthor = releasePath === undefined ? undefined : JSON.parse(await readFile(resolve(releasePath), "utf8")) as NonNullable<AgentRetryOptions["continueReauthor"]>;
+    if (continueReauthor !== undefined) {
+      validateContinueReauthorInput(continueReauthor);
+      if (option(args, "--repair-notes") !== undefined) throw new Error("continueReauthor cannot be combined with repairNotes.");
+    }
     const run = await withOrchestrator(root, (orchestrator) => orchestrator.retryAgent(required(args, "--run"), {
       ...(option(args, "--repair-notes") !== undefined ? { repairNotes: option(args, "--repair-notes") } : {}),
       ...(legacyPrProof ? { legacyPrProof } : {}),
       ...(args.includes("--retain-worktree") ? { retainWorktree: true as const } : {}),
+      ...(continueReauthor !== undefined ? { continueReauthor } : {}),
     }), true);
     print(run);
     if (!["completed", "absorbed", "rejected", "no_changes"].includes(run.status)) process.exitCode = 2;
+    return true;
+  }
+
+  if (command === "queue" && subcommand === "reauthor") {
+    const input = JSON.parse(await readFile(resolve(required(args, "--request-file")), "utf8")) as AgentReauthorInput;
+    validateAgentReauthorInput(input);
+    const runId = required(args, "--run");
+    const run = await withOrchestrator(root, (orchestrator) => orchestrator.reauthorAgent(runId, input), true);
+    const output = run.reauthorRequests?.find((request) => request.id === input.requestId)?.output;
+    print({ runId, requestId: input.requestId, status: output ? "authored" : "pending", output, leafStatus: run.status,
+      ...(!output && run.error ? { error: run.error } : {}) });
+    if (!output) process.exitCode = 2;
     return true;
   }
 
