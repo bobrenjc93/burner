@@ -353,7 +353,7 @@ export type LeafContinuation = LeafCheckpoint & (
 export type LeafReauthorRequest = {
   id: string;
   guidance: string;
-  source: Extract<LeafContinuation, { step: "evidence" | "review" }>;
+  source: Extract<LeafContinuation, { step: "evidence" | "review" | "done" }>;
   previousAuthorMessage?: string;
   assessment?: FullAssessmentIdentity;
   admittedAt: string;

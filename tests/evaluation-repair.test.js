@@ -605,9 +605,10 @@ async function reauthorFixture(t, { step = "review", rounds = 5, limit = 12, equ
       identity: f.orchestrator.continuationIdentity(run, state, { number: 42, headRefOid: "rejected", url: run.prUrl }),
       ...(step === "review" ? { implementationCommit: f.world.head, evidence: "Prior clean-commit evidence handoff" } : {}) };
   });
+  let authors = 0;
   f.orchestrator.codex.reauthor = async (_cwd, thread, guidance, _settings, historicalFeedback) => {
     f.calls.push({ reauthor: { thread, guidance, historicalFeedback: structuredClone(historicalFeedback) } });
-    f.world.dirty = true; f.world.tree = `operator-tree-${f.calls.filter((call) => call.reauthor).length}`;
+    f.world.dirty = true; f.world.tree = `operator-tree-${++authors}`;
     return { threadId: "author", message: "New implementation under current operator requirements" };
   };
   return f;
@@ -621,6 +622,29 @@ function reauthorInput(f, requestId = "operator-request-1", guidance = "Make a n
 function reauthorRelease(f) {
   const request = f.run().reauthorRequests.at(-1);
   return { continueReauthor: { requestId: request.id, ...request.output } };
+}
+
+// Reach the newly supported source through the public workflow, including a
+// released earlier request whose requirements must remain historical afterward.
+async function completedReauthorFixture(t) {
+  const f = await reauthorFixture(t);
+  f.priorInput = reauthorInput(f, "earlier-released-request", "Earlier requirements: preserve the previous implementation approach.");
+  await f.orchestrator.reauthorAgent("agent", f.priorInput);
+  f.priorRelease = reauthorRelease(f);
+  f.world.score = 67;
+  const delivered = await f.orchestrator.retryAgent("agent", f.priorRelease);
+  assert.equal(delivered.status, "completed", delivered.error);
+  assert.equal(delivered.continuation.step, "done");
+  assert.equal(await f.orchestrator.fullyValidateLeafForMerge("agent", "base"), false);
+  const full = latestFullAssessment(f.run());
+  assert.equal(full.candidateCommit, delivered.continuation.head);
+  assert.equal(full.qualified, false);
+  assert.ok(full.evaluation.result);
+  assert.equal(f.run().reviewApproved, true);
+  assert.ok(f.run().reauthorRequests[0].releasedAt);
+  assert.equal(f.run().fullEvaluation, undefined);
+  f.calls.length = 0;
+  return f;
 }
 
 function assertNoReauthorEffects(f) {
@@ -1436,6 +1460,479 @@ test("public reauthor released guidance remains current when a later full reject
   assert.deepEqual(latestFullAssessment(run), newerAssessment);
   assert.equal(run.reauthorRequests.length, 1);
   assert.equal(f.calls.filter((call) => call.reauthor).length, 1);
+});
+
+test("completed full rejection admits new requirements with immutable history, held replay and exact release", async (t) => {
+  const f = await completedReauthorFixture(t);
+  const before = f.run(), rows = f.store.get().evaluationRuns, definitions = f.store.get().evaluations;
+  const oldIdea = f.store.get().ideas[0];
+  const assessed = latestFullAssessment(before);
+  const guidance = `Replacement requirements. ${"Preserve every supported behavior and validate the complete new implementation. ".repeat(65)}FINAL REPLACEMENT REQUIREMENT`;
+  assert.ok(guidance.length > 4000);
+  const input = reauthorInput(f, "completed-rejection-request", guidance);
+  const author = f.orchestrator.codex.reauthor;
+  f.orchestrator.codex.reauthor = async () => { throw new Error("Paused newly admitted author"); };
+  const admitted = await f.orchestrator.reauthorAgent("agent", input);
+  assert.equal(admitted.continuation.step, "author");
+  assert.deepEqual(admitted.continuation.reason, { kind: "operator", requestId: input.requestId });
+  const request = admitted.reauthorRequests[1];
+  assert.deepEqual(request.source, before.continuation, "the original done cursor, including its delivery receipt, is provenance");
+  assert.equal(request.source.step, "done");
+  assert.equal(request.guidance, guidance);
+  assert.equal(request.previousAuthorMessage, before.lastMessage);
+  assert.deepEqual(request.assessment, { baseCommit: assessed.baseCommit, candidateCommit: assessed.candidateCommit,
+    evaluationFingerprint: assessed.evaluationFingerprint });
+  assert.notDeepEqual(request.assessment, before.reauthorRequests[0].assessment, "new feedback must not point at the earlier request's rejection");
+  assert.equal(request.output, undefined);
+  assert.equal(request.releasedAt, undefined);
+  assert.deepEqual(admitted.reauthorRequests[0], before.reauthorRequests[0]);
+  assertNoReauthorEffects(f);
+
+  await restart(f);
+  f.orchestrator.codex.reauthor = author;
+  const paused = f.run(), effects = [...f.calls];
+  await f.orchestrator.reauthorAgent("agent", f.priorInput);
+  assert.deepEqual(f.run(), paused, "replaying the earlier completed request cannot drive the new author");
+  assert.deepEqual(f.calls, effects);
+  await assert.rejects(f.orchestrator.retryAgent("agent", f.priorRelease));
+  await assert.rejects(f.orchestrator.reauthorAgent("agent", { ...input, guidance: "Conflicting replacement" }));
+  const held = await f.orchestrator.reauthorAgent("agent", input);
+  assert.equal(held.status, "failed", held.error);
+  assert.equal(held.continuation.step, "evidence");
+  assert.notEqual(held.continuation.head, before.continuation.head);
+  assert.equal(f.parents.get(held.continuation.head), before.continuation.head);
+  for (const key of ["branch", "prNumber", "prUrl", "prState", "authorThreadId", "baseCommit", "worktree", "resources", "leafPr",
+    "reviewRounds", "fullEvaluationHistory", "deltas", "impact"]) assert.deepEqual(held[key], before[key], key);
+  assert.deepEqual(f.store.get().evaluationRuns, rows);
+  assert.deepEqual(f.store.get().evaluations, definitions);
+  assert.equal(f.store.get().ideas[0].description, oldIdea.description);
+  assert.equal(f.world.remoteHead, before.continuation.head);
+  assert.equal(held.reviewApproved, false);
+  assert.equal(held.fullEvaluation, undefined);
+  assert.equal(held.continuation.publication, undefined);
+  assert.deepEqual(held.reauthorRequests[0], before.reauthorRequests[0]);
+  assert.deepEqual(held.reauthorRequests[1], { ...request, output: { continuationId: held.continuation.id, head: held.continuation.head } });
+  const called = f.calls.filter((call) => call.reauthor);
+  assert.equal(called.length, 1);
+  assert.equal(called[0].reauthor.thread, before.authorThreadId);
+  assert.ok(called[0].reauthor.guidance.includes(guidance));
+  assert.equal(called[0].reauthor.guidance.includes(f.priorInput.guidance), false);
+  assert.ok(called[0].reauthor.historicalFeedback.summary.includes(assessed.candidateCommit));
+  assertNoReauthorEffects(f);
+  const release = reauthorRelease(f);
+  await restart(f);
+  await f.orchestrator.reauthorAgent("agent", input);
+  await f.orchestrator.retryAgent("agent");
+  assert.deepEqual(f.run(), held, "restart and ordinary retry preserve the exact hold");
+  assert.equal(f.calls.filter((call) => call.reauthor).length, 1);
+  await assert.rejects(f.orchestrator.retryAgent("agent", { continueReauthor: { ...release.continueReauthor, head: "wrong-output" } }));
+  assertNoReauthorEffects(f);
+
+  const scopes = [];
+  const evidence = f.orchestrator.codex.refreshAgentEvidence, review = f.orchestrator.codex.review;
+  f.orchestrator.codex.refreshAgentEvidence = async (...args) => {
+    assert.ok(f.run().reauthorRequests[1].releasedAt, "release is durable before downstream work");
+    scopes.push(args[6]); return evidence(...args);
+  };
+  f.orchestrator.codex.review = async (...args) => { scopes.push(args[2]); return review(...args); };
+  const delivered = await f.orchestrator.retryAgent("agent", release);
+  assert.equal(delivered.status, "completed", delivered.error);
+  assert.equal(delivered.continuation.step, "done");
+  assert.equal(delivered.reviewRounds.length, before.reviewRounds.length + 1);
+  assert.deepEqual(delivered.reviewRounds.slice(0, before.reviewRounds.length), before.reviewRounds);
+  assert.deepEqual(delivered.fullEvaluationHistory, before.fullEvaluationHistory);
+  assert.deepEqual(delivered.reauthorRequests[0], before.reauthorRequests[0]);
+  assert.deepEqual(delivered.reauthorRequests[1].source, before.continuation);
+  assert.deepEqual(delivered.reauthorRequests[1].output, held.reauthorRequests[1].output);
+  assert.equal(f.world.remoteHead, delivered.continuation.head);
+  assert.ok(f.world.remoteBody.includes(guidance), "publication consumes the complete replacement scope");
+  assert.equal(f.world.remoteBody.includes(f.priorInput.guidance), false);
+  assert.equal(scopes.length, 2);
+  const finishedEffects = [...f.calls];
+  await restart(f);
+  await f.orchestrator.reauthorAgent("agent", input);
+  await f.orchestrator.retryAgent("agent", release);
+  assert.deepEqual(f.run(), delivered);
+  assert.deepEqual(f.calls, finishedEffects, "exact completed replay cannot buy another review or sample");
+
+  assert.equal(await f.orchestrator.fullyValidateLeafForMerge("agent", "base"), false);
+  const nextAssessment = latestFullAssessment(f.run());
+  assert.equal(nextAssessment.candidateCommit, delivered.continuation.head);
+  const revise = f.orchestrator.codex.revise, revisions = [];
+  f.orchestrator.codex.revise = async (...args) => { revisions.push(args); scopes.push(args[5]); return revise(...args); };
+  f.world.score = 71;
+  const repaired = await f.orchestrator.retryAgent("agent", { repairNotes: "Supplemental detail for this repair; not replacement requirements." });
+  assert.equal(repaired.status, "completed", repaired.error);
+  assert.equal(revisions.length, 1);
+  assert.equal(revisions[0][4], "evaluation");
+  assert.ok(revisions[0][2].summary.includes(nextAssessment.candidateCommit));
+  assert.ok(JSON.stringify(revisions[0][2]).includes("Supplemental detail for this repair"));
+  for (const scope of scopes) {
+    assert.ok(scope.includes(guidance), "all later evidence/review/repair scopes retain the entire current requirements");
+    assert.equal(scope.includes(f.priorInput.guidance), false);
+    assert.match(scope, /explicitly released/);
+  }
+  assert.deepEqual(repaired.reauthorRequests, delivered.reauthorRequests);
+  assert.deepEqual(repaired.fullEvaluationHistory.slice(0, before.fullEvaluationHistory.length), before.fullEvaluationHistory);
+  assert.deepEqual(fullAssessmentForIdentity(repaired, assessed), assessed);
+  for (const row of rows) assert.deepEqual(f.store.get().evaluationRuns.find((item) => item.id === row.id), row);
+  assert.deepEqual(f.store.get().evaluations, definitions);
+  assert.equal(f.calls.filter((call) => call.reauthor).length, 1);
+  assert.equal(repaired.prNumber, before.prNumber);
+  assert.equal(repaired.authorThreadId, before.authorThreadId);
+  assert.deepEqual(await f.orchestrator.locks.list(), []);
+});
+
+test("completed full rejection no-op release cannot buy evidence, review or score samples", async (t) => {
+  const f = await completedReauthorFixture(t);
+  const before = f.run(), rows = f.store.get().evaluationRuns;
+  const input = reauthorInput(f, "completed-no-op", "Inspect a possible replacement without changing evaluator contracts.");
+  f.orchestrator.codex.reauthor = async (_cwd, thread) => {
+    f.calls.push({ reauthor: { thread } });
+    return { threadId: thread, message: "No implementation change was necessary" };
+  };
+  const held = await f.orchestrator.reauthorAgent("agent", input);
+  assert.equal(held.continuation.step, "evidence");
+  assert.equal(held.continuation.head, before.continuation.head);
+  assert.equal(f.calls.includes("commit"), false);
+  assertNoReauthorEffects(f);
+  const release = reauthorRelease(f);
+  const released = await f.orchestrator.retryAgent("agent", release);
+  assert.equal(released.status, "failed");
+  assert.equal(released.continuation.step, "evidence");
+  assert.match(released.error, /rejected tree unchanged/);
+  assert.ok(released.reauthorRequests[1].releasedAt);
+  await restart(f);
+  await f.orchestrator.reauthorAgent("agent", input);
+  await f.orchestrator.retryAgent("agent", release);
+  await f.orchestrator.retryAgent("agent");
+  assert.equal(await f.orchestrator.fullyValidateLeafForMerge("agent", "base"), false);
+  assert.deepEqual(f.run().reviewRounds, before.reviewRounds);
+  assert.deepEqual(f.run().fullEvaluationHistory, before.fullEvaluationHistory);
+  assert.deepEqual(f.run().reauthorRequests[0], before.reauthorRequests[0]);
+  assert.deepEqual(f.store.get().evaluationRuns, rows);
+  assert.equal(f.calls.filter((call) => call.reauthor).length, 1);
+  assertNoReauthorEffects(f);
+});
+
+test("completed full rejection reauthor refuses stale, incomplete or competing admission without effects", async (t) => {
+  const changeRun = (mutate) => (f) => f.store.update((state) => mutate(state.agentRuns[0], state));
+  const changeFull = (mutate) => changeRun((run) => mutate(run.fullEvaluationHistory.at(-1).assessment));
+  const cases = [
+    ["stale continuation", (_f, input) => { input.expectedContinuationId = "old-done"; }],
+    ["stale input", (_f, input) => { input.expectedHead = "old-head"; }],
+    ["stale published head", (_f, input) => { input.expectedPublishedHead = "old-published-head"; }],
+    ["missing full assessment", changeRun((run) => { run.fullEvaluationHistory = []; })],
+    ["stale full assessment", changeRun((run) => { run.fullEvaluationHistory.pop(); })],
+    ["positive assessment", changeFull((full) => { full.qualified = true; })],
+    ["incomplete assessment", changeFull((full) => { delete full.completedAt; })],
+    ["incomplete feedback", changeFull((full) => { full.deltas = []; })],
+    ["missing full receipt source", (f) => f.store.update((state) => {
+      const source = latestFullAssessment(state.agentRuns[0]).evaluation.result.selections[0].candidate;
+      state.evaluationRuns = state.evaluationRuns.filter((row) => row.id !== source);
+    })],
+    ["changed delivery receipt", changeRun((run) => { run.continuation.evaluation.result.impact = 100; })],
+    ["unapproved run", changeRun((run) => { run.reviewApproved = false; })],
+    ["unapproved round", changeRun((run) => { run.reviewRounds.at(-1).approved = false; })],
+    ["incomplete review", changeRun((run) => { delete run.reviewRounds.at(-1).completedAt; })],
+    ["review head", changeRun((run) => { run.reviewRounds.at(-1).commit = "foreign"; })],
+    ["review findings", changeRun((run) => { run.reviewRounds.at(-1).findings = [{ severity: "high", title: "Unresolved", detail: "Not approved", file: "leaf.txt" }]; })],
+    ["review base", changeRun((run) => { run.reviewRounds.at(-1).baseCommit = "foreign"; })],
+    ["review policy", changeRun((run) => { run.reviewRounds.at(-1).evaluationFingerprint = "foreign"; })],
+    ["candidate tree", (f) => { f.trees.set(f.world.head, "foreign-tree"); }],
+    ["dirty candidate", (f) => { f.world.dirty = true; }],
+    ["candidate head", (f) => { f.world.head = "foreign-head"; }],
+    ["advanced base", (f) => { const resolve = f.orchestrator.git.resolveRef; f.orchestrator.git.resolveRef = async (ref) => ref === "main" ? "next-base" : resolve(ref); }],
+    ["changed policy", changeRun((_run, state) => { state.evaluations[0].definitionVersion = "v2"; })],
+    ["remote head", (f) => { f.world.remoteHead = "foreign-head"; }],
+    ["closed remote", (f) => { f.world.remoteState = "CLOSED"; }],
+    ["foreign remote content", (f) => { f.world.remoteBody = "Foreign content owner"; }],
+    ["foreign repository", (f) => { const observe = f.orchestrator.git.observeLeafPr; f.orchestrator.git.observeLeafPr = async (...args) => ({ ...await observe(...args), headRepository: { host: "other.test", id: "foreign", nameWithOwner: "other/repo" } }); }],
+    ["missing author", changeRun((run) => { delete run.authorThreadId; })],
+    ["missing worktree", (f) => { f.orchestrator.git.assertWorktree = async () => { throw new Error("Missing retained checkout"); }; }],
+    ["composite child", changeRun((run) => { run.parentCompositeId = "living"; })],
+    ["composite reservation", changeRun((_run, state) => { state.composites.push({ id: "reserved", title: "Reserved", description: "", branch: "burner/composite",
+      status: "building", sources: [{ agentRunId: "agent", prNumber: 42, branch: "burner/repair", title: "Repair", kind: "pull_request" }],
+      deltas: [], reviewRounds: [], createdAt: timestamp, updatedAt: timestamp }); })],
+    ["pending full work", changeRun((run) => { run.fullEvaluation = { step: "sampling", evaluation: { evaluations: [] } }; })],
+    ["pending full publication", changeRun((run) => { run.fullEvaluation = { step: "publication", assessment: {}, publication: {} }; })],
+    ["pending PR owner", changeRun((run) => { run.leafPr.pending = { id: "pending", owner: { kind: "review-checkpoint", continuationId: run.continuation.id },
+      target: { ...run.leafPr.known.fields, isDraft: true } }; })],
+    ["terminal owner", changeRun((run) => { run.leafPr.terminal = { kind: "abandoned", continuationId: run.continuation.id }; })],
+    ["unreleased prior request", changeRun((run) => { delete run.reauthorRequests[0].releasedAt; })],
+    ["review budget exhausted", changeRun((run, state) => { state.settings.maxReviewRounds = run.reviewRounds.length; })],
+    ["resource contention", (f) => { f.orchestrator.locks.tryAcquireAll = async () => undefined; }],
+  ];
+  for (const [name, mutate] of cases) await t.test(name, async (t) => {
+    const f = await completedReauthorFixture(t);
+    const input = reauthorInput(f, "refused-completed-request");
+    await mutate(f, input);
+    const before = f.store.get();
+    await assert.rejects(f.orchestrator.reauthorAgent("agent", input));
+    assert.deepEqual(f.store.get(), before, "refused admission cannot rewrite its canonical checkpoint");
+    assert.equal(f.calls.some((call) => call.reauthor || ["prepare", "commit"].includes(call)), false);
+    assertNoReauthorEffects(f);
+    assert.deepEqual(await f.orchestrator.locks.list(), []);
+  });
+});
+
+test("completed full rejection reauthor rechecks late asynchronous identity, owner and budget changes", async (t) => {
+  for (const mutation of ["source", "review", "assessment", "policy", "budget", "base", "head", "remote", "pending-owner"]) await t.test(mutation, async (t) => {
+    const f = await completedReauthorFixture(t);
+    const before = f.run(), input = reauthorInput(f, "late-completed-request");
+    const assessedHead = latestFullAssessment(before).candidateCommit;
+    const tree = f.orchestrator.git.tree;
+    let changed = false;
+    f.orchestrator.git.tree = async (commit) => {
+      const result = await tree(commit);
+      if (!changed && commit === assessedHead && f.calls.includes("lease")) {
+        changed = true;
+        if (mutation === "remote") f.world.remoteHead = "foreign-head";
+        else if (mutation === "head") f.world.head = "foreign-head";
+        else if (mutation === "base") {
+          const resolve = f.orchestrator.git.resolveRef;
+          f.orchestrator.git.resolveRef = async (ref) => ref === "main" ? "next-base" : resolve(ref);
+        } else await f.store.update((state) => {
+          const run = state.agentRuns[0];
+          if (mutation === "source") run.continuation.completedAt = "2026-09-02T00:00:00.000Z";
+          if (mutation === "review") run.reviewRounds.at(-1).approved = false;
+          if (mutation === "assessment") run.fullEvaluationHistory.at(-1).assessment.qualified = true;
+          if (mutation === "policy") state.evaluations[0].definitionVersion = "v2";
+          if (mutation === "budget") state.settings.maxReviewRounds = run.reviewRounds.length;
+          if (mutation === "pending-owner") run.fullEvaluation = { step: "sampling", evaluation: { evaluations: [] } };
+        });
+      }
+      return result;
+    };
+    await assert.rejects(f.orchestrator.reauthorAgent("agent", input));
+    assert.equal(changed, true, "exercise a change after canonical full-rejection preparation has awaited Git");
+    assert.deepEqual(f.run().reauthorRequests, before.reauthorRequests);
+    assert.equal(f.run().status, "completed");
+    assert.equal(f.run().continuation.step, "done");
+    assert.equal(f.calls.some((call) => call.reauthor || ["prepare", "commit"].includes(call)), false);
+    assertNoReauthorEffects(f);
+    assert.deepEqual(await f.orchestrator.locks.list(), []);
+  });
+});
+
+test("completed full rejection late required checks revoke new score-repair admission", async (t) => {
+  for (const admission of ["reauthor", "evaluation repair"]) await t.test(admission, async (t) => {
+    const f = await completedReauthorFixture(t);
+    const before = f.store.get(), input = reauthorInput(f, "late-check-request");
+    const assessedHead = latestFullAssessment(f.run()).candidateCommit;
+    const tree = f.orchestrator.git.tree, observe = f.orchestrator.git.getPullRequest;
+    let checksFailed = false, greenReads = 0, failedReads = 0;
+    f.orchestrator.git.getPullRequest = async (...args) => {
+      const remote = await observe(...args);
+      if (checksFailed) failedReads += 1;
+      else greenReads += 1;
+      return { ...remote, statusCheckRollup: [{ name: "Late required test", status: checksFailed ? "COMPLETED" : "IN_PROGRESS",
+        conclusion: checksFailed ? "FAILURE" : null }] };
+    };
+    f.orchestrator.git.tree = async (commit) => {
+      const result = await tree(commit);
+      if (commit === assessedHead && f.calls.includes("lease")) checksFailed = true;
+      return result;
+    };
+    await assert.rejects(admission === "reauthor" ? f.orchestrator.reauthorAgent("agent", input) : f.orchestrator.retryAgent("agent"),
+      /Required checks failed during evaluation-repair preparation/);
+    assert.equal(checksFailed, true);
+    assert.ok(greenReads > 0 && failedReads > 0, "preparation first sees an eligible PR, then the final observation sees the failed check");
+    assert.deepEqual(f.store.get(), before, "late check failure cannot append a request or adopt a new author cursor");
+    assert.equal(f.calls.some((call) => call.reauthor || ["prepare", "commit"].includes(call)), false);
+    assertNoReauthorEffects(f);
+    assert.deepEqual(await f.orchestrator.locks.list(), []);
+  });
+});
+
+test("completed full rejection admitted authors retain recovery after later required-check failure", async (t) => {
+  for (const admission of ["reauthor", "evaluation repair"]) await t.test(admission, async (t) => {
+    const f = await completedReauthorFixture(t);
+    const input = reauthorInput(f, "admitted-before-check-failure"), before = f.run();
+    const method = admission === "reauthor" ? "reauthor" : "revise";
+    const author = f.orchestrator.codex[method];
+    let authorCalls = 0;
+    f.orchestrator.codex[method] = async (...args) => {
+      if (++authorCalls === 1) throw new Error("Paused already-admitted author");
+      return author(...args);
+    };
+    const resume = () => admission === "reauthor" ? f.orchestrator.reauthorAgent("agent", input) : f.orchestrator.retryAgent("agent");
+    const paused = await resume();
+    assert.equal(paused.continuation.step, "author");
+    assert.match(paused.error, /Paused already-admitted author/);
+    assert.equal(paused.continuation.reason.kind, admission === "reauthor" ? "operator" : "evaluation");
+    const observe = f.orchestrator.git.getPullRequest;
+    f.orchestrator.git.getPullRequest = async (...args) => ({ ...await observe(...args),
+      statusCheckRollup: [{ name: "Later required test", status: "COMPLETED", conclusion: "FAILURE" }] });
+    await restart(f);
+    const resumed = await resume();
+    assert.equal(authorCalls, 2, "an acknowledged admission may resume its interrupted author under the same request");
+    assert.deepEqual(resumed.fullEvaluationHistory, before.fullEvaluationHistory);
+    if (admission === "reauthor") {
+      assert.equal(resumed.continuation.step, "evidence", resumed.error);
+      assert.deepEqual(resumed.reauthorRequests[1].source, before.continuation);
+      assert.equal(resumed.reauthorRequests[1].releasedAt, undefined);
+      assert.deepEqual(resumed.reviewRounds, before.reviewRounds);
+      await f.orchestrator.retryAgent("agent");
+      assert.deepEqual(f.run(), resumed, "failed checks do not turn an existing held output into new admission");
+      assertNoReauthorEffects(f);
+    } else {
+      assert.equal(resumed.status, "completed", resumed.error);
+      assert.equal(resumed.continuation.step, "done");
+      assert.equal(f.calls.find((call) => call.revise).revise.kind, "evaluation", "resume cannot substitute check-repair authority");
+      assert.deepEqual(resumed.reauthorRequests, before.reauthorRequests);
+      assert.equal(resumed.reviewRounds.length, before.reviewRounds.length + 1);
+    }
+    assert.deepEqual(await f.orchestrator.locks.list(), []);
+  });
+});
+
+test("completed full rejection with failed required checks remains check repair, not new reauthor authority", async (t) => {
+  const f = await completedReauthorFixture(t);
+  const before = f.run(), rows = f.store.get().evaluationRuns;
+  const observe = f.orchestrator.git.getPullRequest;
+  f.orchestrator.git.getPullRequest = async (...args) => ({ ...await observe(...args),
+    statusCheckRollup: [{ name: "Required test", status: "COMPLETED", conclusion: "FAILURE" }] });
+  await assert.rejects(f.orchestrator.reauthorAgent("agent", reauthorInput(f, "not-check-repair")));
+  assert.deepEqual(f.run(), before);
+  assert.deepEqual(f.store.get().evaluationRuns, rows);
+  assert.equal(f.calls.some((call) => call.reauthor), false);
+  assertNoReauthorEffects(f);
+  const repaired = await f.orchestrator.retryAgent("agent");
+  assert.equal(repaired.status, "completed", repaired.error);
+  const revision = f.calls.find((call) => call.revise).revise;
+  assert.equal(revision.kind, "review");
+  assert.match(revision.feedback.findings[0].detail, /Required test/);
+  assert.deepEqual(repaired.reauthorRequests, before.reauthorRequests);
+  assert.deepEqual(repaired.fullEvaluationHistory, before.fullEvaluationHistory);
+});
+
+test("completed full rejection reauthor accepts only proven generated-progress heads with real Git parentage", async (t) => {
+  for (const proof of ["valid", "missing", "tampered"]) await t.test(proof, async (t) => {
+    const f = await reauthorFixture(t);
+    const g = await leafRefreshRepository(f.root, { branch: "burner/repair", published: true, deferTarget: true });
+    const plan = await g.git.planLeafManagedFiles(g.worktree, "burner/repair", g.head, {
+      "docs/burner-evaluation-history.json": '{"fixture":"generated-progress"}\n',
+    });
+    await g.git.applyLeafManagedFiles(g.worktree, "burner/repair", plan);
+    const prepared = await g.git.prepareLeafCommit(g.worktree, "burner/repair", g.head);
+    const stamped = await g.git.finalizeLeafCommit(g.worktree, "burner/repair", prepared, "fixture generated progress");
+    await g.git.pushLeaf(g.worktree, "origin", "burner/repair", stamped, g.head);
+    const certificate = { baseCommit: g.base, inputCommit: g.head, inputTree: plan.inputTree,
+      outputCommit: stamped, outputTree: plan.tree, plan };
+    await g.git.verifyGeneratedProgress(certificate);
+    assert.notEqual(stamped, g.head);
+    f.orchestrator.git = g.git;
+    delete f.orchestrator.assertCandidateDoesNotOwnProgress;
+    installLeafPrFixtureTransport(g.git, { observe: async () => ({ number: 42, state: "OPEN", headRefName: "burner/repair",
+      headRefOid: await g.git.remoteBranchHead(g.worktree, "origin", "burner/repair"), title: f.world.remoteTitle,
+      body: f.world.remoteBody, isDraft: f.world.remoteDraft, statusCheckRollup: [], url: f.run().prUrl }) });
+    await f.store.update((state) => {
+      const run = state.agentRuns[0];
+      const full = { ...latestFullAssessment(run), baseCommit: g.base, candidateCommit: g.head, candidateTree: plan.inputTree };
+      Object.assign(run, { worktree: g.worktree, baseCommit: g.base, status: "completed", reviewApproved: true });
+      run.fullEvaluationHistory = [{ kind: "assessment", assessment: full, comparison: { tree: plan.inputTree, progress: [] } }];
+      for (const round of run.reviewRounds) Object.assign(round, { commit: g.head, baseCommit: g.base });
+      run.continuation = { id: "completed-generated-source", head: stamped, step: "done", outcome: "completed", completedAt: timestamp,
+        identity: f.orchestrator.continuationIdentity(run, state, { number: 42, headRefOid: stamped, url: run.prUrl }) };
+      if (proof !== "missing") run.generatedProgress = proof === "valid" ? certificate : { ...certificate, outputTree: "tampered-tree" };
+      state.ideas[0].status = "completed";
+      state.evaluationRuns[0].commit = g.base;
+      state.evaluationRuns[1].commit = g.head;
+    });
+    f.orchestrator.codex.reauthor = async (cwd, thread, guidance) => {
+      f.calls.push({ reauthor: { thread, guidance } });
+      await writeFile(join(cwd, "leaf.txt"), "New implementation after the generated checkpoint\n");
+      return { threadId: thread, message: "Unverified replacement implementation" };
+    };
+    g.calls.pushes.length = 0;
+    const before = f.run(), input = reauthorInput(f, "generated-rejection-request");
+    if (proof === "valid") {
+      const held = await f.orchestrator.reauthorAgent("agent", input);
+      assert.equal(held.continuation.step, "evidence", held.error);
+      assert.deepEqual(held.reauthorRequests[0].source, before.continuation);
+      assert.equal(held.reauthorRequests[0].assessment.candidateCommit, g.head, "feedback identifies assessed input, not generated output");
+      assert.equal(await fixtureGit(g.worktree, "rev-parse", `${held.continuation.head}^`), stamped);
+      await fixtureGit(g.worktree, "merge-base", "--is-ancestor", g.head, held.continuation.head);
+      assert.deepEqual(held.fullEvaluationHistory, before.fullEvaluationHistory);
+      assert.deepEqual(held.reviewRounds, before.reviewRounds);
+      assert.equal(await g.git.hasChanges(g.worktree), false);
+    } else {
+      await assert.rejects(f.orchestrator.reauthorAgent("agent", input));
+      assert.deepEqual(f.run(), before);
+      assert.equal(f.calls.some((call) => call.reauthor), false);
+      assert.equal(await g.git.head(g.worktree), stamped);
+    }
+    assert.equal(await g.git.remoteBranchHead(g.worktree, "origin", "burner/repair"), stamped);
+    assert.deepEqual(g.calls.pushes, []);
+    assert.deepEqual(g.calls.merges, []);
+    assertNoReauthorEffects(f);
+  });
+});
+
+test("archived reauthor done receipts retain borrowed, projected and nested evidence through rolling trim", async (t) => {
+  for (const format of ["receipt", "legacy"]) await t.test(format, async (t) => {
+    const f = await fixture(t);
+    const reference = (runId) => ({ runId, digest: "stored-retention-fixture" });
+    const roots = format === "receipt" ? ["borrowed-baseline", "projection-input", "borrowed-candidate", "failed-attempt",
+      "candidate-success", "baseline-confirmation", "baseline-median", "result-only"] : ["borrowed-candidate"];
+    const nestedRoot = format === "receipt" ? "projection-input" : "borrowed-candidate";
+    const rows = [...roots, "nested-source", "nested-grandchild"].map((id) => ({
+      id, evaluationId: "perf", commit: "old-foreign-commit", context: "composite", agentRunId: "unretained-owner",
+      durationMs: 1, attempts: 1, createdAt: timestamp, evaluationDefinitionVersion: "v1",
+      ...(id === "failed-attempt" ? { status: "failed", error: "Historic failed sample" } : { status: "completed", score: 67 }),
+      ...(id === nestedRoot ? { sourceRunIds: ["nested-source"] } : id === "nested-source" ? { sourceRunIds: ["nested-grandchild"] } : {}),
+    }));
+    // Arrange persisted provenance directly: validation/admission is exercised
+    // above. None of these rows belongs to a retained run, comparison base,
+    // current full receipt, latest baseline, or the rolling recent window.
+    await f.store.update((state) => {
+      const run = state.agentRuns[0];
+      const identity = f.orchestrator.continuationIdentity(run, state, { number: 42, headRefOid: "rejected", url: run.prUrl });
+      const evaluation = format === "legacy" ? { evaluationRunIds: roots, deltas: run.deltas, impact: run.impact, completedAt: timestamp } : {
+        id: "archived-delivery", purpose: "delivery", agentRunId: run.id,
+        identity: { baseCommit: "base", candidateCommit: "old-delivery", evaluationFingerprint: identity.evaluationFingerprint },
+        candidateTree: "old-delivery-tree", scoreDefinitionFingerprint: "stored-retention-fixture",
+        evaluations: [{ evaluationId: "perf", definitionVersion: "v1", mode: "prompt",
+          baseline: { source: reference("borrowed-baseline"), comparisonCommit: "base", score: 70, count: 3,
+            projection: { sourceCommit: "old-foreign-commit", inputs: [reference("projection-input")] } },
+          candidate: [{ reuse: { ...reference("borrowed-candidate"), reason: "full-command" } },
+            { attempts: ["failed-attempt", "candidate-success"], success: reference("candidate-success") }],
+          baselineConfirmations: [{ attempts: ["baseline-confirmation"], success: reference("baseline-confirmation") }],
+          baselineMedian: reference("baseline-median"),
+        }],
+        result: { completedAt: timestamp, sources: [reference("result-only")], selections: [], deltas: run.deltas, impact: run.impact },
+      };
+      const source = { id: "old-done", identity, head: "old-delivery", step: "done", outcome: "completed", completedAt: timestamp, evaluation };
+      const output = { continuationId: "current-held-output", head: "current-author-output" };
+      run.continuation = { id: output.continuationId, identity, head: output.head, step: "evidence" };
+      run.reauthorRequests = [
+        { id: "older-done-request", guidance: "Earlier replacement", source, admittedAt: timestamp,
+          output: { continuationId: "earlier-held-output", head: "earlier-output" }, releasedAt: timestamp },
+        { id: "newest-request", guidance: "Current replacement", source: { id: "later-source", identity, head: "earlier-output", step: "evidence" },
+          admittedAt: timestamp, output },
+      ];
+      state.evaluationRuns.push(...structuredClone(rows), { ...rows[0], id: "unreferenced-old-row", sourceRunIds: undefined });
+    });
+    const requests = f.run().reauthorRequests;
+    await f.store.update((state) => {
+      const run = state.agentRuns[0];
+      const full = { ...run.fullMergeValidation, candidateCommit: "later-assessed-head", candidateTree: "later-assessed-tree" };
+      run.fullEvaluationHistory = [{ kind: "assessment", assessment: full, comparison: { tree: full.candidateTree, progress: [] } }];
+      delete run.fullMergeValidation;
+      state.evaluationRuns.push(...Array.from({ length: 1100 }, (_, index) => ({
+        id: `reauthor-roll-${index}`, evaluationId: "perf", commit: "unrelated", context: "agent", agentRunId: "other",
+        status: "completed", score: 1, durationMs: 1, createdAt: timestamp, evaluationDefinitionVersion: "v1",
+      })));
+    });
+    await restart(f);
+    assert.deepEqual(f.run().reauthorRequests, requests);
+    assert.equal(f.run().continuation.step, "evidence");
+    for (const row of rows) assert.deepEqual(f.store.get().evaluationRuns.find((saved) => saved.id === row.id), row, row.id);
+    assert.equal(f.store.get().evaluationRuns.some((row) => row.id === "unreferenced-old-row"), false);
+    assert.equal(f.store.get().evaluationRuns.some((row) => row.id === "reauthor-roll-0"), false, "the rolling trim actually ran");
+    assert.deepEqual(f.calls, [], "retaining evidence never starts recovery work");
+  });
 });
 
 test("reauthor prompts distinguish current requirements, historical measurements and later evidence authority", async () => {
@@ -2546,6 +3043,113 @@ async function oldFullFixture(t) {
   f.expectedSources = oldFullSignals.flatMap(([, , , , baseline, seed, , , ...confirmations]) => [baseline, seed, ...confirmations.map(([key]) => key)]).map((key) => `evalrun_${key}`).sort();
   return f;
 }
+
+async function completedLegacyReauthorFixture(t) {
+  const f = await oldFullFixture(t);
+  await f.store.update((state) => {
+    const run = state.agentRuns[0];
+    const identity = f.orchestrator.continuationIdentity(run, state, { number: 42, headRefOid: "rejected", url: run.prUrl });
+    run.leafQualificationPolicy = "ordinary";
+    run.continuation = { id: "legacy-completed-source", identity, head: "rejected", step: "done", outcome: "completed",
+      completedAt: "2026-09-14T23:59:00.000Z", evaluation: {
+        evaluationRunIds: oldFullSignals.map(([key, , , , , seed], index) => `evalrun_${index === 6 || index === 7 ? seed : `ordinary-${key}`}`),
+        deltas: structuredClone(run.deltas), impact: run.impact, completedAt: "2026-09-14T23:59:00.000Z",
+      } };
+    run.reauthorRequests = [{ id: "older-legacy-request", guidance: "Earlier retained requirements",
+      source: { id: "earlier-legacy-evidence", identity: structuredClone(identity), head: "rejected", step: "evidence" },
+      admittedAt: "2026-09-14T23:00:00.000Z", output: { continuationId: "earlier-legacy-output", head: "rejected" },
+      releasedAt: "2026-09-14T23:10:00.000Z" }];
+  });
+  return f;
+}
+
+test("completed full rejection legacy reauthor adopts raw provenance atomically before author feedback", async (t) => {
+  const f = await completedLegacyReauthorFixture(t);
+  const before = f.run(), raw = f.store.get().evaluationRuns, definitions = f.store.get().evaluations;
+  const original = before.fullMergeValidation, input = reauthorInput(f, "imported-full-request", "Replace the legacy implementation without changing evaluator contracts.");
+  assert.equal(original.deltas, undefined, "this case must hydrate real raw provenance, not reuse already-complete history");
+  assert.equal(before.fullEvaluationHistory, undefined);
+  const snapshots = [], unsubscribe = f.store.subscribe((state) => snapshots.push(structuredClone(state.agentRuns[0])));
+  t.after(unsubscribe);
+  let pause = true;
+  f.orchestrator.codex.reauthor = async (_cwd, thread, guidance, _settings, feedback) => {
+    f.calls.push({ reauthor: { thread, guidance, historicalFeedback: structuredClone(feedback) } });
+    const run = f.run(), full = latestFullAssessment(run);
+    assert.equal(run.fullMergeValidation, undefined, "legacy alias retires before operator feedback is resolved");
+    assert.equal(run.fullEvaluationHistory.length, 1);
+    assert.equal(full.legacyProvenance.importer, "old-leaf-full-v1");
+    assert.deepEqual(full.legacyProvenance.sources.map((source) => source.runId).sort(), f.expectedSources);
+    assert.deepEqual(run.reauthorRequests[1].source, before.continuation);
+    assert.deepEqual(run.reviewRounds, before.reviewRounds);
+    assert.deepEqual(f.store.get().evaluationRuns, raw);
+    assert.ok(guidance.includes(input.guidance));
+    assert.ok(feedback.summary.includes(original.candidateCommit));
+    assert.ok(feedback.findings.some((finding) => /28 -> 21\.2 \(delta -6\.8\)/.test(finding.title)), "author receives the imported negative measurements");
+    if (pause) { pause = false; throw new Error("Paused imported operator author"); }
+    f.world.dirty = true; f.world.tree = "imported-operator-tree";
+    return { threadId: thread, message: "Replacement implementation from retained legacy feedback" };
+  };
+  const admitted = await f.orchestrator.reauthorAgent("agent", input);
+  assert.equal(admitted.continuation.step, "author");
+  assert.match(admitted.error, /Paused imported operator author/);
+  assert.equal(f.calls.filter((call) => call.reauthor).length, 1);
+  assert.ok(snapshots.some((run) => run.reauthorRequests.length === 2));
+  for (const run of snapshots) {
+    if (run.reauthorRequests.length === 2) {
+      assert.equal(run.fullMergeValidation, undefined);
+      assert.equal(run.fullEvaluationHistory.length, 1, "request admission and full-history adoption are one persisted transition");
+    } else {
+      assert.deepEqual(run.fullMergeValidation, original);
+      assert.equal(run.fullEvaluationHistory, undefined, "there is no pre-admission history rewrite");
+    }
+  }
+  const full = latestFullAssessment(admitted);
+  for (const key of Object.keys(original)) assert.deepEqual(full[key], original[key], key);
+  assert.equal(full.candidateTree, "rejected-tree");
+  assert.equal(full.impact, -0.7);
+  assert.deepEqual(admitted.fullEvaluationHistory[0].comparison, { tree: "rejected-tree", progress: [] });
+  assert.deepEqual(admitted.reauthorRequests[1].assessment, { baseCommit: original.baseCommit, candidateCommit: original.candidateCommit,
+    evaluationFingerprint: original.evaluationFingerprint });
+  assert.equal(admitted.reauthorRequests[1].output, undefined);
+  assertNoReauthorEffects(f);
+  unsubscribe();
+  await restart(f);
+  assert.deepEqual(f.run(), admitted, "the imported history and original done source survive restart before author completion");
+  const held = await f.orchestrator.reauthorAgent("agent", input);
+  assert.equal(held.continuation.step, "evidence", held.error);
+  assert.equal(f.parents.get(held.continuation.head), before.continuation.head);
+  assert.equal(held.fullMergeValidation, undefined);
+  assert.deepEqual(held.fullEvaluationHistory, admitted.fullEvaluationHistory);
+  assert.deepEqual(held.reauthorRequests[0], before.reauthorRequests[0]);
+  assert.deepEqual(held.reauthorRequests[1].source, before.continuation);
+  assert.equal(held.reauthorRequests[1].releasedAt, undefined);
+  assert.deepEqual(held.reviewRounds, before.reviewRounds);
+  assert.deepEqual(f.store.get().evaluationRuns, raw);
+  assert.deepEqual(f.store.get().evaluations, definitions);
+  assert.equal(f.world.measurements, 0);
+  assert.equal(f.world.remoteHead, "rejected");
+  assert.equal(held.prNumber, before.prNumber);
+  assert.equal(held.authorThreadId, before.authorThreadId);
+  assert.equal(f.calls.filter((call) => call.reauthor).length, 2, "only the interrupted invocation is resumed");
+  assertNoReauthorEffects(f);
+});
+
+test("completed full rejection legacy reauthor refuses missing or ambiguous raw provenance", async (t) => {
+  for (const corruption of ["missing-confirmation", "competing-seed"]) await t.test(corruption, async (t) => {
+    const f = await completedLegacyReauthorFixture(t);
+    await f.store.update((state) => {
+      if (corruption === "missing-confirmation") state.evaluationRuns = state.evaluationRuns.filter((row) => row.id !== "evalrun_179ec2be");
+      else state.evaluationRuns.push({ ...state.evaluationRuns.find((row) => row.id === "evalrun_4fe7f816"), id: "competing-legacy-seed" });
+    });
+    f.orchestrator.codex.reauthor = async () => { f.calls.push({ reauthor: {} }); throw new Error("Unproven feedback cannot admit an author"); };
+    const before = f.store.get();
+    await assert.rejects(f.orchestrator.reauthorAgent("agent", reauthorInput(f, "unproven-legacy-request")), /historical measurement provenance/);
+    assert.deepEqual(f.store.get(), before);
+    assert.equal(f.calls.some((call) => call.reauthor || ["prepare", "commit"].includes(call)), false);
+    assertNoReauthorEffects(f);
+    assert.deepEqual(await f.orchestrator.locks.list(), []);
+  });
+});
 
 test("public legacy admission imports the actual two/six-row topology without sampling or rewriting raw evidence", async (t) => {
   const f = await oldFullFixture(t);

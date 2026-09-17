@@ -2921,7 +2921,7 @@ export class Orchestrator {
       run.prNumber !== run.leafPr.known.number || !cursor.identity.pullRequest ||
       run.leafPr.terminal || run.leafPr.known.fields.state !== "OPEN" || run.prState !== "open" ||
       run.fullEvaluation || cursor.publication || run.leafPr.pending) {
-      throw new Error("Re-authoring requires an unfinished standalone leaf with established OPEN PR ownership and no pending publication, full evaluation or terminal work.");
+      throw new Error("Re-authoring requires a standalone leaf with established OPEN PR ownership and no pending publication, full evaluation or terminal work.");
     }
     if (!input) {
       if (!held) throw new Error("The leaf has no held re-author request.");
@@ -2938,10 +2938,12 @@ export class Orchestrator {
       this.assertReauthorSource(run);
       return;
     }
-    if (run.status !== "failed" || (cursor.step !== "evidence" && cursor.step !== "review") ||
+    const stoppedCheckpoint = run.status === "failed" && (cursor.step === "evidence" || cursor.step === "review");
+    const completedCheckpoint = run.status === "completed" && cursor.step === "done" && !held;
+    if ((!stoppedCheckpoint && !completedCheckpoint) ||
       (held && !held.output) || cursor.id !== input.expectedContinuationId || cursor.head !== input.expectedHead ||
       cursor.identity.pullRequest.head !== input.expectedPublishedHead) {
-      throw new Error("New re-authoring requires the exact idle failed committed evidence/review checkpoint and recorded published head.");
+      throw new Error("New re-authoring requires an exact idle failed evidence/review checkpoint or completed full rejection, and its recorded published head.");
     }
   }
 
@@ -3311,6 +3313,39 @@ export class Orchestrator {
     return saved!;
   }
 
+  /** Shared admission for evaluation repair and explicitly scoped re-authoring. */
+  private async prepareEvaluationRepair(run: AgentRun, state: BurnerState, checkpoint: {
+    identity: LeafContinuationIdentity; head: string; dirty: boolean;
+    remote: LeafPullRequestObservation | undefined; full: FullMergeValidation;
+  }): Promise<{ full: FullMergeValidation; history: FullEvaluationHistoryEntry[] }> {
+    const { identity, head, dirty, remote } = checkpoint;
+    let full = checkpoint.full;
+    if (full.qualified !== false || !remote || failedPullRequestChecks(remote).length) {
+      throw new Error("Evaluation repair requires a full rejection, not a positive or required-check repair checkpoint.");
+    }
+    // A proven check failure owns check repair even when an unrelated old
+    // score record is incomplete. Hydration is only score-repair admission.
+    const history = await this.legacyFullHistory(run, state);
+    full = history.find((entry): entry is Extract<FullEvaluationHistoryEntry, { kind: "assessment" }> =>
+      entry.kind === "assessment" && sameAssessment(entry.assessment, full))?.assessment ?? full;
+    if (full.evaluation) verifyCurrentLeafReceipt(state, this.assertFullAssessmentReceipt(run, full, state));
+    const progress = run.generatedProgress;
+    const certified = progress?.outputCommit === head && progress.inputCommit === full.candidateCommit;
+    if (certified) await this.git.verifyGeneratedProgress(progress!);
+    const assessedHead = certified ? progress!.inputCommit : head;
+    const review = run.reviewRounds.at(-1);
+    if (run.parentCompositeId || (!run.continuation && run.authoringComplete === false) || !review?.approved || !review.completedAt ||
+      review.findings.length || run.reviewApproved !== true || review.commit !== assessedHead || assessedHead !== full.candidateCommit ||
+      full.baseCommit !== run.baseCommit || full.evaluationFingerprint !== identity.evaluationFingerprint || dirty ||
+      remote.headRefOid !== head || remote.state !== "OPEN" || !this.completeFullFeedback(full, state) ||
+      await this.git.tree(assessedHead) !== full.candidateTree ||
+      (review.baseCommit !== undefined && review.baseCommit !== run.baseCommit) ||
+      (review.evaluationFingerprint !== undefined && review.evaluationFingerprint !== identity.evaluationFingerprint)) {
+      throw new Error("Evaluation repair requires the complete, current, independently approved full-rejection checkpoint and clean matching head.");
+    }
+    return { full, history };
+  }
+
   private async admitLeafContinuation(run: AgentRun, worktree: string, options: AgentRetryOptions, claim: AgentClaim, reauthorInput?: AgentReauthorInput): Promise<{
     continuation: LeafContinuation; full?: FullMergeValidation; history?: FullEvaluationHistoryEntry[]; reauthorRequest?: LeafReauthorRequest;
   }> {
@@ -3324,8 +3359,17 @@ export class Orchestrator {
       await this.assertLeafRemote(run, claim);
       await this.assertLeafCheckpoint(run, claim);
       const source = run.continuation;
-      if (source?.step !== "evidence" && source?.step !== "review") throw new Error("Re-author source is not a committed checkpoint.");
-      const full = latestFullAssessment(run);
+      if (source?.step !== "evidence" && source?.step !== "review" && source?.step !== "done") throw new Error("Re-author source is not a committed checkpoint.");
+      let full = latestFullAssessment(run);
+      let history: FullEvaluationHistoryEntry[] = [];
+      if (source.step === "done") {
+        if (!full) throw new Error("Completed re-authoring requires a current full-rejection assessment.");
+        if (source.evaluation && "id" in source.evaluation) verifyCurrentLeafReceipt(state, source.evaluation);
+        const remote = await this.assertLeafRemote(run, claim);
+        ({ full, history } = await this.prepareEvaluationRepair(run, state, {
+          identity: source.identity, head: source.head, dirty: await this.git.hasChanges(worktree), remote, full,
+        }));
+      }
       let assessment: FullAssessmentIdentity | undefined;
       if (full?.qualified === false && full.baseCommit === source.identity.baseCommit && full.evaluationFingerprint === source.identity.evaluationFingerprint) {
         if (!this.completeFullFeedback(full, state)) throw new Error("The re-author source has incomplete historical negative feedback.");
@@ -3337,6 +3381,7 @@ export class Orchestrator {
         reauthorRequest: { id: reauthorInput.requestId, guidance: reauthorInput.guidance, source: structuredClone(source),
           ...(run.lastMessage !== undefined ? { previousAuthorMessage: run.lastMessage } : {}),
           ...(assessment ? { assessment } : {}), admittedAt: now() },
+        ...(history.length ? { history } : {}),
       };
     }
     if (run.continuation && run.continuation.step !== "done") {
@@ -3372,25 +3417,7 @@ export class Orchestrator {
     let continuation: LeafContinuation;
     const newRepair = (run.continuation?.step === "done" || run.status === "completed" || retired) && full?.qualified === false && !knownCheckFailure;
     if (newRepair) {
-      // A proven check failure owns check repair even when an unrelated old
-      // score record is incomplete. Hydration is only score-repair admission.
-      history = await this.legacyFullHistory(run, state);
-      full = history.find((entry): entry is Extract<FullEvaluationHistoryEntry, { kind: "assessment" }> =>
-        entry.kind === "assessment" && sameAssessment(entry.assessment, full!))?.assessment ?? full!;
-      if (full.evaluation) verifyCurrentLeafReceipt(state, this.assertFullAssessmentReceipt(run, full, state));
-      const progress = run.generatedProgress;
-      const certified = progress?.outputCommit === head && progress.inputCommit === full.candidateCommit;
-      if (certified) await this.git.verifyGeneratedProgress(progress!);
-      const assessedHead = certified ? progress!.inputCommit : head;
-      if (run.parentCompositeId || !remote || (!run.continuation && run.authoringComplete === false) || !review?.approved || !review.completedAt ||
-        review.findings.length || run.reviewApproved !== true || review.commit !== assessedHead || assessedHead !== full.candidateCommit ||
-        full.baseCommit !== run.baseCommit || full.evaluationFingerprint !== identity.evaluationFingerprint || dirty ||
-        remote.headRefOid !== head || remote.state !== "OPEN" || !this.completeFullFeedback(full, state) ||
-        await this.git.tree(assessedHead) !== full.candidateTree ||
-        (review.baseCommit !== undefined && review.baseCommit !== run.baseCommit) ||
-        (review.evaluationFingerprint !== undefined && review.evaluationFingerprint !== identity.evaluationFingerprint)) {
-        throw new Error("Evaluation repair requires the complete, current, independently approved full-rejection checkpoint and clean matching head.");
-      }
+      ({ full, history } = await this.prepareEvaluationRepair(run, state, { identity, head, dirty, remote, full: full! }));
       continuation = { ...checkpoint, step: "author", reason: { kind: "evaluation", assessment: {
         baseCommit: full.baseCommit, candidateCommit: full.candidateCommit, evaluationFingerprint: full.evaluationFingerprint,
       }, ...(options.repairNotes ? { notes: options.repairNotes } : {}) } };
@@ -3549,6 +3576,11 @@ export class Orchestrator {
           ![known.head, ...(cursor.step === "delivery" ? [cursor.head] : [])].includes(remote.headRefOid) ||
           remote.state !== "OPEN") {
           throw new Error("The candidate remote PR identity changed during retry preparation.");
+        }
+        const newEvaluationRepair = cursor.id !== run.continuation?.id && cursor.step === "author" &&
+          (cursor.reason.kind === "evaluation" || admission.reauthorRequest?.source.step === "done");
+        if (newEvaluationRepair && failedPullRequestChecks(remote).length) {
+          throw new Error("Required checks failed during evaluation-repair preparation; retry their repair explicitly.");
         }
       }
       if ((!pinnedCompletion && (await this.git.resolveRef(run.baseRef) !== run.baseCommit ||

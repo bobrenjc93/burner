@@ -454,8 +454,11 @@ export class StateStore {
     };
     for (const run of this.state.agentRuns) {
       const cursor = run.continuation;
-      const delivery = cursor?.step === "progress" ? cursor.done.evaluation : cursor && "evaluation" in cursor ? cursor.evaluation : undefined;
-      if (delivery) {
+      const currentDelivery = cursor?.step === "progress" ? cursor.done.evaluation : cursor && "evaluation" in cursor ? cursor.evaluation : undefined;
+      // A new author can supersede a done cursor without superseding its evidence.
+      const deliveries = [currentDelivery, ...run.reauthorRequests?.map(({ source }) =>
+        source.step === "done" ? source.evaluation : undefined) ?? []];
+      for (const delivery of deliveries) if (delivery) {
         if ("id" in delivery) retainReceipt(delivery);
         else for (const runId of delivery.evaluationRunIds) retainedEvaluationRunIds.add(runId);
       }
