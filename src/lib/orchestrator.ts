@@ -97,6 +97,27 @@ async function settleEvaluationWork<T>(work: Promise<T>[]): Promise<T[]> {
 type FullAssessmentSource = Pick<AgentRun, "fullEvaluationHistory" | "fullMergeValidation" | "evaluationRepair">;
 
 function fullAssessments(run: FullAssessmentSource | undefined): FullMergeValidation[] {
+  // Only absent optional owners mean no full feedback. Malformed persisted
+  // owners must not authorize a fallback to ordinary-delivery repair.
+  if (run?.fullEvaluationHistory !== undefined && !Array.isArray(run.fullEvaluationHistory)) {
+    throw new Error("Malformed full-evaluation history owner.");
+  }
+  for (const entry of run?.fullEvaluationHistory ?? []) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) ||
+      (entry.kind !== "assessment" && entry.kind !== "superseded") ||
+      (entry.kind === "assessment" && (!entry.assessment || typeof entry.assessment !== "object" || Array.isArray(entry.assessment)))) {
+      throw new Error("Malformed full-evaluation history entry.");
+    }
+  }
+  const legacyFull = run?.fullMergeValidation;
+  if (legacyFull !== undefined && (!legacyFull || typeof legacyFull !== "object" || Array.isArray(legacyFull))) {
+    throw new Error("Malformed legacy full-assessment owner.");
+  }
+  const legacyRepair = run?.evaluationRepair;
+  if (legacyRepair !== undefined && (!legacyRepair || typeof legacyRepair !== "object" || Array.isArray(legacyRepair) ||
+    !legacyRepair.validation || typeof legacyRepair.validation !== "object" || Array.isArray(legacyRepair.validation))) {
+    throw new Error("Malformed legacy full-repair owner.");
+  }
   const history = (run?.fullEvaluationHistory ?? []).filter((entry): entry is Extract<FullEvaluationHistoryEntry, { kind: "assessment" }> => entry.kind === "assessment");
   const entries = new Map<string, FullEvaluationHistoryEntry>();
   for (const entry of history) {
@@ -2012,6 +2033,11 @@ export class Orchestrator {
   /** The completed reduction's original protocol/threshold determine its verdict. */
   private recordedFullQualification(receipt: LeafEvaluationReceipt): boolean {
     if (receipt.purpose !== "full" || !receipt.result) throw new Error("No completed full reduction is available.");
+    return this.recordedLeafQualification(receipt);
+  }
+
+  private recordedLeafQualification(receipt: LeafEvaluationReceipt): boolean {
+    if (!receipt.result) throw new Error("No completed leaf reduction is available.");
     const frozen = readRecordedLeafPolicy(receipt);
     return isYoloCandidate(receipt.result.deltas, receipt.result.impact, new Set(frozen.evaluations.map((entry) => entry.id)),
       new Set(frozen.evaluations.filter((entry) => entry.command).map((entry) => entry.id)), frozen.threshold);
@@ -2091,17 +2117,17 @@ export class Orchestrator {
   }
 
   /** A failed HEAD read is not absence. Retained allocation is never inferred from the latch. */
-  private async leafWorktree(run: AgentRun, claim: AgentClaim, allocationId: string, initialRetention = false): Promise<string> {
+  private async leafWorktree(run: AgentRun, claim: AgentClaim, allocationId: string, initialRetention = false, settledReauthor = false): Promise<string> {
     this.assertLeafOwnerSnapshot(run, claim);
     const present = (path: string) => lstat(path).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return undefined;
       throw error;
     });
     let worktree: string | undefined;
-    if (run.retainWorktree) {
+    if (run.retainWorktree || settledReauthor) {
       const directory = join(this.store.dataDir, "worktrees");
       const paths = [join(directory, run.id), join(directory, `full-leaf-${run.id}`)];
-      if (run.worktree && !paths.includes(resolve(run.worktree))) throw new Error("The retained saved checkout is outside this leaf's exact deterministic namespace; files were left untouched.");
+      if (run.worktree && !paths.includes(resolve(run.worktree))) throw new Error("The saved checkout is outside this leaf's exact deterministic namespace; files were left untouched.");
       for (const path of [this.store.dataDir, directory]) {
         const existing = await present(path);
         if (existing && (!existing.isDirectory() || existing.isSymbolicLink())) throw new Error("The retained checkout namespace has an unknown file or symlink; files were left untouched.");
@@ -2109,11 +2135,12 @@ export class Orchestrator {
       const extant = (await Promise.all(paths.map(async (path) => await present(path) ? path : undefined))).filter((path): path is string => Boolean(path));
       if (extant.length > 1) throw new Error("Both deterministic retained checkouts exist; allocation is ambiguous and files were left untouched.");
       worktree = extant[0];
-      if (!worktree && !initialRetention) throw new Error("Retained checkout has missing/unknown allocation or loss; explicit reconciliation is required and no checkout was created.");
+      if (!worktree && run.retainWorktree && !initialRetention) throw new Error("Retained checkout has missing/unknown allocation or loss; explicit reconciliation is required and no checkout was created.");
     } else if (run.worktree && await present(run.worktree)) worktree = run.worktree;
+    if (settledReauthor) this.assertLeafSnapshot(run, this.store.get(), claim);
     if (!worktree) worktree = await this.git.createExistingWorktree(allocationId, run.branch);
     await this.git.assertWorktree(worktree, run.branch);
-    if (run.retainWorktree && run.continuation?.step !== "refresh") await this.git.assertLeafWorktreeIdle(worktree);
+    if ((run.retainWorktree || settledReauthor) && run.continuation?.step !== "refresh") await this.git.assertLeafWorktreeIdle(worktree);
     this.assertLeafOwnerSnapshot(run, claim);
     return worktree;
   }
@@ -2975,6 +3002,113 @@ export class Orchestrator {
     throw new LeafReviewLimitError(`Reviewer did not approve after ${limit} total rounds; no review budget remains.`);
   }
 
+  private recordedCompletedDelivery(run: AgentRun, source: Extract<LeafContinuation, { step: "done" }>, state: BurnerState): LeafEvaluationReceipt {
+    const receipt = source.evaluation;
+    if (!receipt || !("id" in receipt) || !receipt.id || receipt.purpose !== "delivery" || !receipt.result ||
+      receipt.agentRunId !== run.id || receipt.identity.baseCommit !== source.identity.baseCommit ||
+      receipt.identity.evaluationFingerprint !== source.identity.evaluationFingerprint ||
+      source.identity.branch !== run.branch || source.identity.pullRequest?.number !== run.prNumber ||
+      source.identity.pullRequest?.head !== source.head || source.outcome !== "completed" ||
+      !Number.isFinite(Date.parse(source.completedAt))) {
+      throw new Error("Re-authoring requires the exact completed delivery receipt and published source identity.");
+    }
+    verifyRecordedLeafReceipt(state, receipt);
+    // Later authoring changes the final review/approval flag, not this receipt's linked round.
+    const approvals = run.reviewRounds.filter((round) => round.id === receipt.approvalRoundId);
+    const review = approvals[0];
+    if (approvals.length !== 1 || !review?.approved || !review.completedAt || review.findings.length ||
+      !Number.isFinite(Date.parse(review.completedAt)) || review.commit !== receipt.identity.candidateCommit ||
+      review.baseCommit !== source.identity.baseCommit || review.evaluationFingerprint !== source.identity.evaluationFingerprint ||
+      Date.parse(review.completedAt) > Date.parse(receipt.result.completedAt) ||
+      Date.parse(receipt.result.completedAt) > Date.parse(source.completedAt)) {
+      throw new Error("The completed delivery lost its exact independent approval and completion provenance.");
+    }
+    return receipt;
+  }
+
+  private ordinaryDeliveryRejected(run: AgentRun, receipt: LeafEvaluationReceipt): boolean {
+    if (run.leafQualificationPolicy !== "ordinary" || receipt.purpose !== "delivery" || !receipt.evaluations.length ||
+      receipt.evaluations.some((entry) => entry.mode === "screening-command") || receipt.result?.deltas.some((delta) => delta.screening)) {
+      throw new Error("Ordinary re-authoring requires an explicit ordinary origin and a complete nonscreened delivery.");
+    }
+    return !this.recordedLeafQualification(receipt);
+  }
+
+  private reauthorDeliverySources(run: AgentRun): Array<{
+    request: LeafReauthorRequest; source: Extract<LeafContinuation, { step: "done" }>; receipt: LeafEvaluationReceipt; rejected: boolean;
+  }> {
+    const sources: ReturnType<Orchestrator["reauthorDeliverySources"]> = [];
+    for (const request of run.reauthorRequests ?? []) {
+      const source = request.source;
+      if (source.step !== "done") continue;
+      const delivery = source.evaluation;
+      if (!delivery || !("id" in delivery)) {
+        // Only this request's saved full cause can witness an older source with no typed delivery.
+        const full = request.assessment ? fullAssessmentForIdentity(run, request.assessment) : undefined;
+        if (request.checkFailures !== undefined || !full || full.qualified !== false ||
+          full.baseCommit !== source.identity.baseCommit || full.evaluationFingerprint !== source.identity.evaluationFingerprint ||
+          (delivery && (!Array.isArray(delivery.evaluationRunIds) || !Array.isArray(delivery.deltas) ||
+            !Number.isFinite(delivery.impact) || !Number.isFinite(Date.parse(delivery.completedAt))))) {
+          throw new Error("The retained re-author source lost its required completed delivery receipt.");
+        }
+        if (full.evaluation) this.assertFullAssessmentReceipt(run, full, this.store.get());
+        continue;
+      }
+      if (request.checkFailures !== undefined && !request.checkFailures.length) throw new Error("The retained CI source lost its recorded admission cause.");
+      const receipt = this.recordedCompletedDelivery(run, source, this.store.get());
+      const ordinary = run.leafQualificationPolicy === "ordinary" && receipt.evaluations.length > 0 &&
+        !receipt.evaluations.some((entry) => entry.mode === "screening-command") && !receipt.result!.deltas.some((delta) => delta.screening);
+      const rejected = ordinary && !this.recordedLeafQualification(receipt);
+      if (!request.checkFailures && !request.assessment && !rejected) {
+        throw new Error("The retained ordinary source lost its recorded negative-delivery authority.");
+      }
+      sources.push({ request, source, receipt, rejected });
+    }
+    return sources;
+  }
+
+  private async reauthorSourceTrees(run: AgentRun): Promise<Array<{ tree: string; rejected: boolean }>> {
+    const sources = this.reauthorDeliverySources(run).filter(({ source }) => source.identity.baseCommit === run.baseCommit);
+    if (!sources.length) return [];
+    const proofs = this.leafProgressProofs(run, run.baseCommit!);
+    const normalize = (head: string) => proofs.length
+      ? this.git.normalizeLeafProgressHistoryTree(head, run.baseCommit!, proofs) : this.git.tree(head);
+    const trees = [];
+    for (const { source, receipt, rejected } of sources) {
+      const tree = await normalize(source.head);
+      if (!tree || await this.git.tree(receipt.identity.candidateCommit) !== receipt.candidateTree ||
+        await normalize(receipt.identity.candidateCommit) !== tree) {
+        throw new Error("The retained completed delivery lost its exact measured-tree proof.");
+      }
+      trees.push({ tree, rejected });
+    }
+    return trees;
+  }
+
+  private async assertReauthorTreeChanged(run: AgentRun, head: string): Promise<void> {
+    const sources = await this.reauthorSourceTrees(run);
+    if (!sources.length) return;
+    const proofs = this.leafProgressProofs(run, run.baseCommit!);
+    const tree = proofs.length ? await this.git.normalizeLeafProgressHistoryTree(head, run.baseCommit!, proofs) : await this.git.tree(head);
+    if (!tree || sources.some((source) => source.tree === tree)) {
+      throw new Error("Re-author output matches an already measured completed-delivery source tree; no new samples are allowed.");
+    }
+  }
+
+  private ordinaryDeliveryFeedback(receipt: LeafEvaluationReceipt): ReviewResult {
+    const result = receipt.result!;
+    return {
+      approved: false,
+      summary: `Historical ordinary delivery rejected ${receipt.identity.candidateCommit} against ${receipt.identity.baseCommit} at ${result.completedAt}. These are its recorded values, not a full-purpose assessment or a new sample.`,
+      findings: result.deltas.map((delta) => ({
+        severity: delta.delta! < 0 ? "high" as const : "low" as const,
+        title: `${delta.name}: ${delta.before} -> ${delta.after} (delta ${delta.delta})`,
+        detail: delta.summary || "No detailed evaluator summary was retained for this ordinary delivery.",
+        file: "",
+      })),
+    };
+  }
+
   private evaluationRepairFeedback(full: FullMergeValidation, notes?: string): ReviewResult {
     return {
       approved: false,
@@ -2993,11 +3127,13 @@ export class Orchestrator {
 
   private async isRejectedLeafTree(run: AgentRun, head: string): Promise<boolean> {
     const negatives = fullAssessments(run).filter((full) => !full.qualified && full.baseCommit === run.baseCommit);
-    if (!negatives.length) return false;
+    const ordinary = (await this.reauthorSourceTrees(run)).filter((source) => source.rejected);
+    if (!negatives.length && !ordinary.length) return false;
     const progress = this.leafProgressProofs(run, run.baseCommit!);
     const normalize = (commit: string, proofs = progress) => proofs.length
       ? this.git.normalizeLeafProgressHistoryTree(commit, run.baseCommit!, proofs) : this.git.tree(commit);
     const candidate = await normalize(head);
+    if (ordinary.some((source) => source.tree === candidate)) return true;
     for (const full of negatives) {
       if (full.evaluation) this.assertFullAssessmentReceipt(run, full, this.store.get());
       const actual = await this.git.tree(full.candidateCommit);
@@ -3052,6 +3188,7 @@ export class Orchestrator {
   }
 
   private async assertLeafMaySample(run: AgentRun, head: string): Promise<void> {
+    await this.assertReauthorTreeChanged(run, head);
     if (await this.isRejectedLeafTree(run, head)) {
       throw new Error("Evaluation repair left the rejected tree unchanged; no new review or evaluation samples are allowed.");
     }
@@ -3279,14 +3416,14 @@ export class Orchestrator {
     return current;
   }
 
-  private async assertLeafCheckpoint(run: AgentRun, claim: AgentClaim, allowEdits = false, head = run.continuation!.head, allowStaleBase = false): Promise<void> {
+  private async assertLeafCheckpoint(run: AgentRun, claim: AgentClaim, allowEdits = false, head = run.continuation!.head, allowStaleBase = false, worktree = run.worktree): Promise<void> {
     this.assertLeafSnapshot(run, this.store.get(), claim);
     const identity = run.continuation!.identity;
-    await this.git.assertWorktree(run.worktree, identity.branch);
+    await this.git.assertWorktree(worktree, identity.branch);
     const [base, configuredBase, branchHead, worktreeHead, dirty] = await Promise.all([
       allowStaleBase ? Promise.resolve(identity.baseCommit) : this.git.resolveRef(identity.baseRef),
       allowStaleBase || run.parentCompositeId ? Promise.resolve(identity.baseCommit) : this.git.resolveRef(identity.baseBranch),
-      this.git.resolveRef(identity.branch), this.git.head(run.worktree), this.git.hasChanges(run.worktree),
+      this.git.resolveRef(identity.branch), this.git.head(worktree), this.git.hasChanges(worktree),
     ]);
     if (!allowStaleBase && (base !== identity.baseCommit || configuredBase !== identity.baseCommit)) throw new Error(BASE_REFRESH_ERRORS.review);
     if (branchHead !== worktreeHead || worktreeHead !== head || (!allowEdits && dirty)) {
@@ -3318,10 +3455,10 @@ export class Orchestrator {
 
   /** Shared admission for evaluation repair and explicitly scoped re-authoring. */
   private async prepareEvaluationRepair(run: AgentRun, state: BurnerState, checkpoint: {
-    identity: LeafContinuationIdentity; head: string; dirty: boolean;
+    identity: LeafContinuationIdentity; head: string;
     remote: LeafPullRequestObservation | undefined; full: FullMergeValidation;
   }): Promise<{ full: FullMergeValidation; history: FullEvaluationHistoryEntry[] }> {
-    const { identity, head, dirty, remote } = checkpoint;
+    const { identity, head, remote } = checkpoint;
     let full = checkpoint.full;
     if (full.qualified !== false || !remote || failedPullRequestChecks(remote).length) {
       throw new Error("Evaluation repair requires a full rejection, not a positive or required-check repair checkpoint.");
@@ -3339,7 +3476,7 @@ export class Orchestrator {
     const review = run.reviewRounds.at(-1);
     if (run.parentCompositeId || (!run.continuation && run.authoringComplete === false) || !review?.approved || !review.completedAt ||
       review.findings.length || run.reviewApproved !== true || review.commit !== assessedHead || assessedHead !== full.candidateCommit ||
-      full.baseCommit !== run.baseCommit || full.evaluationFingerprint !== identity.evaluationFingerprint || dirty ||
+      full.baseCommit !== run.baseCommit || full.evaluationFingerprint !== identity.evaluationFingerprint ||
       remote.headRefOid !== head || remote.state !== "OPEN" || !this.completeFullFeedback(full, state) ||
       await this.git.tree(assessedHead) !== full.candidateTree ||
       (review.baseCommit !== undefined && review.baseCommit !== run.baseCommit) ||
@@ -3349,31 +3486,76 @@ export class Orchestrator {
     return { full, history };
   }
 
-  /** Check repair is authorized by this delivery, never an unrelated full verdict. */
-  private async assertCompletedCheckRepair(run: AgentRun, state: BurnerState, source: Extract<LeafContinuation, { step: "done" }>, remote: LeafPullRequestObservation): Promise<void> {
-    const receipt = source.evaluation;
-    if (!receipt || !("id" in receipt) || receipt.purpose !== "delivery" || !receipt.result ||
-      receipt.agentRunId !== run.id || receipt.identity.baseCommit !== run.baseCommit ||
-      receipt.identity.evaluationFingerprint !== source.identity.evaluationFingerprint) {
-      throw new Error("Required-check re-authoring requires the completed current delivery receipt of this leaf.");
-    }
+  private async assertCompletedDelivery(run: AgentRun, state: BurnerState, source: Extract<LeafContinuation, { step: "done" }>, remote: LeafPullRequestObservation): Promise<LeafEvaluationReceipt> {
+    const receipt = this.recordedCompletedDelivery(run, source, state);
     verifyCurrentLeafReceipt(state, receipt);
     const progress = run.generatedProgress;
     const certified = progress?.outputCommit === source.head && progress.inputCommit === receipt.identity.candidateCommit;
     if (certified) await this.git.verifyGeneratedProgress(progress!);
     const assessedHead = certified ? progress!.inputCommit : source.head;
     const review = run.reviewRounds.at(-1);
-    if (source.outcome !== "completed" || !Number.isFinite(Date.parse(source.completedAt)) ||
-      remote.headRefOid !== source.head || remote.state !== "OPEN" || source.identity.pullRequest?.head !== source.head ||
-      !review?.approved || !review.completedAt || review.findings.length || run.reviewApproved !== true ||
-      review.commit !== assessedHead || review.baseCommit !== run.baseCommit ||
-      review.evaluationFingerprint !== source.identity.evaluationFingerprint || receipt.approvalRoundId !== review.id ||
+    if (receipt.identity.baseCommit !== run.baseCommit || remote.headRefOid !== source.head || remote.state !== "OPEN" ||
+      run.reviewApproved !== true || receipt.approvalRoundId !== review?.id ||
       receipt.identity.candidateCommit !== assessedHead || await this.git.tree(assessedHead) !== receipt.candidateTree) {
-      throw new Error("Required-check re-authoring requires the exact independently approved completed delivery and matching published head.");
+      throw new Error("Re-authoring requires the current independently approved completed delivery and matching published head.");
     }
+    return receipt;
   }
 
-  private async admitLeafContinuation(run: AgentRun, worktree: string, options: AgentRetryOptions, claim: AgentClaim, reauthorInput?: AgentReauthorInput): Promise<{
+  private async prepareReauthorContinuation(run: AgentRun, claim: AgentClaim, input: AgentReauthorInput): Promise<{
+    continuation: LeafContinuation; history?: FullEvaluationHistoryEntry[]; reauthorRequest: LeafReauthorRequest;
+  }> {
+    const state = this.store.get();
+    this.assertReauthorSource(run, input);
+    this.assertReviewHeadroom(run, state);
+    this.assertLeafSnapshot(run, state, claim);
+    this.reauthorDeliverySources(run);
+    const source = run.continuation;
+    if (source?.step !== "evidence" && source?.step !== "review" && source?.step !== "done") throw new Error("Re-author source is not a committed checkpoint.");
+    const remote = await this.assertLeafRemote(run, claim);
+    let full: FullMergeValidation | undefined;
+    let history: FullEvaluationHistoryEntry[] = [];
+    let checkFailures: string[] | undefined;
+    if (source.step === "done") {
+      const failures = remote ? failedPullRequestChecks(remote, true) : [];
+      if (failures.length) {
+        await this.assertCompletedDelivery(run, state, source, remote!);
+        checkFailures = failures;
+      } else {
+        if (run.status !== "completed") throw new Error("A failed-health completed leaf requires confirmed current-head check failures for re-authoring.");
+        full = latestFullAssessment(run);
+        if (full) {
+          if (source.evaluation && "id" in source.evaluation) verifyCurrentLeafReceipt(state, source.evaluation);
+          ({ full, history } = await this.prepareEvaluationRepair(run, state, { identity: source.identity, head: source.head, remote, full }));
+        } else {
+          const receipt = await this.assertCompletedDelivery(run, state, source, remote!);
+          if (!this.ordinaryDeliveryRejected(run, receipt)) throw new Error("The current ordinary delivery is not a negative qualification result.");
+        }
+      }
+    } else full = latestFullAssessment(run);
+    let assessment: FullAssessmentIdentity | undefined;
+    if (full?.qualified === false && full.baseCommit === source.identity.baseCommit && full.evaluationFingerprint === source.identity.evaluationFingerprint) {
+      if (!this.completeFullFeedback(full, state)) throw new Error("The re-author source has incomplete historical negative feedback.");
+      if (full.evaluation) verifyCurrentLeafReceipt(state, this.assertFullAssessmentReceipt(run, full, state));
+      assessment = { baseCommit: full.baseCommit, candidateCommit: full.candidateCommit, evaluationFingerprint: full.evaluationFingerprint };
+    }
+    if (await this.git.resolveRef(source.identity.baseRef) !== source.identity.baseCommit ||
+      await this.git.resolveRef(source.identity.baseBranch) !== source.identity.baseCommit ||
+      await this.git.resolveRef(source.identity.branch) !== source.head) {
+      throw new Error("The re-author source base or branch changed before checkout admission.");
+    }
+    this.assertLeafSnapshot(run, this.store.get(), claim);
+    return {
+      continuation: { id: id("leaf"), identity: source.identity, head: source.head, step: "author", reason: { kind: "operator", requestId: input.requestId } },
+      reauthorRequest: { id: input.requestId, guidance: input.guidance, source: structuredClone(source),
+        ...(run.lastMessage !== undefined ? { previousAuthorMessage: run.lastMessage } : {}),
+        ...(assessment ? { assessment } : {}), ...(checkFailures ? { checkFailures } : {}), admittedAt: now() },
+      ...(history.length ? { history } : {}),
+    };
+  }
+
+  private async admitLeafContinuation(run: AgentRun, worktree: string, options: AgentRetryOptions, claim: AgentClaim, reauthorInput?: AgentReauthorInput,
+    preparedReauthor?: Awaited<ReturnType<Orchestrator["prepareReauthorContinuation"]>>): Promise<{
     continuation: LeafContinuation; full?: FullMergeValidation; history?: FullEvaluationHistoryEntry[]; reauthorRequest?: LeafReauthorRequest;
   }> {
     const state = this.store.get();
@@ -3381,44 +3563,13 @@ export class Orchestrator {
       this.assertReauthorSource(run, reauthorInput);
       if (run.reauthorRequests?.some((request) => request.id === reauthorInput.requestId)) return { continuation: run.continuation! };
       this.assertReviewHeadroom(run, state);
-      if (worktree !== run.worktree) throw new Error("New re-authoring requires its existing exact worktree.");
-      await this.assertLeafCheckpoint(run, claim);
-      await this.assertLeafRemote(run, claim);
-      await this.assertLeafCheckpoint(run, claim);
-      const source = run.continuation;
-      if (source?.step !== "evidence" && source?.step !== "review" && source?.step !== "done") throw new Error("Re-author source is not a committed checkpoint.");
-      let full: FullMergeValidation | undefined;
-      let history: FullEvaluationHistoryEntry[] = [];
-      let checkFailures: string[] | undefined;
-      if (source.step === "done") {
-        const remote = await this.assertLeafRemote(run, claim);
-        const failures = remote ? failedPullRequestChecks(remote, true) : [];
-        if (failures.length) {
-          await this.assertCompletedCheckRepair(run, state, source, remote!);
-          checkFailures = failures;
-        } else {
-          if (run.status !== "completed") throw new Error("A failed-health completed leaf requires confirmed current-head check failures for re-authoring.");
-          full = latestFullAssessment(run);
-          if (!full) throw new Error("Completed re-authoring requires a current full rejection or confirmed required-check failures.");
-          if (source.evaluation && "id" in source.evaluation) verifyCurrentLeafReceipt(state, source.evaluation);
-          ({ full, history } = await this.prepareEvaluationRepair(run, state, {
-            identity: source.identity, head: source.head, dirty: await this.git.hasChanges(worktree), remote, full,
-          }));
-        }
-      } else full = latestFullAssessment(run);
-      let assessment: FullAssessmentIdentity | undefined;
-      if (full?.qualified === false && full.baseCommit === source.identity.baseCommit && full.evaluationFingerprint === source.identity.evaluationFingerprint) {
-        if (!this.completeFullFeedback(full, state)) throw new Error("The re-author source has incomplete historical negative feedback.");
-        if (full.evaluation) verifyCurrentLeafReceipt(state, this.assertFullAssessmentReceipt(run, full, state));
-        assessment = { baseCommit: full.baseCommit, candidateCommit: full.candidateCommit, evaluationFingerprint: full.evaluationFingerprint };
+      if (!preparedReauthor || (worktree !== run.worktree && preparedReauthor.reauthorRequest.source.step !== "done")) {
+        throw new Error("New re-authoring requires its source proof and exact existing or canonically restored checkout.");
       }
-      return {
-        continuation: { id: id("leaf"), identity: source.identity, head: source.head, step: "author", reason: { kind: "operator", requestId: reauthorInput.requestId } },
-        reauthorRequest: { id: reauthorInput.requestId, guidance: reauthorInput.guidance, source: structuredClone(source),
-          ...(run.lastMessage !== undefined ? { previousAuthorMessage: run.lastMessage } : {}),
-          ...(assessment ? { assessment } : {}), ...(checkFailures ? { checkFailures } : {}), admittedAt: now() },
-        ...(history.length ? { history } : {}),
-      };
+      await this.assertLeafCheckpoint(run, claim, false, run.continuation!.head, false, worktree);
+      await this.assertLeafRemote(run, claim);
+      await this.assertLeafCheckpoint(run, claim, false, run.continuation!.head, false, worktree);
+      return preparedReauthor;
     }
     if (run.continuation && run.continuation.step !== "done") {
       if (options.repairNotes !== undefined) throw new Error("repairNotes cannot replace an admitted continuation.");
@@ -3453,7 +3604,8 @@ export class Orchestrator {
     let continuation: LeafContinuation;
     const newRepair = (run.continuation?.step === "done" || run.status === "completed" || retired) && full?.qualified === false && !knownCheckFailure;
     if (newRepair) {
-      ({ full, history } = await this.prepareEvaluationRepair(run, state, { identity, head, dirty, remote, full: full! }));
+      if (dirty) throw new Error("Evaluation repair requires a clean matching candidate head.");
+      ({ full, history } = await this.prepareEvaluationRepair(run, state, { identity, head, remote, full: full! }));
       continuation = { ...checkpoint, step: "author", reason: { kind: "evaluation", assessment: {
         baseCommit: full.baseCommit, candidateCommit: full.candidateCommit, evaluationFingerprint: full.evaluationFingerprint,
       }, ...(options.repairNotes ? { notes: options.repairNotes } : {}) } };
@@ -3505,29 +3657,7 @@ export class Orchestrator {
     // named base must not strand it behind a refresh that the hold forbids.
     await this.assertLeafCheckpoint(run, claim, false, output.head, true);
     await this.assertLeafRemote(run, claim);
-    // A later request must not erase a completed CI source's no-resample guard.
-    const measured = run.reauthorRequests!.filter((entry) => entry.checkFailures?.length && entry.source.identity.baseCommit === run.baseCommit);
-    if (measured.length) {
-      const proofs = this.leafProgressProofs(run, run.baseCommit!);
-      const normalize = (head: string) => proofs.length
-        ? this.git.normalizeLeafProgressHistoryTree(head, run.baseCommit!, proofs) : this.git.tree(head);
-      const outputTree = await normalize(output.head);
-      for (const { source } of measured) {
-        const receipt = source.step === "done" ? source.evaluation : undefined;
-        if (source.step !== "done" || source.outcome !== "completed" || !receipt || !("id" in receipt) ||
-          receipt.purpose !== "delivery" || receipt.agentRunId !== run.id ||
-          receipt.identity.baseCommit !== source.identity.baseCommit || receipt.identity.evaluationFingerprint !== source.identity.evaluationFingerprint) {
-          throw new Error("The retained required-check source lost its completed delivery identity.");
-        }
-        verifyRecordedLeafReceipt(this.store.get(), receipt);
-        const sourceTree = await normalize(source.head);
-        if (!outputTree || !sourceTree || await this.git.tree(receipt.identity.candidateCommit) !== receipt.candidateTree ||
-          await normalize(receipt.identity.candidateCommit) !== sourceTree) {
-          throw new Error("The retained required-check source lost its exact measured-tree proof.");
-        }
-        if (outputTree === sourceTree) throw new Error("Re-author output matches an already measured required-check source tree; it remains held without new samples.");
-      }
-    }
+    await this.assertReauthorTreeChanged(run, output.head);
     await this.assertLeafCheckpoint(run, claim, false, output.head, true);
     return this.updateLeafOwner(run, claim, (current) => { current.reauthorRequests!.at(-1)!.releasedAt = now(); });
   }
@@ -3541,6 +3671,7 @@ export class Orchestrator {
     let run = state.agentRuns.find((item) => item.id === runId)!;
     const idea = run ? state.ideas.find((item) => item.id === run.ideaId) : undefined;
     let worktree = run?.worktree ?? "";
+    let preparedReauthor: Awaited<ReturnType<Orchestrator["prepareReauthorContinuation"]>> | undefined;
     const bounded = () => Boolean(reauthorInput || heldReauthorRequest(this.store.get().agentRuns.find((item) => item.id === runId)));
     try {
       this.assertAgentClaim(claim, runId);
@@ -3570,7 +3701,11 @@ export class Orchestrator {
         if (hadDeliveryPublication && run.continuation?.step === "done") return run;
       } else {
         await this.assertLeafRemote(run, claim);
-        await this.git.assertWorktree(run.worktree, run.branch);
+        if (reauthorInput && !run.reauthorRequests?.some((request) => request.id === reauthorInput.requestId)) {
+          preparedReauthor = await this.prepareReauthorContinuation(run, claim, reauthorInput);
+        }
+        // Only a freshly proved settled source may recreate a normally cleaned-up checkout.
+        if (preparedReauthor?.reauthorRequest.source.step !== "done") await this.git.assertWorktree(run.worktree, run.branch);
       }
       state = this.store.get();
       if (!bounded() && !canRetryAgent(run)) return run;
@@ -3591,7 +3726,8 @@ export class Orchestrator {
       lease ??= await this.locks.tryAcquireAll(run.resources, `${run.id}-retry`);
       if (!lease) throw new Error("A required resource is currently locked.");
       const gitLock = await this.locks.acquire("git-metadata", `${run.id}-retry-worktree`);
-      try { worktree = await this.leafWorktree(run, claim, run.id, optionsAdmission.initialRetention); }
+      try { worktree = await this.leafWorktree(run, claim, run.id, optionsAdmission.initialRetention,
+        preparedReauthor?.reauthorRequest.source.step === "done"); }
       finally { await gitLock.release(); }
       if (run.continuation?.step === "progress") {
         if (worktree !== run.worktree) run = await this.transitionLeaf(run, claim, run.continuation, { worktree });
@@ -3603,7 +3739,7 @@ export class Orchestrator {
         await this.assertLeafCheckpoint(run, claim, false, run.continuation!.head, true);
         return run;
       }
-      const admission = await this.admitLeafContinuation(run, worktree, options, claim, reauthorInput);
+      const admission = await this.admitLeafContinuation(run, worktree, options, claim, reauthorInput, preparedReauthor);
       const cursor = admission.continuation;
       const resumeDelivery = cursor.step === "delivery";
       const baseline = run.parentCompositeId
@@ -6859,8 +6995,10 @@ export class Orchestrator {
           if (!held || held.id !== cursor.reason.requestId || !run.authorThreadId) throw new Error("The operator author request lost its owned session.");
           const full = held.assessment ? fullAssessmentForIdentity(run, held.assessment) : undefined;
           if (held.assessment && (!full || !this.completeFullFeedback(full, live))) throw new Error("The operator request's recorded historical feedback is no longer authoritative.");
+          const delivery = this.reauthorDeliverySources(run).find(({ request }) => request.id === held.id);
           result = await this.codex.reauthor(run.worktree, run.authorThreadId, this.leafTaskScope(run, idea.description), live.settings,
-            full ? this.evaluationRepairFeedback(full) : undefined);
+            full ? this.evaluationRepairFeedback(full)
+              : !held.checkFailures && delivery?.rejected ? this.ordinaryDeliveryFeedback(delivery.receipt) : undefined);
         } else {
           if (!run.authorThreadId) throw new Error("A revision must reuse its existing author session.");
           let feedback: ReviewResult;

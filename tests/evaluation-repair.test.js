@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
@@ -71,6 +71,7 @@ async function fixture(t, { rounds = 9, limit = 12 } = {}) {
     head: async () => world.head,
     tree: async (commit) => trees.get(commit) ?? world.tree,
     assertWorktree: async () => undefined,
+    assertLeafWorktreeIdle: async () => undefined,
     hasChanges: async () => world.dirty,
     createExistingWorktree: async () => root,
     commit: async () => { const parent = world.head; world.head = `repaired-${++world.commits}`; world.dirty = false; trees.set(world.head, world.tree); parents.set(world.head, parent); calls.push("commit"); return world.head; },
@@ -624,15 +625,36 @@ function reauthorRelease(f) {
   return { continueReauthor: { requestId: request.id, ...request.output } };
 }
 
+async function canonicalCompletedFixtureCheckout(f) {
+  if (f.run().worktree !== f.root) return;
+  const worktree = join(f.root, ".burner", "worktrees", "agent");
+  await mkdir(worktree, { recursive: true });
+  await f.store.update((state) => { state.agentRuns[0].worktree = worktree; });
+  f.orchestrator.git.createExistingWorktree = async () => worktree;
+}
+
+// Arrange an already-completed checkpoint/cache at a remembered source tree.
+// Public restoration normally stops earlier; this independently probes the
+// full-cache and merge boundaries against a stale persisted completed result.
+async function restoreCompletedFixtureResult(f, source, requests) {
+  await f.store.update((state) => {
+    state.agentRuns[0] = { ...structuredClone(source), reauthorRequests: structuredClone(requests) };
+  });
+  const fields = source.leafPr.known.fields;
+  Object.assign(f.world, { head: source.continuation.head, tree: f.trees.get(source.continuation.head), dirty: false,
+    remoteHead: source.continuation.head, remoteTitle: fields.title, remoteBody: fields.body,
+    remoteDraft: fields.isDraft, remoteState: fields.state });
+}
+
 // Reach the newly supported source through the public workflow, including a
 // released earlier request whose requirements must remain historical afterward.
-async function completedReauthorFixture(t, { qualify = true, configure } = {}) {
+async function completedReauthorFixture(t, { qualify = true, score = 67, configure } = {}) {
   const f = await reauthorFixture(t);
   if (configure) await configure(f);
   f.priorInput = reauthorInput(f, "earlier-released-request", "Earlier requirements: preserve the previous implementation approach.");
   await f.orchestrator.reauthorAgent("agent", f.priorInput);
   f.priorRelease = reauthorRelease(f);
-  f.world.score = 67;
+  f.world.score = score;
   const delivered = await f.orchestrator.retryAgent("agent", f.priorRelease);
   assert.equal(delivered.status, "completed", delivered.error);
   assert.equal(delivered.continuation.step, "done");
@@ -646,14 +668,15 @@ async function completedReauthorFixture(t, { qualify = true, configure } = {}) {
   assert.equal(f.run().reviewApproved, true);
   assert.ok(f.run().reauthorRequests[0].releasedAt);
   assert.equal(f.run().fullEvaluation, undefined);
+  await canonicalCompletedFixtureCheckout(f);
   f.calls.length = 0;
   return f;
 }
 
 // The completed modern delivery comes from public author/release operations;
 // only full history and the external CI observation vary.
-async function completedCheckReauthorFixture(t, { history = "older", health = "completed", configure } = {}) {
-  const f = await completedReauthorFixture(t, { qualify: history === "current", configure });
+async function completedCheckReauthorFixture(t, { history = "older", health = "completed", score = 67, configure } = {}) {
+  const f = await completedReauthorFixture(t, { qualify: history === "current", score, configure });
   await f.store.update((state) => {
     const run = state.agentRuns[0];
     run.status = health;
@@ -685,6 +708,17 @@ async function completedCheckReauthorFixture(t, { history = "older", health = "c
   const observe = f.orchestrator.git.getPullRequest;
   f.orchestrator.git.getPullRequest = async (...args) => ({ ...await observe(...args), statusCheckRollup: structuredClone(f.checks) });
   f.calls.length = 0;
+  return f;
+}
+
+// No full-purpose cohort or CI cause is needed to produce this ordinary
+// source. Its typed receipt and approval are written by the public pipeline.
+async function completedOrdinaryReauthorFixture(t, { configure, ...options } = {}) {
+  const f = await completedCheckReauthorFixture(t, { history: "none", ...options, configure: async (fixture) => {
+    await fixture.store.update((state) => { state.agentRuns[0].fullEvaluationHistory = []; });
+    if (configure) await configure(fixture);
+  } });
+  f.checks = [];
   return f;
 }
 
@@ -998,19 +1032,26 @@ test("public reauthor refuses awaited author identity drift without cleanup, pub
   });
 });
 
-test("public reauthor durable cuts resume only their saved author or commit successor after reload", async (t) => {
+for (const sourceKind of ["stopped-review", "ordinary-negative"]) test(`public reauthor ${sourceKind} durable cuts resume only their saved author or commit successor after reload`, async (t) => {
   for (const cut of ["before-admission", "after-admission", "session-checkpoint", "before-author-receipt", "after-author-receipt",
     "after-git-commit", "before-output", "after-output"]) await t.test(cut, async (t) => {
     for (const replay of ["same-request", "bare-retry"]) await t.test(replay, async (t) => {
-      const f = await reauthorFixture(t);
+      const f = sourceKind === "stopped-review" ? await reauthorFixture(t) : await completedOrdinaryReauthorFixture(t);
       const input = reauthorInput(f);
       const initialSource = f.run().continuation;
+      const previousRequests = f.run().reauthorRequests ?? [], previousRounds = f.run().reviewRounds.length, previousCommits = f.world.commits;
+      const rows = f.store.get().evaluationRuns;
+      const outputSnapshots = [];
+      const recordOutput = (state) => {
+        const run = state.agentRuns[0], request = run.reauthorRequests?.at(-1);
+        if (request?.id === input.requestId && request.output) outputSnapshots.push(structuredClone({ cursor: run.continuation, output: request.output }));
+      };
       let cutReached = false;
       const matches = (state) => {
         const run = state.agentRuns[0], cursor = run.continuation;
         if (cut.endsWith("admission")) return cursor?.step === "author" && cursor.reason.kind === "operator";
         if (cut.endsWith("author-receipt")) return cursor?.step === "commit" && cursor.source.kind === "author" && cursor.source.reason.kind === "operator";
-        if (cut.endsWith("output")) return Boolean(run.reauthorRequests?.at(-1)?.output);
+        if (cut.endsWith("output")) return run.reauthorRequests?.at(-1)?.id === input.requestId && Boolean(run.reauthorRequests.at(-1).output);
         return false;
       };
       const update = f.store.update.bind(f.store);
@@ -1019,11 +1060,7 @@ test("public reauthor durable cuts resume only their saved author or commit succ
         if (!cutReached && matches(draft)) { cutReached = true; throw new Error(`Injected ${cut}`); }
       });
       const unsubscribe = f.store.subscribe((state) => {
-        const request = state.agentRuns[0].reauthorRequests?.at(-1);
-        if (request?.output) {
-          assert.equal(state.agentRuns[0].continuation.step, "evidence", "output and successor are one durable write");
-          assert.deepEqual(request.output, { continuationId: state.agentRuns[0].continuation.id, head: state.agentRuns[0].continuation.head });
-        }
+        recordOutput(state);
         if (!cutReached && cut.startsWith("after-") && matches(state)) { cutReached = true; throw new Error(`Injected ${cut}`); }
       });
       const finalize = f.orchestrator.git.finalizeLeafCommit;
@@ -1034,7 +1071,7 @@ test("public reauthor durable cuts resume only their saved author or commit succ
       };
       const author = f.orchestrator.codex.reauthor;
       if (cut === "session-checkpoint") f.orchestrator.codex.reauthor = async (...args) => {
-        await f.orchestrator.checkpointAuthorSession(f.root, "resumed-author");
+        await f.orchestrator.checkpointAuthorSession(f.run().worktree, "resumed-author");
         const result = await author(...args);
         if (!cutReached) { cutReached = true; throw new Error("Injected session response interruption"); }
         return { ...result, threadId: "resumed-author" };
@@ -1046,34 +1083,46 @@ test("public reauthor durable cuts resume only their saved author or commit succ
       unsubscribe();
       if (cut === "before-admission") {
         assert.deepEqual(f.run().continuation, initialSource);
-        assert.equal(f.run().reauthorRequests, undefined);
+        assert.deepEqual(f.run().reauthorRequests ?? [], previousRequests);
         assert.equal(f.calls.filter((call) => call.reauthor).length, 0);
       } else {
-        assert.equal(f.run().reauthorRequests.length, 1);
-        assert.equal(f.run().reauthorRequests[0].id, input.requestId);
+        assert.equal(f.run().reauthorRequests.length, previousRequests.length + 1);
+        assert.equal(f.run().reauthorRequests.at(-1).id, input.requestId);
+        assert.deepEqual(f.run().reauthorRequests.at(-1).source, initialSource);
       }
       if (["before-author-receipt", "session-checkpoint"].includes(cut)) {
-        assert.equal(f.run().reauthorRequests[0].output, undefined, "an unacknowledged author response is not exactly-once completion");
+        assert.equal(f.run().reauthorRequests.at(-1).output, undefined, "an unacknowledged author response is not exactly-once completion");
         assert.equal(f.world.dirty, true, "partial authored files are retained");
       }
       if (cut === "after-git-commit") {
         assert.equal(initial.status, "failed");
         assert.equal(initial.continuation.step, "commit");
-        assert.equal(f.world.head, "repaired-1");
+        assert.notEqual(f.world.head, initialSource.head);
+        assert.equal(f.world.commits, previousCommits + 1);
       }
       await restart(f);
+      const unsubscribeRecovered = f.store.subscribe(recordOutput);
+      t.after(unsubscribeRecovered);
       // No durable admission means a bare retry is still the original workflow;
       // only the explicit operation may admit this request after that cut.
       const result = replay === "same-request" || cut === "before-admission"
         ? await f.orchestrator.reauthorAgent("agent", input)
         : await f.orchestrator.retryAgent("agent");
+      unsubscribeRecovered();
+      assert.ok(outputSnapshots.length > 0, "at least one durable output transition must be observed");
+      for (const { cursor, output } of outputSnapshots) {
+        assert.equal(cursor.step, "evidence", "output and successor are one durable write");
+        assert.deepEqual(output, { continuationId: cursor.id, head: cursor.head });
+      }
       assert.equal(result.status, "failed");
       assert.equal(result.continuation.step, "evidence", result.error);
-      assert.deepEqual(result.reauthorRequests[0].output, { continuationId: result.continuation.id, head: result.continuation.head });
+      assert.deepEqual(result.reauthorRequests.at(-1).output, { continuationId: result.continuation.id, head: result.continuation.head });
+      assert.deepEqual(result.reauthorRequests.slice(0, -1), previousRequests);
       assert.equal(f.calls.filter((call) => call.reauthor).length, ["before-author-receipt", "session-checkpoint"].includes(cut) ? 2 : 1,
         "only a response never saved in a commit receipt may require another author turn");
-      assert.equal(f.world.commits, 1);
-      assert.equal(f.run().reviewRounds.length, 5);
+      assert.equal(f.world.commits, previousCommits + 1);
+      assert.equal(f.run().reviewRounds.length, previousRounds);
+      assert.deepEqual(f.store.get().evaluationRuns, rows);
       assertNoReauthorEffects(f);
       assert.deepEqual(await f.orchestrator.locks.list(), []);
     });
@@ -1290,9 +1339,10 @@ test("public reauthor released no-op output survives stale-base PR synchronizati
   assertNoReauthorEffects(f);
 });
 
-test("public reauthor release is durable before downstream work and replay never repeats the author", async (t) => {
+for (const sourceKind of ["stopped-review", "ordinary-negative"]) test(`public reauthor ${sourceKind} release is durable before downstream work and replay never repeats the author`, async (t) => {
   for (const cut of ["before-release", "after-release", "downstream-evidence"]) await t.test(cut, async (t) => {
-    const f = await reauthorFixture(t);
+    const f = sourceKind === "stopped-review" ? await reauthorFixture(t) : await completedOrdinaryReauthorFixture(t);
+    const previousRounds = f.run().reviewRounds.length;
     const input = reauthorInput(f);
     await f.orchestrator.reauthorAgent("agent", input);
     const release = reauthorRelease(f);
@@ -1300,14 +1350,14 @@ test("public reauthor release is durable before downstream work and replay never
     const update = f.store.update.bind(f.store);
     if (cut === "before-release") f.store.update = (mutator) => update((draft) => {
       mutator(draft);
-      if (!failed && draft.agentRuns[0].reauthorRequests[0].releasedAt) { failed = true; throw new Error("Injected release write failure"); }
+      if (!failed && draft.agentRuns[0].reauthorRequests.at(-1).releasedAt) { failed = true; throw new Error("Injected release write failure"); }
     });
     const unsubscribe = f.store.subscribe((state) => {
-      if (!failed && cut === "after-release" && state.agentRuns[0].reauthorRequests[0].releasedAt) { failed = true; throw new Error("Injected release listener failure"); }
+      if (!failed && cut === "after-release" && state.agentRuns[0].reauthorRequests.at(-1).releasedAt) { failed = true; throw new Error("Injected release listener failure"); }
     });
     const evidence = f.orchestrator.codex.refreshAgentEvidence;
     f.orchestrator.codex.refreshAgentEvidence = async (...args) => {
-      assert.ok(f.run().reauthorRequests[0].releasedAt, "release must be saved before evidence starts");
+      assert.ok(f.run().reauthorRequests.at(-1).releasedAt, "release must be saved before evidence starts");
       if (!failed && cut === "downstream-evidence") { failed = true; throw new Error("Injected evidence failure"); }
       return evidence(...args);
     };
@@ -1316,9 +1366,9 @@ test("public reauthor release is durable before downstream work and replay never
     assert.equal(failed, true);
     unsubscribe();
     if (cut === "before-release") {
-      assert.equal(f.run().reauthorRequests[0].releasedAt, undefined);
+      assert.equal(f.run().reauthorRequests.at(-1).releasedAt, undefined);
       assertNoReauthorEffects(f);
-    } else assert.ok(f.run().reauthorRequests[0].releasedAt);
+    } else assert.ok(f.run().reauthorRequests.at(-1).releasedAt);
     f.orchestrator.codex.refreshAgentEvidence = evidence;
     await restart(f);
     if (f.run().continuation.step !== "done") await f.orchestrator.retryAgent("agent", release);
@@ -1331,8 +1381,8 @@ test("public reauthor release is durable before downstream work and replay never
     assert.equal(f.calls.filter((call) => call.reauthor).length, 1);
     assert.equal(f.calls.filter((call) => call === "evidence").length, 1);
     assert.equal(f.calls.filter((call) => call === "review").length, 1);
-    assert.equal(f.run().reviewRounds.length, 6);
-    assert.deepEqual(f.run().reauthorRequests[0].output, release.continueReauthor && {
+    assert.equal(f.run().reviewRounds.length, previousRounds + 1);
+    assert.deepEqual(f.run().reauthorRequests.at(-1).output, release.continueReauthor && {
       continuationId: release.continueReauthor.continuationId, head: release.continueReauthor.head });
   });
 });
@@ -1682,7 +1732,7 @@ test("completed full rejection admits new requirements with immutable history, h
   assert.deepEqual(await f.orchestrator.locks.list(), []);
 });
 
-test("completed full rejection no-op release cannot buy evidence, review or score samples", async (t) => {
+test("completed typed full-owned no-op output stays held before evidence, review or score samples", async (t) => {
   const f = await completedReauthorFixture(t);
   const before = f.run(), rows = f.store.get().evaluationRuns;
   const input = reauthorInput(f, "completed-no-op", "Inspect a possible replacement without changing evaluator contracts.");
@@ -1696,14 +1746,12 @@ test("completed full rejection no-op release cannot buy evidence, review or scor
   assert.equal(f.calls.includes("commit"), false);
   assertNoReauthorEffects(f);
   const release = reauthorRelease(f);
-  const released = await f.orchestrator.retryAgent("agent", release);
-  assert.equal(released.status, "failed");
-  assert.equal(released.continuation.step, "evidence");
-  assert.match(released.error, /rejected tree unchanged/);
-  assert.ok(released.reauthorRequests[1].releasedAt);
+  await assert.rejects(f.orchestrator.retryAgent("agent", release), /already measured.*source|measured.*tree/);
+  assert.deepEqual(f.run(), held, "a typed full-owned delivery is still a measured release source");
+  assert.equal(f.run().reauthorRequests[1].releasedAt, undefined);
   await restart(f);
   await f.orchestrator.reauthorAgent("agent", input);
-  await f.orchestrator.retryAgent("agent", release);
+  await assert.rejects(f.orchestrator.retryAgent("agent", release), /already measured.*source|measured.*tree/);
   await f.orchestrator.retryAgent("agent");
   assert.equal(await f.orchestrator.fullyValidateLeafForMerge("agent", "base"), false);
   assert.deepEqual(f.run().reviewRounds, before.reviewRounds);
@@ -1721,7 +1769,7 @@ test("completed full rejection reauthor refuses stale, incomplete or competing a
     ["stale continuation", (_f, input) => { input.expectedContinuationId = "old-done"; }],
     ["stale input", (_f, input) => { input.expectedHead = "old-head"; }],
     ["stale published head", (_f, input) => { input.expectedPublishedHead = "old-published-head"; }],
-    ["missing full assessment", changeRun((run) => { run.fullEvaluationHistory = []; })],
+    ["missing full assessment for separate-full delivery", changeRun((run) => { run.fullEvaluationHistory = []; run.leafQualificationPolicy = "separate-full"; })],
     ["stale full assessment", changeRun((run) => { run.fullEvaluationHistory.pop(); })],
     ["positive assessment", changeFull((full) => { full.qualified = true; })],
     ["incomplete assessment", changeFull((full) => { delete full.completedAt; })],
@@ -1779,12 +1827,11 @@ test("completed full rejection reauthor rechecks late asynchronous identity, own
   for (const mutation of ["source", "review", "assessment", "policy", "budget", "base", "head", "remote", "pending-owner"]) await t.test(mutation, async (t) => {
     const f = await completedReauthorFixture(t);
     const before = f.run(), input = reauthorInput(f, "late-completed-request");
-    const assessedHead = latestFullAssessment(before).candidateCommit;
-    const tree = f.orchestrator.git.tree;
+    const checkWorktree = f.orchestrator.git.assertWorktree;
     let changed = false;
-    f.orchestrator.git.tree = async (commit) => {
-      const result = await tree(commit);
-      if (!changed && commit === assessedHead && f.calls.includes("lease")) {
+    f.orchestrator.git.assertWorktree = async (...args) => {
+      const result = await checkWorktree(...args);
+      if (!changed && f.calls.includes("lease")) {
         changed = true;
         if (mutation === "remote") f.world.remoteHead = "foreign-head";
         else if (mutation === "head") f.world.head = "foreign-head";
@@ -1830,9 +1877,17 @@ test("completed full rejection late required checks revoke new score-repair admi
     };
     f.orchestrator.git.tree = async (commit) => {
       const result = await tree(commit);
-      if (commit === assessedHead && f.calls.includes("lease")) checksFailed = true;
+      if (admission !== "reauthor" && commit === assessedHead && f.calls.includes("lease")) checksFailed = true;
       return result;
     };
+    if (admission === "reauthor") {
+      const checkWorktree = f.orchestrator.git.assertWorktree;
+      f.orchestrator.git.assertWorktree = async (...args) => {
+        const result = await checkWorktree(...args);
+        if (f.calls.includes("lease")) checksFailed = true;
+        return result;
+      };
+    }
     await assert.rejects(admission === "reauthor" ? f.orchestrator.reauthorAgent("agent", input) : f.orchestrator.retryAgent("agent"),
       /Required checks failed during evaluation-repair preparation/);
     assert.equal(checksFailed, true);
@@ -1913,6 +1968,283 @@ test("completed full rejection with failed checks supports bounded reauthor whil
   });
 });
 
+test("ordinary negative delivery admits one same-PR author without a full cohort and resumes only after exact release", async (t) => {
+  const f = await completedOrdinaryReauthorFixture(t);
+  const before = f.run(), rows = f.store.get().evaluationRuns, definitions = f.store.get().evaluations;
+  const measurements = f.world.measurements, guidance = "Replace the implementation while preserving every supported output and evaluator contract.";
+  const input = reauthorInput(f, "ordinary-negative-follow-up", guidance);
+  assert.equal(latestFullAssessment(before), undefined);
+  assert.equal(before.continuation.evaluation.purpose, "delivery");
+  assert.equal(before.continuation.evaluation.result.impact, -3);
+  assert.equal(canRetryAgent(before), false, "the new authority is explicit reauthor, not ordinary retry");
+  const held = await f.orchestrator.reauthorAgent("agent", input);
+  assert.equal(held.continuation.step, "evidence", held.error);
+  const request = held.reauthorRequests.at(-1);
+  assert.deepEqual(request.source, before.continuation);
+  assert.equal(request.assessment, undefined, "ordinary delivery is never relabeled as a full assessment");
+  assert.equal(request.checkFailures, undefined, "ordinary delivery is not fictional CI feedback");
+  assert.equal(request.releasedAt, undefined);
+  assert.deepEqual(request.output, { continuationId: held.continuation.id, head: held.continuation.head });
+  assert.equal(f.parents.get(held.continuation.head), before.continuation.head);
+  assert.equal(held.reviewApproved, false);
+  for (const key of ["id", "branch", "baseCommit", "authorThreadId", "prNumber", "prUrl", "prState", "leafPr",
+    "reviewRounds", "fullEvaluationHistory", "deltas", "impact", "worktree", "resources"]) assert.deepEqual(held[key], before[key], key);
+  assert.deepEqual(held.reauthorRequests.slice(0, -1), before.reauthorRequests);
+  assert.deepEqual(f.store.get().evaluationRuns, rows);
+  assert.deepEqual(f.store.get().evaluations, definitions);
+  assert.equal(f.world.measurements, measurements);
+  assert.equal(f.world.remoteHead, before.continuation.head);
+  const authors = f.calls.filter((call) => call.reauthor);
+  assert.equal(authors.length, 1);
+  assert.equal(authors[0].reauthor.thread, before.authorThreadId);
+  assert.ok(authors[0].reauthor.guidance.includes(guidance));
+  const feedback = authors[0].reauthor.historicalFeedback;
+  assert.match(feedback.summary, /ordinary.*delivery/i);
+  assert.ok(feedback.summary.includes(before.continuation.evaluation.identity.candidateCommit));
+  assert.ok(feedback.summary.includes(before.baseCommit));
+  assert.ok(JSON.stringify(feedback).includes("70 -> 67"));
+  assertNoReauthorEffects(f);
+  const release = reauthorRelease(f);
+  await restart(f);
+  await f.orchestrator.reauthorAgent("agent", input);
+  await f.orchestrator.retryAgent("agent");
+  assert.deepEqual(f.run(), held);
+  await assert.rejects(f.orchestrator.reauthorAgent("agent", { ...input, guidance: "Conflicting request identity" }));
+  for (const key of ["requestId", "continuationId", "head"]) {
+    await assert.rejects(f.orchestrator.retryAgent("agent", { continueReauthor: { ...release.continueReauthor, [key]: "foreign" } }));
+  }
+  assert.equal(await f.orchestrator.fullyValidateLeafForMerge("agent", "base"), false);
+  assert.deepEqual(f.run(), held);
+  assertNoReauthorEffects(f);
+  const evidence = f.orchestrator.codex.refreshAgentEvidence;
+  f.orchestrator.codex.refreshAgentEvidence = async (...args) => {
+    assert.ok(f.run().reauthorRequests.at(-1).releasedAt, "release must be durable before evidence");
+    assert.ok(args[6].includes(guidance));
+    return evidence(...args);
+  };
+  f.world.score = 71;
+  const delivered = await f.orchestrator.retryAgent("agent", release);
+  assert.equal(delivered.status, "completed", delivered.error);
+  assert.equal(delivered.continuation.step, "done");
+  assert.equal(delivered.reviewRounds.length, before.reviewRounds.length + 1);
+  assert.deepEqual(delivered.reviewRounds.slice(0, -1), before.reviewRounds);
+  assert.equal(delivered.reviewRounds.at(-1).round, before.reviewRounds.length + 1);
+  assert.deepEqual(delivered.reauthorRequests.at(-1).source, before.continuation);
+  assert.deepEqual(delivered.reauthorRequests.at(-1).output, request.output);
+  assert.equal(latestFullAssessment(delivered), undefined);
+  assert.equal(delivered.prNumber, before.prNumber);
+  assert.equal(delivered.authorThreadId, before.authorThreadId);
+  assert.equal(f.world.measurements, measurements + 1, "only the explicitly released changed delivery is measured");
+  assert.deepEqual(f.calls.filter((call) => ["evidence", "review", "evaluate"].includes(call)), ["evidence", "review", "evaluate"]);
+  for (const row of rows) assert.deepEqual(f.store.get().evaluationRuns.find((saved) => saved.id === row.id), row);
+  const effects = [...f.calls];
+  await restart(f);
+  await f.orchestrator.reauthorAgent("agent", input);
+  await f.orchestrator.retryAgent("agent", release);
+  assert.deepEqual(f.run(), delivered);
+  assert.deepEqual(f.calls, effects, "completed replay neither reauthors nor measures");
+  assert.deepEqual(await f.orchestrator.locks.list(), []);
+});
+
+test("ordinary delivery admission uses threshold and both prompt and command regression vetoes", async (t) => {
+  for (const cause of ["below threshold", "prompt regression", "command regression"]) await t.test(cause, async (t) => {
+    const scores = cause === "below threshold" ? { gain: 70.5 } : { gain: 76, regression: 69 };
+    const f = await completedOrdinaryReauthorFixture(t, { configure: async (fixture) => {
+      await fixture.store.update((state) => {
+        state.settings.compositeAbsorbThreshold = 1;
+        state.evaluations = Object.keys(scores).map((id) => ({ id, name: id, prompt: "Frozen scoring contract",
+          ...((cause === "command regression" ? id === "regression" : id === "gain") ? { command: "fixture-command" } : {}),
+          definitionVersion: "v1", weight: 1, enabled: true, createdAt: timestamp }));
+        state.evaluationRuns = state.evaluations.map((evaluation) => ({ id: `baseline-${evaluation.id}`, evaluationId: evaluation.id,
+          score: 70, summary: "Frozen baseline", commit: "base", context: "baseline", status: "completed", durationMs: 1,
+          createdAt: timestamp, evaluationDefinitionVersion: "v1", ...(!evaluation.command ? { promptSampleCount: 3 } : {}) }));
+        const run = state.agentRuns[0];
+        for (const round of run.reviewRounds) round.evaluationFingerprint = fullMergeValidationFingerprint(state);
+        run.continuation.identity = fixture.orchestrator.continuationIdentity(run, state, { number: 42, headRefOid: "rejected", url: run.prUrl });
+      });
+      fixture.orchestrator.codex.evaluate = async (_cwd, evaluation, _settings, context) => {
+        fixture.calls.push("evaluate"); fixture.world.measurements += 1;
+        return { score: context === "baseline" ? 70 : scores[evaluation.id], summary: `Measured ${evaluation.id}`, evidence: [], suggestions: [] };
+      };
+    } });
+    const before = f.run(), receipt = before.continuation.evaluation, rows = f.store.get().evaluationRuns, count = f.world.measurements;
+    if (cause === "below threshold") {
+      assert.ok(receipt.result.deltas.every((delta) => delta.delta >= 0));
+      assert.equal(receipt.result.impact, 0.5);
+    } else {
+      assert.ok(receipt.result.impact > 1, "aggregate improvement alone must not erase a regression veto");
+      assert.equal(receipt.result.deltas.find((delta) => delta.evaluationId === "regression").delta, -1);
+      assert.equal(receipt.evaluations.find((entry) => entry.evaluationId === "regression").mode,
+        cause === "prompt regression" ? "prompt" : "full-command");
+    }
+    const held = await f.orchestrator.reauthorAgent("agent", reauthorInput(f, `negative-${cause.replaceAll(" ", "-")}`));
+    assert.equal(held.continuation.step, "evidence", held.error);
+    assert.deepEqual(held.reauthorRequests.at(-1).source, before.continuation);
+    assert.equal(held.reauthorRequests.at(-1).assessment, undefined);
+    assert.equal(held.reauthorRequests.at(-1).checkFailures, undefined);
+    assert.equal(latestFullAssessment(held), undefined);
+    assert.equal(f.world.measurements, count);
+    assert.deepEqual(f.store.get().evaluationRuns, rows);
+    assertNoReauthorEffects(f);
+  });
+});
+
+test("ordinary-negative fallback refuses positive, unknown-origin, separate-full, screened and empty-registry sources", async (t) => {
+  for (const refusal of ["positive", "unknown origin", "separate-full", "screened", "empty registry"]) await t.test(refusal, async (t) => {
+    const f = await completedOrdinaryReauthorFixture(t, { score: refusal === "positive" ? 71 : 67, configure: async (fixture) => {
+      if (refusal !== "screened") return;
+      await fixture.store.update((state) => {
+        const run = state.agentRuns[0];
+        if (refusal === "screened") {
+          run.leafQualificationPolicy = "separate-full";
+          state.evaluations[0].screeningCommand = "fixture-screening-command";
+        }
+        for (const round of run.reviewRounds) round.evaluationFingerprint = fullMergeValidationFingerprint(state);
+        run.continuation.identity = fixture.orchestrator.continuationIdentity(run, state, { number: 42, headRefOid: "rejected", url: run.prUrl });
+      });
+    } });
+    await f.store.update((state) => {
+      if (refusal === "unknown origin") delete state.agentRuns[0].leafQualificationPolicy;
+      if (refusal === "separate-full") state.agentRuns[0].leafQualificationPolicy = "separate-full";
+      if (refusal === "screened") state.agentRuns[0].leafQualificationPolicy = "ordinary";
+      if (refusal === "empty registry") {
+        // There is no finite weighted reduction for zero definitions. Preserve
+        // the real completed owner while arranging the unsupported empty contract.
+        state.evaluations = [];
+        const run = state.agentRuns[0], receipt = run.continuation.evaluation;
+        const fingerprint = fullMergeValidationFingerprint(state);
+        run.continuation.identity.evaluationFingerprint = fingerprint;
+        run.reviewRounds.at(-1).evaluationFingerprint = fingerprint;
+        receipt.identity.evaluationFingerprint = fingerprint;
+        receipt.scoreDefinitionFingerprint = "[]";
+        receipt.evaluations = [];
+        receipt.result = { ...receipt.result, sources: [], selections: [], deltas: [], impact: 0 };
+      }
+    });
+    if (refusal === "screened") {
+      assert.equal(f.run().continuation.evaluation.evaluations[0].mode, "screening-command");
+      assert.equal(f.run().continuation.evaluation.result.deltas[0].screening, true);
+    }
+    if (refusal === "empty registry") assert.deepEqual(f.run().continuation.evaluation.evaluations, []);
+    const before = f.store.get(), measurements = f.world.measurements;
+    await assert.rejects(f.orchestrator.reauthorAgent("agent", reauthorInput(f)));
+    assert.deepEqual(f.store.get(), before);
+    assert.equal(f.world.measurements, measurements);
+    assert.equal(f.calls.some((call) => call.reauthor || ["prepare", "commit"].includes(call)), false);
+    assertNoReauthorEffects(f);
+  });
+});
+
+test("ordinary negative delivery cannot bypass any existing full-assessment owner", async (t) => {
+  for (const history of ["older", "positive", "incomplete", "legacy-incomplete"]) await t.test(history, async (t) => {
+    const f = await completedCheckReauthorFixture(t, { history });
+    f.checks = [];
+    assert.ok(latestFullAssessment(f.run()));
+    assert.equal(f.run().continuation.evaluation.result.impact, -3);
+    const before = f.store.get();
+    await assert.rejects(f.orchestrator.reauthorAgent("agent", reauthorInput(f)));
+    assert.deepEqual(f.store.get(), before, "a non-current or malformed full record is not absence of full history");
+    assert.equal(f.calls.some((call) => call.reauthor || ["prepare", "commit"].includes(call)), false);
+    assertNoReauthorEffects(f);
+  });
+});
+
+test("ordinary negative admission refuses malformed present full owners before checkout or author effects", async (t) => {
+  const cases = [
+    ...[null, false, 0, "", []].map((value) => ["fullMergeValidation", value]),
+    ...[null, false, 0, "not-an-array", {}].map((value) => ["fullEvaluationHistory", value]),
+    ...[null, false, [], {}, { kind: "unknown" }, { kind: "assessment" },
+      ...[null, false, 0, "", []].map((assessment) => ({ kind: "assessment", assessment }))]
+      .map((entry) => ["fullEvaluationHistory", [entry]]),
+    ...[null, false, {}, { deltas: [], rejectedTree: "saved-source-tree" },
+      { validation: null }, { validation: false }, { validation: [] }].map((value) => ["evaluationRepair", value]),
+  ];
+  for (const [field, value] of cases) await t.test(`${field}=${JSON.stringify(value)}`, async (t) => {
+    const f = await completedOrdinaryReauthorFixture(t);
+    const corrupted = f.store.get();
+    corrupted.agentRuns[0][field] = structuredClone(value);
+    // Load damaged persisted input through the real store. Its normal writer
+    // assumes valid owner shapes while retaining nested receipt evidence.
+    await writeFile(f.store.statePath, `${JSON.stringify(corrupted)}\n`);
+    await restart(f);
+    const before = f.store.get(), persisted = await readFile(f.store.statePath, "utf8"), count = f.world.measurements;
+    assert.deepEqual(f.run()[field], value, "the malformed owner must survive fixture reload");
+    const checkouts = [];
+    for (const method of ["assertWorktree", "assertLeafWorktreeIdle", "createExistingWorktree"]) {
+      const perform = f.orchestrator.git[method];
+      f.orchestrator.git[method] = async (...args) => { checkouts.push(method); return perform(...args); };
+    }
+    await assert.rejects(f.orchestrator.reauthorAgent("agent", reauthorInput(f, "malformed-full-owner")));
+    assert.deepEqual(f.store.get(), before, "malformed history is neither absence nor authority to replace the done source");
+    assert.equal(await readFile(f.store.statePath, "utf8"), persisted);
+    assert.deepEqual(checkouts, [], "source refusal precedes checkout verification or allocation");
+    assert.equal(f.world.measurements, count);
+    assert.equal(f.calls.some((call) => call.reauthor || ["prepare", "commit"].includes(call)), false);
+    assertNoReauthorEffects(f);
+    assert.deepEqual(await f.orchestrator.locks.list(), []);
+  });
+});
+
+test("ordinary negative admission keeps absent and explicitly undefined full owners compatible", async (t) => {
+  for (const representation of ["absent", "explicit undefined", "empty history", "superseded history"]) await t.test(representation, async (t) => {
+    const f = representation === "superseded history" ? await completedReauthorFixture(t) : await completedOrdinaryReauthorFixture(t);
+    const retiredReceipt = representation === "superseded history" ? latestFullAssessment(f.run()).evaluation : undefined;
+    const fields = ["fullMergeValidation", "fullEvaluationHistory", "evaluationRepair"];
+    await f.store.update((state) => {
+      for (const field of fields) delete state.agentRuns[0][field];
+      if (representation === "empty history") state.agentRuns[0].fullEvaluationHistory = [];
+      if (retiredReceipt) state.agentRuns[0].fullEvaluationHistory = [{ kind: "superseded", evaluation: structuredClone(retiredReceipt),
+        refreshId: "fixture-retired-full", targetRef: "main", targetCommit: "base", retiredAt: retiredReceipt.result.completedAt }];
+    });
+    if (representation === "explicit undefined") {
+      // JSON omits undefined. Exercise its valid JavaScript snapshot spelling
+      // at the public store boundary without manufacturing a different record.
+      const get = f.store.get.bind(f.store);
+      f.store.get = () => {
+        const snapshot = get();
+        for (const field of fields) if (!Object.hasOwn(snapshot.agentRuns[0], field)) snapshot.agentRuns[0][field] = undefined;
+        return snapshot;
+      };
+    }
+    const before = f.run(), rows = f.store.get().evaluationRuns, count = f.world.measurements;
+    for (const field of fields) assert.equal(Object.hasOwn(before, field),
+      representation === "explicit undefined" || (["empty history", "superseded history"].includes(representation) && field === "fullEvaluationHistory"));
+    const held = await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "valid-full-absence"));
+    assert.equal(held.continuation.step, "evidence", held.error);
+    assert.deepEqual(held.reauthorRequests.at(-1).source, before.continuation);
+    assert.equal(held.reauthorRequests.at(-1).assessment, undefined);
+    assert.equal(held.reauthorRequests.at(-1).checkFailures, undefined);
+    assert.equal(held.reauthorRequests.at(-1).releasedAt, undefined);
+    assert.deepEqual(held.fullEvaluationHistory, before.fullEvaluationHistory, "a retired full receipt is not a full assessment or ordinary feedback");
+    assert.equal(f.calls.filter((call) => call.reauthor).length, 1);
+    assert.equal(f.world.measurements, count);
+    assert.deepEqual(f.store.get().evaluationRuns, rows);
+    assertNoReauthorEffects(f);
+  });
+});
+
+test("confirmed current-head CI admission remains independent of malformed unrelated full owners", async (t) => {
+  for (const field of ["fullMergeValidation", "fullEvaluationHistory"]) await t.test(field, async (t) => {
+    const f = await completedCheckReauthorFixture(t, { history: "none" });
+    const corrupted = f.store.get();
+    corrupted.agentRuns[0][field] = null;
+    await writeFile(f.store.statePath, `${JSON.stringify(corrupted)}\n`);
+    await restart(f);
+    const before = f.run(), rows = f.store.get().evaluationRuns, count = f.world.measurements;
+    const held = await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "confirmed-CI-before-full-shape"));
+    assert.equal(held.continuation.step, "evidence", held.error);
+    assert.deepEqual(held.reauthorRequests.at(-1).source, before.continuation);
+    assert.deepEqual(held.reauthorRequests.at(-1).checkFailures, ["Required documentation"]);
+    assert.equal(held.reauthorRequests.at(-1).assessment, undefined);
+    assert.equal(held[field], null, "CI author admission does not repair or reinterpret unrelated full history");
+    assert.equal(f.calls.filter((call) => call.reauthor).length, 1);
+    assert.equal(f.calls.find((call) => call.reauthor).reauthor.historicalFeedback, undefined);
+    assert.equal(f.world.measurements, count);
+    assert.deepEqual(f.store.get().evaluationRuns, rows);
+    assertNoReauthorEffects(f);
+  });
+});
+
 test("completed required-check reauthor uses current delivery rather than absent or unrelated full feedback", async (t) => {
   for (const history of ["older", "none", "positive", "incomplete", "legacy-incomplete"]) {
     for (const health of ["completed", "failed"]) await t.test(`${history}, ${health}`, async (t) => {
@@ -1980,7 +2312,7 @@ test("completed required-check reauthor refuses caller claims and every unconfir
     ["pending context", [{ __typename: "StatusContext", context: "ci", state: "PENDING" }]],
   ];
   for (const [name, checks] of observations) await t.test(name, async (t) => {
-    const f = await completedCheckReauthorFixture(t, { history: "none" });
+    const f = await completedCheckReauthorFixture(t, { history: "none", score: 71 });
     f.checks = checks;
     await f.store.update((state) => { state.agentRuns[0].error = "Caller says a required check failed"; });
     const before = f.store.get();
@@ -2006,10 +2338,11 @@ test("completed required-check reauthor refuses caller claims and every unconfir
   });
 });
 
-test("completed required-check failed-health source cannot fall back to a current full rejection after CI clears", async (t) => {
-  const f = await completedCheckReauthorFixture(t, { history: "current", health: "failed" });
+for (const history of ["current", "none"]) test(`completed required-check failed-health source with ${history} full history cannot fall back after CI clears`, async (t) => {
+  const f = await completedCheckReauthorFixture(t, { history, health: "failed" });
   f.checks = [];
-  assert.equal(latestFullAssessment(f.run()).qualified, false);
+  if (history === "current") assert.equal(latestFullAssessment(f.run()).qualified, false);
+  else assert.equal(f.run().continuation.evaluation.result.impact, -3);
   const before = f.store.get();
   await assert.rejects(f.orchestrator.reauthorAgent("agent", reauthorInput(f)), /failed-health.*confirmed/);
   assert.deepEqual(f.store.get(), before);
@@ -2017,7 +2350,7 @@ test("completed required-check failed-health source cannot fall back to a curren
   assertNoReauthorEffects(f);
 });
 
-test("completed required-check admission rejects inexact delivery, approval and owner before author effects", async (t) => {
+for (const cause of ["required-check", "ordinary-negative"]) test(`completed ${cause} admission rejects inexact delivery, approval and owner before author effects`, async (t) => {
   const changeRun = (mutate) => (f) => f.store.update((state) => mutate(state.agentRuns[0], state));
   const changeReceipt = (mutate) => changeRun((run) => mutate(run.continuation.evaluation));
   const cases = [
@@ -2036,6 +2369,15 @@ test("completed required-check admission rejects inexact delivery, approval and 
     ["receipt policy", changeReceipt((receipt) => { receipt.identity.evaluationFingerprint = "foreign"; })],
     ["receipt score policy", changeReceipt((receipt) => { receipt.scoreDefinitionFingerprint = "foreign"; })],
     ["receipt approval", changeReceipt((receipt) => { receipt.approvalRoundId = "foreign"; })],
+    ["duplicate linked approval", changeRun((run) => { run.reviewRounds.push(structuredClone(run.reviewRounds.at(-1))); })],
+    ["approval completed after measured result", changeRun((run) => {
+      const resultTime = Date.parse(run.continuation.evaluation.result.completedAt);
+      run.reviewRounds.at(-1).completedAt = new Date(resultTime + 1000).toISOString();
+      run.continuation.completedAt = new Date(resultTime + 2000).toISOString();
+    })],
+    ["measured result completed after done", changeRun((run) => {
+      run.continuation.evaluation.result.completedAt = new Date(Date.parse(run.continuation.completedAt) + 1000).toISOString();
+    })],
     ["receipt tree", changeReceipt((receipt) => { receipt.candidateTree = "foreign-tree"; })],
     ["receipt raw source", changeRun((run, state) => {
       const id = run.continuation.evaluation.result.selections[0].candidate;
@@ -2066,7 +2408,7 @@ test("completed required-check admission rejects inexact delivery, approval and 
     ["lease contention", (f) => { f.orchestrator.locks.tryAcquireAll = async () => undefined; }],
   ];
   for (const [name, mutate] of cases) await t.test(name, async (t) => {
-    const f = await completedCheckReauthorFixture(t, { history: "none" });
+    const f = cause === "required-check" ? await completedCheckReauthorFixture(t, { history: "none" }) : await completedOrdinaryReauthorFixture(t);
     const input = reauthorInput(f);
     await mutate(f, input);
     const before = f.store.get();
@@ -2078,16 +2420,17 @@ test("completed required-check admission rejects inexact delivery, approval and 
   });
 });
 
-test("completed required-check classification is pinned across awaited preparation and records the final failures", async (t) => {
+for (const history of ["current", "none"]) test(`completed required-check classification with ${history} full history is pinned across awaited preparation and records the final failures`, async (t) => {
   for (const outcome of ["green", "pending failure", "unknown completed", "different failure"]) await t.test(outcome, async (t) => {
-    const f = await completedCheckReauthorFixture(t, { history: "current" });
-    assert.equal(latestFullAssessment(f.run()).qualified, false, "score repair would otherwise be available when CI clears");
-    const before = f.store.get(), input = reauthorInput(f), head = f.run().continuation.head;
-    const tree = f.orchestrator.git.tree;
+    const f = await completedCheckReauthorFixture(t, { history });
+    if (history === "current") assert.equal(latestFullAssessment(f.run()).qualified, false);
+    else assert.equal(f.run().continuation.evaluation.result.impact, -3, "ordinary repair would otherwise be available when CI clears");
+    const before = f.store.get(), input = reauthorInput(f);
+    const checkWorktree = f.orchestrator.git.assertWorktree;
     let changed = false;
-    f.orchestrator.git.tree = async (commit) => {
-      const result = await tree(commit);
-      if (!changed && commit === head && f.calls.includes("lease")) {
+    f.orchestrator.git.assertWorktree = async (...args) => {
+      const result = await checkWorktree(...args);
+      if (!changed && f.calls.includes("lease")) {
         changed = true;
         f.checks = outcome === "green" ? [{ __typename: "CheckRun", name: "Required documentation", status: "COMPLETED", conclusion: "SUCCESS" }]
           : outcome === "pending failure" ? [{ __typename: "CheckRun", name: "Required documentation", status: "IN_PROGRESS", conclusion: "FAILURE" }]
@@ -2107,22 +2450,23 @@ test("completed required-check classification is pinned across awaited preparati
       assert.deepEqual(f.store.get(), before, "a lost CI cause cannot fall back to another admission");
       assert.equal(f.calls.some((call) => call.reauthor || ["prepare", "commit"].includes(call)), false);
     }
-    assert.equal(changed, true, "change CI after its initial classification and a real awaited source-tree read");
+    assert.equal(changed, true, "change CI after its initial classification and an awaited checkout check");
     assertNoReauthorEffects(f);
   });
 });
 
-test("completed required-check admission rechecks late source, approval, owner and budget drift", async (t) => {
-  for (const mutation of ["source", "receipt", "review", "policy", "budget", "base", "head", "remote", "pending-owner"]) await t.test(mutation, async (t) => {
-    const f = await completedCheckReauthorFixture(t, { history: "none" });
-    const before = f.run(), input = reauthorInput(f), tree = f.orchestrator.git.tree;
+for (const cause of ["required-check", "ordinary-negative"]) test(`completed ${cause} admission rechecks late source, approval, owner and budget drift`, async (t) => {
+  for (const mutation of ["source", "receipt", "review", "policy", "budget", "base", "head", "remote", "pending-owner", "checks"]) await t.test(mutation, async (t) => {
+    const f = cause === "required-check" ? await completedCheckReauthorFixture(t, { history: "none" }) : await completedOrdinaryReauthorFixture(t);
+    const before = f.run(), input = reauthorInput(f), checkWorktree = f.orchestrator.git.assertWorktree;
     let changed = false;
-    f.orchestrator.git.tree = async (commit) => {
-      const result = await tree(commit);
-      if (!changed && commit === before.continuation.head && f.calls.includes("lease")) {
+    f.orchestrator.git.assertWorktree = async (...args) => {
+      const result = await checkWorktree(...args);
+      if (!changed && f.calls.includes("lease")) {
         changed = true;
         if (mutation === "remote") f.world.remoteHead = "foreign";
         else if (mutation === "head") f.world.head = "foreign";
+        else if (mutation === "checks") f.checks = cause === "required-check" ? [] : [{ __typename: "CheckRun", name: "Late required test", status: "COMPLETED", conclusion: "FAILURE" }];
         else if (mutation === "base") {
           const resolve = f.orchestrator.git.resolveRef;
           f.orchestrator.git.resolveRef = async (ref) => ref === "main" ? "next-base" : resolve(ref);
@@ -2182,9 +2526,9 @@ test("completed required-check author and commit cuts recover their saved owner 
   });
 });
 
-test("completed required-check no-op and chained return to a measured source refuse release before the hold changes", async (t) => {
+for (const cause of ["required-check", "ordinary-negative"]) test(`completed ${cause} no-op and chained return to a measured source refuse release before the hold changes`, async (t) => {
   for (const result of ["no-op", "repeated no-op", "change then revert"]) await t.test(result, async (t) => {
-    const f = await completedCheckReauthorFixture(t, { history: "none" });
+    const f = cause === "required-check" ? await completedCheckReauthorFixture(t, { history: "none" }) : await completedOrdinaryReauthorFixture(t);
     const before = f.run(), rows = f.store.get().evaluationRuns, measuredTree = await f.orchestrator.git.tree(before.continuation.head);
     let authors = 0;
     f.orchestrator.codex.reauthor = async (_cwd, thread, guidance) => {
@@ -2202,9 +2546,9 @@ test("completed required-check no-op and chained return to a measured source ref
     if (result === "change then revert") assert.notEqual(held.continuation.head, before.continuation.head);
     if (result !== "no-op") assert.equal(request.checkFailures, undefined, "a later ordinary request must not erase the earlier CI guard");
     await restart(f);
-    await assert.rejects(f.orchestrator.retryAgent("agent", release), /already measured required-check source/);
+    await assert.rejects(f.orchestrator.retryAgent("agent", release), /already measured.*source|measured.*tree/);
     assert.deepEqual(f.run(), held, "release refusal cannot record releasedAt or mutate its held source");
-    await assert.rejects(f.orchestrator.retryAgent("agent", release), /already measured required-check source/);
+    await assert.rejects(f.orchestrator.retryAgent("agent", release), /already measured.*source|measured.*tree/);
     assert.deepEqual(f.run(), held);
     assert.deepEqual(f.store.get().evaluationRuns, rows);
     assert.equal(f.world.remoteHead, before.continuation.head);
@@ -2212,8 +2556,8 @@ test("completed required-check no-op and chained return to a measured source ref
   });
 });
 
-test("completed required-check release remembers older released CI sources as well as the latest done source", async (t) => {
-  const f = await completedCheckReauthorFixture(t, { history: "none" });
+for (const cause of ["required-check", "ordinary-negative"]) test(`completed ${cause} release remembers older released sources as well as the latest done source`, async (t) => {
+  const f = cause === "required-check" ? await completedCheckReauthorFixture(t, { history: "none" }) : await completedOrdinaryReauthorFixture(t);
   const original = f.run(), originalTree = await f.orchestrator.git.tree(original.continuation.head);
   await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "first-ci-source"));
   const delivered = await f.orchestrator.retryAgent("agent", reauthorRelease(f));
@@ -2229,18 +2573,231 @@ test("completed required-check release remembers older released CI sources as we
   await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "second-ci-source"));
   const held = f.run(), rows = f.store.get().evaluationRuns;
   assert.notEqual(held.reauthorRequests.at(-1).source.head, original.continuation.head);
-  assert.deepEqual(held.reauthorRequests.at(-1).checkFailures, ["Required documentation"]);
+  assert.deepEqual(held.reauthorRequests.at(-1).checkFailures, cause === "required-check" ? ["Required documentation"] : undefined);
   await restart(f);
-  await assert.rejects(f.orchestrator.retryAgent("agent", reauthorRelease(f)), /already measured required-check source/);
+  await assert.rejects(f.orchestrator.retryAgent("agent", reauthorRelease(f)), /already measured.*source|measured.*tree/);
   assert.deepEqual(f.run(), held);
   assert.deepEqual(f.store.get().evaluationRuns, rows);
   assert.equal(f.world.remoteHead, delivered.continuation.head);
   assertNoReauthorEffects(f);
 });
 
-test("completed required-check real Git admission preserves parentage and verifies generated-progress correspondence", async (t) => {
+test("older ordinary source memory survives release and a later evidence or reviewer restoration", async (t) => {
+  for (const restoration of ["evidence", "reviewer"]) await t.test(restoration, async (t) => {
+    const f = await completedOrdinaryReauthorFixture(t);
+    const original = f.run().continuation, originalTree = await f.orchestrator.git.tree(original.head);
+    await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "ordinary-A-to-B"));
+    assert.equal((await f.orchestrator.retryAgent("agent", reauthorRelease(f))).status, "completed");
+    const first = f.run().reauthorRequests.at(-1), before = f.run(), rows = f.store.get().evaluationRuns, count = f.world.measurements;
+    assert.ok(first.releasedAt);
+    assert.notEqual(before.continuation.head, original.head);
+    await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "ordinary-B-to-C"));
+    const current = f.run().reauthorRequests.at(-1), release = reauthorRelease(f);
+    assert.deepEqual(current.source, before.continuation);
+    const evidence = f.orchestrator.codex.refreshAgentEvidence, review = f.orchestrator.codex.review, revise = f.orchestrator.codex.revise;
+    if (restoration === "evidence") f.orchestrator.codex.refreshAgentEvidence = async (...args) => {
+      f.world.dirty = true; f.world.tree = originalTree;
+      return evidence(...args);
+    };
+    else {
+      f.orchestrator.codex.review = async () => {
+        f.calls.push("review");
+        return { approved: false, summary: "Change the current implementation", findings: [{ severity: "high", title: "Implementation", detail: "A reviewer-requested change", file: "leaf.txt" }] };
+      };
+      f.orchestrator.codex.revise = async (_cwd, thread, feedback, _settings, kind) => {
+        f.calls.push({ revise: { thread, feedback, kind } });
+        f.world.dirty = true; f.world.tree = originalTree;
+        return { threadId: thread, message: "Restored the older measured implementation" };
+      };
+    }
+    f.calls.length = 0;
+    const refused = await f.orchestrator.retryAgent("agent", release);
+    assert.equal(refused.status, "failed");
+    assert.match(refused.error, /rejected tree|already measured|measured.*source/i);
+    assert.equal(await f.orchestrator.git.tree(refused.continuation.head), originalTree);
+    assert.notEqual(refused.continuation.head, original.head, "new commit identity cannot buy a repeat experiment");
+    assert.ok(refused.reauthorRequests.at(-1).releasedAt);
+    assert.deepEqual(refused.reauthorRequests.find((request) => request.id === first.id), first);
+    assert.deepEqual(refused.reviewRounds.slice(0, before.reviewRounds.length), before.reviewRounds,
+      "historical approval uses the retained linked round, not today's final round");
+    assert.equal(refused.reviewRounds.length, before.reviewRounds.length + (restoration === "reviewer" ? 1 : 0));
+    assert.equal(f.calls.filter((call) => call === "evidence").length, 1);
+    assert.equal(f.calls.filter((call) => call === "review").length, restoration === "reviewer" ? 1 : 0);
+    assert.equal(f.calls.some((call) => ["evaluate", "push", "edit", "draft", "ready", "cleanup"].includes(call)), false);
+    assert.equal(f.world.measurements, count);
+    assert.deepEqual(f.store.get().evaluationRuns, rows);
+    await restart(f);
+    await f.orchestrator.retryAgent("agent", release);
+    assert.equal(f.world.measurements, count);
+    assert.deepEqual(f.store.get().evaluationRuns, rows);
+    f.orchestrator.codex.refreshAgentEvidence = evidence;
+    f.orchestrator.codex.review = review;
+    f.orchestrator.codex.revise = revise;
+    f.world.score = 71;
+    await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "ordinary-new-D"));
+    const changed = await f.orchestrator.retryAgent("agent", reauthorRelease(f));
+    assert.equal(changed.status, "completed", changed.error);
+    assert.equal(f.world.measurements, count + 1, "the guard still permits a genuinely distinct changed tree");
+    assert.deepEqual(changed.reauthorRequests.find((request) => request.id === first.id), first);
+  });
+});
+
+test("ordinary archived source loss fails closed even when a newer full assessment exists", async (t) => {
+  for (const loss of ["receipt", "receipt with newer full", "candidate row", "baseline row", "approval round", "receipt linkage", "malformed receipt"]) await t.test(loss, async (t) => {
+    const f = await completedOrdinaryReauthorFixture(t);
+    await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "required-ordinary-source"));
+    const sourceRequest = f.run().reauthorRequests.at(-1);
+    assert.equal(sourceRequest.assessment, undefined);
+    assert.equal((await f.orchestrator.retryAgent("agent", reauthorRelease(f))).status, "completed");
+    if (loss === "receipt with newer full") assert.equal(await f.orchestrator.fullyValidateLeafForMerge("agent", "base"), false);
+    await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "later-source-cannot-excuse-loss"));
+    const release = reauthorRelease(f);
+    await f.store.update((state) => {
+      const run = state.agentRuns[0], request = run.reauthorRequests.find((entry) => entry.id === sourceRequest.id);
+      const receipt = request.source.evaluation;
+      if (loss.startsWith("receipt") && loss !== "receipt linkage") delete request.source.evaluation;
+      if (loss === "candidate row" || loss === "baseline row") {
+        const id = receipt.result.selections[0][loss === "candidate row" ? "candidate" : "baseline"];
+        state.evaluationRuns = state.evaluationRuns.filter((row) => row.id !== id);
+      }
+      if (loss === "approval round") run.reviewRounds = run.reviewRounds.filter((round) => round.id !== receipt.approvalRoundId);
+      if (loss === "receipt linkage") receipt.identity.evaluationFingerprint = "unowned-policy";
+      if (loss === "malformed receipt") receipt.result.impact = 100;
+    });
+    const before = f.store.get(), count = f.world.measurements;
+    f.calls.length = 0;
+    await restart(f);
+    await assert.rejects(f.orchestrator.retryAgent("agent", release));
+    assert.deepEqual(f.store.get(), before, "required old evidence cannot disappear from the release comparison");
+    assert.equal(f.run().reauthorRequests.at(-1).releasedAt, undefined);
+    assert.equal(f.world.measurements, count);
+    assertNoReauthorEffects(f);
+  });
+});
+
+test("ordinary historical rejection keeps its recorded threshold before new full samples, positive cache and merge", async (t) => {
+  for (const cache of [false, true]) await t.test(cache ? "positive legacy cache" : "no cache", async (t) => {
+    const f = await completedOrdinaryReauthorFixture(t, { score: 70.5, configure: (fixture) => fixture.store.update((state) => {
+      state.settings.compositeAbsorbThreshold = 1;
+      const run = state.agentRuns[0];
+      for (const round of run.reviewRounds) round.evaluationFingerprint = fullMergeValidationFingerprint(state);
+      run.continuation.identity = fixture.orchestrator.continuationIdentity(run, state, { number: 42, headRefOid: "rejected", url: run.prUrl });
+    }) });
+    const source = f.run(), receipt = source.continuation.evaluation;
+    assert.equal(receipt.result.impact, 0.5);
+    assert.ok(receipt.result.deltas.every((delta) => delta.delta >= 0));
+    await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "old-threshold-negative"));
+    assert.equal((await f.orchestrator.retryAgent("agent", reauthorRelease(f))).status, "completed");
+    const requests = f.run().reauthorRequests;
+    await restoreCompletedFixtureResult(f, source, requests);
+    await f.store.update((state) => {
+      state.settings.compositeAbsorbThreshold = 0;
+      if (cache) {
+        // A saved legacy positive cache is not a new receipt and cannot
+        // reinterpret the original delivery's threshold-one negative result.
+        const assessment = { baseCommit: "base", candidateCommit: source.continuation.head, candidateTree: receipt.candidateTree,
+          evaluationFingerprint: fullMergeValidationFingerprint(state), qualified: true, completedAt: receipt.result.completedAt,
+          deltas: structuredClone(receipt.result.deltas), impact: receipt.result.impact };
+        state.agentRuns[0].fullEvaluationHistory = [{ kind: "assessment", assessment,
+          comparison: { tree: receipt.candidateTree, progress: [] } }];
+      }
+    });
+    const rows = f.store.get().evaluationRuns, measurements = f.world.measurements;
+    f.calls.length = 0;
+    await restart(f);
+    if (cache) assert.equal(latestFullAssessment(f.run()).qualified, true);
+    assert.equal(await f.orchestrator.fullyValidateLeafForMerge("agent", "base"), false,
+      "the original recorded negative wins even though the current threshold would allow its values");
+    await assert.rejects(f.orchestrator.mergeAgent("agent"), /historically rejected tree|rejected tree/i);
+    assert.equal(f.world.measurements, measurements);
+    assert.deepEqual(f.store.get().evaluationRuns, rows);
+    assert.deepEqual(f.run().reauthorRequests, requests);
+    assert.equal(f.run().reauthorRequests.at(-1).source.evaluation.purpose, "delivery");
+    assertNoReauthorEffects(f);
+  });
+});
+
+test("positive CI sources stay measured without becoming automatic historical merge rejections", async (t) => {
+  for (const policy of ["unchanged", "stricter current threshold"]) await t.test(policy, async (t) => {
+    const f = await completedCheckReauthorFixture(t, { history: "none", score: 71 });
+    f.checks = [];
+    assert.equal(await f.orchestrator.fullyValidateLeafForMerge("agent", "base"), true);
+    const source = f.run(), full = latestFullAssessment(source);
+    assert.equal(full.evaluation.purpose, "full", "use a real public full cache, not a relabeled delivery");
+    f.checks = [{ __typename: "CheckRun", name: "Required documentation", status: "COMPLETED", conclusion: "FAILURE" }];
+    await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "positive-measured-CI-source"));
+    assert.deepEqual(f.run().reauthorRequests.at(-1).checkFailures, ["Required documentation"]);
+    assert.equal((await f.orchestrator.retryAgent("agent", reauthorRelease(f))).status, "completed");
+    const requests = f.run().reauthorRequests;
+    await restoreCompletedFixtureResult(f, source, requests);
+    f.checks = [];
+    if (policy !== "unchanged") await f.store.update((state) => { state.settings.compositeAbsorbThreshold = 2; });
+    const measurements = f.world.measurements, rows = f.store.get().evaluationRuns;
+    f.calls.length = 0;
+    await restart(f);
+    let merges = 0;
+    f.orchestrator.stampLeafProgress = async () => f.run();
+    f.orchestrator.git.mergeLeafPr = async (_cwd, _repository, number, head) => {
+      assert.equal(number, source.prNumber); assert.equal(head, source.continuation.head); merges += 1;
+      throw new TransientMergeGateError("Fixture reached the authorized positive-CI merge boundary");
+    };
+    f.orchestrator.syncPullRequests = async () => undefined;
+    if (policy === "unchanged") {
+      assert.equal(await f.orchestrator.fullyValidateLeafForMerge("agent", "base"), true,
+        "measurement memory does not invalidate an existing positive full cache");
+      await assert.rejects(f.orchestrator.mergeAgent("agent"), /authorized positive-CI merge boundary/);
+      assert.equal(merges, 1);
+    } else {
+      await assert.rejects(f.orchestrator.fullyValidateLeafForMerge("agent", "base"), /already measured.*source|measured.*tree/,
+        "a stricter current threshold cannot turn old positive CI into a frozen negative; new work is blocked as already measured");
+      assert.equal(merges, 0);
+    }
+    assert.equal(f.world.measurements, measurements);
+    assert.deepEqual(f.store.get().evaluationRuns, rows);
+    assert.deepEqual(f.run().reauthorRequests, requests);
+  });
+});
+
+test("full-owned legacy sources retain exact per-request compatibility but cannot hide a malformed typed receipt", async (t) => {
+  for (const evidence of ["legacy", "malformed typed"]) await t.test(evidence, async (t) => {
+    const f = await completedLegacyReauthorFixture(t);
+    f.orchestrator.codex.reauthor = async (_cwd, thread, guidance) => {
+      f.calls.push({ reauthor: { thread, guidance } });
+      f.world.dirty = true; f.world.tree = "new-legacy-follow-up-tree";
+      return { threadId: thread, message: "Changed the legacy implementation" };
+    };
+    const held = await f.orchestrator.reauthorAgent("agent", reauthorInput(f, "full-owned-legacy-follow-up"));
+    const request = held.reauthorRequests.at(-1), release = reauthorRelease(f);
+    assert.equal(held.continuation.step, "evidence", held.error);
+    assert.ok(request.assessment);
+    assert.equal(Object.hasOwn(request.source.evaluation, "id"), false);
+    if (evidence === "malformed typed") await f.store.update((state) => {
+      const run = state.agentRuns[0], source = run.reauthorRequests.at(-1).source;
+      source.evaluation = { id: "lost-typed-receipt", purpose: "delivery", agentRunId: run.id,
+        identity: { baseCommit: source.identity.baseCommit, candidateCommit: source.head, evaluationFingerprint: source.identity.evaluationFingerprint },
+        candidateTree: "rejected-tree", scoreDefinitionFingerprint: "malformed-recorded-policy", evaluations: [],
+        result: { completedAt: timestamp, sources: [], selections: [], deltas: [], impact: 0 } };
+    });
+    const before = f.store.get();
+    await restart(f);
+    if (evidence === "legacy") {
+      const delivered = await f.orchestrator.retryAgent("agent", release);
+      assert.equal(delivered.status, "completed", delivered.error);
+      assert.ok(delivered.reauthorRequests.at(-1).releasedAt);
+      assert.deepEqual(delivered.reauthorRequests.at(-1).source, request.source);
+      assert.deepEqual(delivered.reauthorRequests.at(-1).assessment, request.assessment);
+    } else {
+      await assert.rejects(f.orchestrator.retryAgent("agent", release));
+      assert.deepEqual(f.store.get(), before);
+      assertNoReauthorEffects(f);
+    }
+  });
+});
+
+for (const cause of ["required-check", "ordinary-negative"]) test(`completed ${cause} real Git admission preserves parentage and verifies generated-progress correspondence`, async (t) => {
   for (const certificate of ["valid", "missing", "tampered"]) await t.test(certificate, async (t) => {
     const f = await realGitCheckReauthorFixture(t), g = f.repository;
+    if (cause === "ordinary-negative") f.checks = [];
     const proof = await stampCompletedCheckSource(f);
     if (certificate !== "valid") await f.store.update((state) => {
       if (certificate === "missing") delete state.agentRuns[0].generatedProgress;
@@ -2259,7 +2816,7 @@ test("completed required-check real Git admission preserves parentage and verifi
       assert.equal(await fixtureGit(g.worktree, "rev-parse", `${held.continuation.head}^`), proof.outputCommit);
       assert.deepEqual(held.reauthorRequests.at(-1).source, before.continuation);
       assert.equal(held.reauthorRequests.at(-1).source.evaluation.identity.candidateCommit, proof.inputCommit);
-      assert.deepEqual(held.reauthorRequests.at(-1).checkFailures, ["Required documentation"]);
+      assert.deepEqual(held.reauthorRequests.at(-1).checkFailures, cause === "required-check" ? ["Required documentation"] : undefined);
       assert.equal(await g.git.hasChanges(g.worktree), false);
     } else {
       await assert.rejects(f.orchestrator.reauthorAgent("agent", input));
@@ -2275,9 +2832,10 @@ test("completed required-check real Git admission preserves parentage and verifi
   });
 });
 
-test("completed required-check release fails closed when retained source or progress proof is lost", async (t) => {
+for (const cause of ["required-check", "ordinary-negative"]) test(`completed ${cause} release fails closed when retained source or progress proof is lost`, async (t) => {
   for (const loss of ["receipt", "raw source", "progress", "tampered progress"]) await t.test(loss, async (t) => {
     const f = await realGitCheckReauthorFixture(t), g = f.repository;
+    if (cause === "ordinary-negative") f.checks = [];
     const proof = await stampCompletedCheckSource(f);
     f.orchestrator.codex.reauthor = async (cwd, thread, guidance) => {
       f.calls.push({ reauthor: { thread, guidance } });
@@ -2310,8 +2868,9 @@ test("completed required-check release fails closed when retained source or prog
   });
 });
 
-test("completed required-check later certified progress cannot disguise a return to an older released source", async (t) => {
+for (const cause of ["required-check", "ordinary-negative"]) test(`completed ${cause} later certified progress cannot disguise a return to an older released source`, async (t) => {
   const f = await realGitCheckReauthorFixture(t), g = f.repository;
+  if (cause === "ordinary-negative") f.checks = [];
   const original = f.run().continuation, originalText = await readFile(join(g.worktree, "leaf.txt"), "utf8");
   f.orchestrator.codex.reauthor = async (cwd, thread, guidance) => {
     f.calls.push({ reauthor: { thread, guidance } });
@@ -2337,7 +2896,7 @@ test("completed required-check later certified progress cannot disguise a return
   assert.equal(await g.git.normalizeLeafProgressHistoryTree(held.continuation.head, g.base, [proof]),
     await g.git.normalizeLeafProgressHistoryTree(original.head, g.base, [proof]), "the certified normalization identifies the same measured source");
   await restart(f);
-  await assert.rejects(f.orchestrator.retryAgent("agent", reauthorRelease(f)), /already measured required-check source/);
+  await assert.rejects(f.orchestrator.retryAgent("agent", reauthorRelease(f)), /already measured.*source|measured.*tree/);
   assert.deepEqual(f.run(), held);
   assert.deepEqual(f.store.get().evaluationRuns, rows);
   assert.equal(await g.git.remoteBranchHead(g.worktree, "origin", "burner/repair"), proof.outputCommit);
@@ -2389,6 +2948,9 @@ test("completed full rejection reauthor accepts only proven generated-progress h
   for (const proof of ["valid", "missing", "tampered"]) await t.test(proof, async (t) => {
     const f = await reauthorFixture(t);
     const g = await leafRefreshRepository(f.root, { branch: "burner/repair", published: true, deferTarget: true });
+    const worktree = join(f.root, ".burner", "worktrees", "agent");
+    await fixtureGit(f.root, "worktree", "move", g.worktree, worktree);
+    g.worktree = worktree;
     const plan = await g.git.planLeafManagedFiles(g.worktree, "burner/repair", g.head, {
       "docs/burner-evaluation-history.json": '{"fixture":"generated-progress"}\n',
     });
@@ -2449,12 +3011,12 @@ test("completed full rejection reauthor accepts only proven generated-progress h
 });
 
 test("archived reauthor done receipts retain borrowed, projected and nested evidence through rolling trim", async (t) => {
-  for (const format of ["receipt", "legacy"]) await t.test(format, async (t) => {
+  for (const format of ["receipt", "ordinary-receipt", "legacy"]) await t.test(format, async (t) => {
     const f = await fixture(t);
     const reference = (runId) => ({ runId, digest: "stored-retention-fixture" });
-    const roots = format === "receipt" ? ["borrowed-baseline", "projection-input", "borrowed-candidate", "failed-attempt",
+    const roots = format !== "legacy" ? ["borrowed-baseline", "projection-input", "borrowed-candidate", "failed-attempt",
       "candidate-success", "baseline-confirmation", "baseline-median", "result-only"] : ["borrowed-candidate"];
-    const nestedRoot = format === "receipt" ? "projection-input" : "borrowed-candidate";
+    const nestedRoot = format !== "legacy" ? "projection-input" : "borrowed-candidate";
     const rows = [...roots, "nested-source", "nested-grandchild"].map((id) => ({
       id, evaluationId: "perf", commit: "old-foreign-commit", context: "composite", agentRunId: "unretained-owner",
       durationMs: 1, attempts: 1, createdAt: timestamp, evaluationDefinitionVersion: "v1",
@@ -2466,6 +3028,7 @@ test("archived reauthor done receipts retain borrowed, projected and nested evid
     // current full receipt, latest baseline, or the rolling recent window.
     await f.store.update((state) => {
       const run = state.agentRuns[0];
+      if (format === "ordinary-receipt") run.leafQualificationPolicy = "ordinary";
       const identity = f.orchestrator.continuationIdentity(run, state, { number: 42, headRefOid: "rejected", url: run.prUrl });
       const evaluation = format === "legacy" ? { evaluationRunIds: roots, deltas: run.deltas, impact: run.impact, completedAt: timestamp } : {
         id: "archived-delivery", purpose: "delivery", agentRunId: run.id,
@@ -3895,6 +4458,7 @@ async function completedLegacyReauthorFixture(t) {
       admittedAt: "2026-09-14T23:00:00.000Z", output: { continuationId: "earlier-legacy-output", head: "rejected" },
       releasedAt: "2026-09-14T23:10:00.000Z" }];
   });
+  await canonicalCompletedFixtureCheckout(f);
   return f;
 }
 
