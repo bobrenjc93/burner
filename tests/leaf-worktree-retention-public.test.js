@@ -99,6 +99,14 @@ function installFakes(t, f) {
       await fs.writeFile(join(cwd, "code.txt"), `genuine repair ${f.calls.models.filter((name) => name === "revise").length}\n`);
       return session();
     },
+    reauthor: async (cwd, thread, guidance, _settings, historicalFeedback) => {
+      model(cwd, "reauthor"); assert.equal(thread, "retained-author");
+      f.calls.reauthors.push({ cwd, thread, guidance, historicalFeedback: clone(historicalFeedback) });
+      await f.onReauthor?.(cwd);
+      if (f.failReauthor) throw new Error("Fixture interrupted explicitly admitted re-author");
+      await fs.writeFile(join(cwd, "code.txt"), `genuine operator repair ${f.calls.reauthors.length}\n`);
+      return session();
+    },
     refreshAgentEvidence: async (cwd) => { model(cwd, "evidence"); return session(); },
     review: async (cwd) => { model(cwd, "review"); return { approved: true, summary: "Fixture approval", findings: [] }; },
     evaluate: async (cwd, evaluation, _settings, context, _baseline, evidence) => {
@@ -225,8 +233,8 @@ function installFakes(t, f) {
 
 async function fixture(t, options = {}) {
   const sandbox = await fs.mkdtemp(join(tmpdir(), "burner-retained-worktree-"));
-  const f = { sandbox, root: join(sandbox, "project"), bin: join(sandbox, "bin"), phase: "delivery", scores: { command: 60, prompt: 55 }, passed: false, operations: [],
-    calls: { models: [], samples: [], pr: [], creates: [], removes: [], git: [], blocked: [], baselineRequests: [],
+  const f = { sandbox, root: join(sandbox, "project"), bin: join(sandbox, "bin"), phase: "delivery", scores: { command: 60, prompt: 55, ...options.scores }, passed: false, operations: [],
+    calls: { models: [], samples: [], pr: [], creates: [], removes: [], git: [], blocked: [], baselineRequests: [], reauthors: [],
       observations: 0, repositories: 0, batches: 0, proofs: [], updates: 0, markups: [], baseSyncs: [] } };
   t.after(async () => {
     await f.close?.();
@@ -253,7 +261,7 @@ async function fixture(t, options = {}) {
   f.store = new StateStore(f.root); await f.store.init();
   const timestamp = new Date().toISOString();
   await f.store.update((state) => {
-    Object.assign(state.settings, { autoRun: false, autoCreatePrs: options.published !== false, defaultResources: [], parallelism: 1,
+    Object.assign(state.settings, { autoRun: false, autoCreatePrs: options.published !== false, defaultResources: options.resources ?? [], parallelism: 1,
       preferLivingComposite: false, maxReviewRounds: options.reviewLimit ?? 4, portfolioReviewRounds: 6, stallTerminationHours: 0 });
     Object.assign(state.orchestrator, { enabled: false, lastEvaluationAt: timestamp, lastPlanningAt: timestamp });
     state.evaluations = [{ id: "command", name: "Command", command: "fixture-command-never-executed", prompt: "Fixture command", weight: 1, enabled: true, definitionVersion: "v1", createdAt: timestamp },
@@ -278,6 +286,7 @@ async function fixture(t, options = {}) {
   };
   f.full = (options) => { const work = f.server.orchestrator.fullyValidateLeafForMerge(f.run().id, f.base, options); f.operations.push(work); return work; };
   f.retry = (options) => { const work = f.server.orchestrator.retryAgent(f.run().id, options); f.operations.push(work); return work; };
+  f.reauthor = (input) => { const work = f.server.orchestrator.reauthorAgent(f.run().id, input); f.operations.push(work); return work; };
   f.sync = () => { const work = f.server.orchestrator.syncPullRequests(true); f.operations.push(work); return work; };
   f.paths = () => [join(f.root, ".burner", "worktrees", f.run().id), join(f.root, ".burner", "worktrees", `full-leaf-${f.run().id}`)];
   await f.restart();
@@ -330,6 +339,36 @@ function allocations(f) { return f.calls.git.filter(({ args }) => args[0] === "w
 async function allocate(f, which = 0) {
   const path = await f.git.createExistingWorktree(which ? `full-leaf-${f.run().id}` : f.run().id, f.run().branch);
   assert.equal(path, f.paths()[which]); await ignored(path); return path;
+}
+
+function reauthorInput(f, requestId = "ordinary-checkout-request") {
+  return { requestId, expectedContinuationId: f.run().continuation.id, expectedHead: f.run().continuation.head,
+    expectedPublishedHead: f.run().continuation.identity.pullRequest.head,
+    guidance: "Make one genuine implementation change on this same PR; preserve the evaluation and review contracts." };
+}
+
+function admissionState(f) {
+  return clone({ run: f.run(), ideas: f.store.get().ideas, definitions: f.store.get().evaluations, rows: f.store.get().evaluationRuns,
+    pr: f.pr, effects: f.calls.pr, models: f.calls.models, samples: f.calls.samples });
+}
+
+async function missingCheckouts(f) {
+  for (const path of f.paths()) await assert.rejects(fs.lstat(path), { code: "ENOENT" });
+}
+
+function assertOrdinaryHeld(f, input, source) {
+  const run = f.run(), request = run.reauthorRequests.at(-1);
+  assert.equal(run.status, "failed", run.error);
+  assert.equal(run.continuation.step, "evidence", run.error);
+  assert.equal(request.id, input.requestId);
+  assert.deepEqual(request.source, source.continuation, "the exact completed ordinary receipt stays in the request source");
+  assert.equal(request.assessment, undefined, "ordinary delivery is not a synthetic full assessment");
+  assert.equal(request.checkFailures, undefined);
+  assert.equal(request.releasedAt, undefined);
+  assert.deepEqual(request.output, { continuationId: run.continuation.id, head: run.continuation.head });
+  for (const key of ["id", "ideaId", "branch", "baseRef", "baseCommit", "prNumber", "prUrl", "prState", "authorThreadId", "resources",
+    "leafPr", "reviewRounds", "fullEvaluationHistory", "fullMergeValidation", "deltas", "impact", "retainWorktree"]) assert.deepEqual(run[key], source[key], key);
+  assert.equal(latestFullAssessment(run), undefined);
 }
 
 function reconciliationWork(f) {
@@ -915,3 +954,237 @@ test("unselected leaves retain the existing actual delivery/full cleanup behavio
   for (const path of f.paths()) await assert.rejects(fs.lstat(path), { code: "ENOENT" });
   assert.equal(Object.hasOwn(f.run(), "retainWorktree"), false);
 }));
+
+test("ordinary re-author materializes a genuinely cleaned-up checkout under its lease and stops at the same-session committed output", async (t) => withFixture(t,
+  { scores: { prompt: 40 }, resources: ["fixture-checkout-lease"] }, async (f) => {
+    const source = clone(f.run()), prior = admissionState(f), creates = allocations(f), removes = f.calls.removes.length;
+    assert.equal(source.leafQualificationPolicy, "ordinary");
+    assert.equal(source.continuation.evaluation.purpose, "delivery");
+    assert.equal(latestFullAssessment(source), undefined);
+    assert.ok(f.calls.removes.includes(f.paths()[0]), "ordinary delivery really removed the original non-retained checkout");
+    await missingCheckouts(f);
+    const input = reauthorInput(f);
+    let allocated;
+    f.onCreate = async (path) => {
+      assert.equal(path, f.paths()[0]);
+      assert.deepEqual(f.run(), source, "allocation cannot rewrite the completed source or publish an author request");
+      assert.deepEqual((await f.server.orchestrator.locks.list()).sort(), ["fixture-checkout-lease", "git-metadata"]);
+      await ignored(path); allocated = await namespace(f, path);
+      assert.equal(allocated.head, source.continuation.head);
+    };
+    await f.reauthor(input);
+    assertOrdinaryHeld(f, input, source);
+    assert.ok(allocated, "the public request reached the real existing-worktree allocator");
+    assert.equal(allocations(f), creates + 1);
+    assert.equal(f.calls.removes.length, removes);
+    assert.deepEqual(f.store.get().evaluationRuns, prior.rows);
+    assert.deepEqual(f.store.get().evaluations, prior.definitions);
+    assert.deepEqual(f.calls.samples, prior.samples);
+    assert.deepEqual(f.calls.models, [...prior.models, "reauthor"]);
+    assert.deepEqual(f.pr, prior.pr); assert.deepEqual(f.calls.pr, prior.effects);
+    assert.equal(f.calls.reauthors.length, 1);
+    assert.equal(f.calls.reauthors[0].thread, source.authorThreadId);
+    assert.equal(f.run().reauthorRequests.at(-1).guidance, input.guidance);
+    assert.ok(f.calls.reauthors[0].guidance.includes(input.guidance), "existing contextual task scope retains the exact operator guidance");
+    const path = f.run().worktree, output = await namespace(f, path);
+    assert.equal(output.status, ""); assert.equal(output.gitfile, allocated.gitfile);
+    assert.deepEqual(output.files, allocated.files, "committed and ignored sentinel bytes survive author-only allocation");
+    assert.equal(await git(path, "rev-parse", "HEAD^"), source.continuation.head);
+    assert.notEqual(await f.git.tree(output.head), await f.git.tree(source.continuation.head));
+    assert.equal(await f.git.remoteBranchHead(f.root, "origin", source.branch), source.continuation.head, "held output is not pushed");
+    assert.deepEqual(await f.server.orchestrator.locks.list(), []);
+    const held = admissionState(f), createCalls = f.calls.creates.length;
+    await f.restart(); await f.reauthor(input); await f.retry();
+    assert.deepEqual(admissionState(f), held, "restart and exact replay do not authorize evidence, review, sampling or PR work");
+    assert.equal(f.calls.reauthors.length, 1); assert.equal(f.calls.creates.length, createCalls);
+    assert.deepEqual(await namespace(f, path), output); assert.equal(f.calls.removes.length, removes);
+  }));
+
+test("ordinary re-author reuses either exact canonical checkout and atomically saves an alternate pointer with its request", async (t) => {
+  for (const which of [0, 1]) await t.test(which ? "full-leaf path" : "ordinary path", async (t) => withFixture(t, { scores: { prompt: 40 } }, async (f) => {
+    const path = await allocate(f, which), saved = await namespace(f, path), source = clone(f.run());
+    const creates = allocations(f), createCalls = f.calls.creates.length, removes = f.calls.removes.length;
+    const input = reauthorInput(f), observedPointers = [];
+    f.onReauthor = async (cwd) => { assert.equal(cwd, path); assert.deepEqual(await namespace(f, path), saved); };
+    const unsubscribe = f.store.subscribe((state) => {
+      const run = state.agentRuns.find((item) => item.id === source.id);
+      observedPointers.push({ worktree: run.worktree, admitted: Boolean(run.reauthorRequests?.length) });
+    });
+    try { await f.reauthor(input); } finally { unsubscribe(); }
+    // Lost-listener acknowledgments are deliberately recoverable in production;
+    // assert observations afterward so that recovery cannot swallow a test failure.
+    assert.ok(observedPointers.some((entry) => entry.admitted));
+    for (const entry of observedPointers) assert.equal(entry.worktree, entry.admitted ? path : source.worktree,
+      "the canonical pointer and author request must be saved atomically");
+    assertOrdinaryHeld(f, input, source);
+    assert.equal(f.run().worktree, path); assert.equal((await f.persistedRun()).worktree, path);
+    assert.equal(allocations(f), creates); assert.equal(f.calls.creates.length, createCalls);
+    assert.equal(f.calls.removes.length, removes);
+    assert.equal((await namespace(f, path)).gitfile, saved.gitfile);
+    assert.deepEqual(await fs.readFile(join(path, "ignored/sentinel.bin")), sentinel["ignored/sentinel.bin"]);
+  }));
+});
+
+test("ordinary re-author refuses unproven completed sources before any checkout allocation", async (t) => {
+  for (const kind of ["positive delivery", "missing receipt", "changed policy", "wrong approval", "wrong remote tuple", "exhausted budget"]) {
+    await t.test(kind, async (t) => withFixture(t, kind === "positive delivery" ? {} : { scores: { prompt: 40 } }, async (f) => {
+      if (kind === "wrong remote tuple") f.observationPatch = { headRepository: { ...repository, id: "foreign-repository" } };
+      if (!["positive delivery", "wrong remote tuple"].includes(kind)) await f.store.update((state) => {
+        const run = state.agentRuns.find((item) => item.id === f.run().id);
+        if (kind === "missing receipt") delete run.continuation.evaluation;
+        if (kind === "changed policy") state.evaluations[1].weight = 2;
+        if (kind === "wrong approval") run.continuation.evaluation.approvalRoundId = "unrelated-approval";
+        if (kind === "exhausted budget") state.settings.maxReviewRounds = run.reviewRounds.length;
+      });
+      const input = reauthorInput(f), before = admissionState(f), creates = allocations(f), createCalls = f.calls.creates.length, removes = f.calls.removes.length;
+      await missingCheckouts(f);
+      await assert.rejects(f.reauthor(input));
+      assert.deepEqual(admissionState(f), before);
+      assert.equal(allocations(f), creates); assert.equal(f.calls.creates.length, createCalls, "even the canonical allocator must not be entered before proof");
+      assert.equal(f.calls.removes.length, removes); await missingCheckouts(f);
+      assert.deepEqual(await f.server.orchestrator.locks.list(), []);
+    }));
+  }
+});
+
+test("ordinary re-author preserves invalid extant namespaces, including the other canonical candidate and clean pending Git work", async (t) => {
+  const cases = ["dirty saved", "dirty alternate", "foreign branch", "foreign HEAD", "foreign repository", "foreign file",
+    "checkout symlink", "ancestor symlink", "unreadable checkout", "unreadable ancestor", "dual paths", "pending merge"];
+  for (const kind of cases) await t.test(kind, async (t) => withFixture(t, { scores: { prompt: 40 } }, async (f) => {
+    const which = ["dirty alternate", "foreign repository", "foreign file"].includes(kind) ? 1 : 0;
+    const path = f.paths()[which], directory = dirname(path);
+    let saved, inspectPath = path, restore = async () => {}, mergeHead;
+    if (kind === "foreign file") await fs.writeFile(path, "foreign namespace bytes\n");
+    else if (kind === "foreign repository") {
+      await fs.mkdir(path, { recursive: true }); await git(path, "init", "-b", f.run().branch);
+      await fs.writeFile(join(path, "foreign.txt"), "foreign repository bytes\n");
+      await git(path, "add", "."); await git(path, "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-m", "foreign repository");
+    } else {
+      await allocate(f, which);
+      if (kind.startsWith("dirty")) await dirty(path);
+      if (kind === "foreign branch") await git(path, "switch", "-c", "fixture/foreign");
+      if (kind === "foreign HEAD") await git(path, "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "--allow-empty", "-m", "foreign head");
+      if (kind === "dual paths") { await git(f.root, "worktree", "add", "--force", f.paths()[1], f.run().branch); await ignored(f.paths()[1]); }
+      if (kind === "pending merge") {
+        await git(f.root, "switch", "-c", "fixture/pending-merge", f.base);
+        await git(f.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "--allow-empty", "-m", "parallel empty change");
+        const other = await f.git.head(f.root); await git(f.root, "switch", "main");
+        await git(path, "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "merge", "--no-ff", "--no-commit", other);
+        assert.equal(await git(path, "status", "--porcelain"), "", "a pending merge is not necessarily a dirty tree");
+        mergeHead = resolve(path, await git(path, "rev-parse", "--git-path", "MERGE_HEAD"));
+        assert.equal((await fs.readFile(mergeHead, "utf8")).trim(), other);
+      }
+      if (kind === "checkout symlink") {
+        inspectPath = join(f.sandbox, "moved-ordinary-checkout");
+        await git(f.root, "worktree", "move", path, inspectPath); await fs.symlink(inspectPath, path, "dir");
+      }
+      saved = await namespace(f, inspectPath);
+      if (kind === "ancestor symlink") {
+        const moved = join(f.sandbox, "moved-ordinary-namespace");
+        await fs.rename(directory, moved); await fs.symlink(moved, directory, "dir");
+        restore = async () => { assert.equal((await fs.lstat(directory)).isSymbolicLink(), true); assert.equal(await fs.readlink(directory), moved);
+          await fs.unlink(directory); await fs.rename(moved, directory); };
+      }
+      if (kind.startsWith("unreadable")) {
+        const inaccessible = kind === "unreadable ancestor" ? directory : path;
+        await fs.chmod(inaccessible, 0o000);
+        restore = async () => { assert.equal((await fs.lstat(inaccessible)).mode & 0o777, 0); await fs.chmod(inaccessible, 0o755); };
+      }
+    }
+    const before = admissionState(f), creates = allocations(f), createCalls = f.calls.creates.length, removes = f.calls.removes.length;
+    const registrations = await git(f.root, "worktree", "list", "--porcelain"), pending = mergeHead && await fs.readFile(mergeHead, "utf8");
+    try {
+      await assert.rejects(f.reauthor(reauthorInput(f)));
+      assert.deepEqual(admissionState(f), before); assert.equal(allocations(f), creates); assert.equal(f.calls.creates.length, createCalls);
+      assert.equal(f.calls.removes.length, removes);
+      assert.equal(await git(f.root, "worktree", "list", "--porcelain"), registrations);
+      if (kind === "checkout symlink") { assert.equal((await fs.lstat(path)).isSymbolicLink(), true); assert.equal(await fs.readlink(path), inspectPath); }
+      if (mergeHead) assert.equal(await fs.readFile(mergeHead, "utf8"), pending);
+    } finally { await restore(); }
+    if (saved) assert.deepEqual(await namespace(f, inspectPath), saved);
+    if (kind === "foreign file") assert.equal(await fs.readFile(path, "utf8"), "foreign namespace bytes\n");
+    if (kind === "foreign repository") assert.equal(await fs.readFile(join(path, "foreign.txt"), "utf8"), "foreign repository bytes\n");
+    if (kind === "dual paths") assert.deepEqual(await fs.readFile(join(f.paths()[1], "ignored/sentinel.bin")), sentinel["ignored/sentinel.bin"]);
+    assert.deepEqual(await f.server.orchestrator.locks.list(), []);
+  }));
+});
+
+test("ordinary re-author allocation cannot recover a missing retained checkout or already-held author/commit", async (t) => {
+  for (const checkpoint of ["retained", "author", "commit"]) await t.test(checkpoint, async (t) => withFixture(t, { scores: { prompt: 40 } }, async (f) => {
+    const input = reauthorInput(f);
+    if (checkpoint === "retained") {
+      assert.equal(await f.full({ retainWorktree: true }), false, "establish the real one-way retention owner");
+      assert.equal(f.run().retainWorktree, true);
+    } else {
+      if (checkpoint === "author") f.failReauthor = true;
+      else f.stateCut = { when: "before", hit: false, matches: (before, after) => before?.continuation?.step === "commit" && after?.continuation?.step === "evidence" };
+      await f.reauthor(input);
+      assert.equal(f.run().continuation.step, checkpoint);
+      assert.equal(f.run().reauthorRequests.at(-1).output, undefined);
+      if (checkpoint === "commit") assert.equal(f.stateCut.hit, true);
+      f.failReauthor = false; f.stateCut = undefined;
+    }
+    await f.git.removeWorktree(f.run().worktree); await missingCheckouts(f);
+    await f.restart();
+    const before = admissionState(f), creates = allocations(f), createCalls = f.calls.creates.length, removes = f.calls.removes.length;
+    const request = checkpoint === "retained" ? reauthorInput(f) : input;
+    await assert.rejects(f.reauthor(request), /missing|unknown allocation|loss|reconcil|worktree/i);
+    if (checkpoint !== "retained") await assert.rejects(f.retry(), /missing|unknown allocation|loss|reconcil|worktree/i);
+    assert.deepEqual(admissionState(f), before); assert.equal(allocations(f), creates); assert.equal(f.calls.creates.length, createCalls);
+    assert.equal(f.calls.removes.length, removes); await missingCheckouts(f);
+  }));
+});
+
+test("ordinary re-author rechecks source, policy, remote and cleanliness after allocation without removing the refused checkout", async (t) => {
+  for (const race of ["dirty checkout", "moved branch", "policy", "receipt", "remote close"]) await t.test(race, async (t) => withFixture(t, { scores: { prompt: 40 } }, async (f) => {
+    const input = reauthorInput(f), source = clone(f.run()), creates = allocations(f), removes = f.calls.removes.length;
+    let allocated, afterRace;
+    f.onCreate = async (path) => {
+      assert.deepEqual(f.run(), source); await ignored(path);
+      if (race === "dirty checkout") await dirty(path);
+      if (race === "moved branch") await git(path, "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "--allow-empty", "-m", "raced head");
+      if (race === "remote close") f.pr.state = "CLOSED";
+      if (race === "policy" || race === "receipt") await f.store.update((state) => {
+        if (race === "policy") state.evaluations[1].weight = 2;
+        else state.agentRuns.find((run) => run.id === source.id).continuation.evaluation.approvalRoundId = "raced-approval";
+      });
+      allocated = await namespace(f, path); afterRace = admissionState(f);
+    };
+    await assert.rejects(f.reauthor(input));
+    assert.ok(allocated, "the race occurs only after a real checkout allocation");
+    assert.equal(allocations(f), creates + 1); assert.equal(f.calls.removes.length, removes);
+    assert.deepEqual(admissionState(f), afterRace, "refusal cannot rewrite the old source, ownership, evidence, or author-request ledger");
+    assert.equal(f.run().reauthorRequests, undefined);
+    assert.deepEqual(await namespace(f, f.paths()[0]), allocated);
+    assert.deepEqual(await f.server.orchestrator.locks.list(), []);
+  }));
+});
+
+test("ordinary re-author preserves a newly allocated checkout across admission write cuts and exactly discovers it on restart", async (t) => {
+  for (const when of ["before", "after"]) await t.test(when, async (t) => withFixture(t, { scores: { prompt: 40 } }, async (f) => {
+    const input = reauthorInput(f), source = clone(f.run()), before = admissionState(f), creates = allocations(f), removes = f.calls.removes.length;
+    let allocated;
+    f.onCreate = async (path) => { await ignored(path); allocated = await namespace(f, path); };
+    f.stateCut = { when, hit: false, matches: (oldRun, newRun) => !oldRun?.reauthorRequests?.length && newRun?.reauthorRequests?.length === 1 };
+    if (when === "before") {
+      await assert.rejects(f.reauthor(input), /Fixture state cut/);
+      assert.deepEqual(admissionState(f), before); assert.equal(f.calls.reauthors.length, 0);
+      assert.deepEqual(await namespace(f, f.paths()[0]), allocated);
+    } else {
+      await f.reauthor(input); assertOrdinaryHeld(f, input, source);
+      assert.equal(f.calls.reauthors.length, 1);
+    }
+    assert.equal(f.stateCut.hit, true); assert.equal(allocations(f), creates + 1); assert.equal(f.calls.removes.length, removes);
+    const createCalls = f.calls.creates.length;
+    f.stateCut = undefined; f.onCreate = undefined;
+    await f.restart(); await f.reauthor(input);
+    assertOrdinaryHeld(f, input, source);
+    assert.equal(f.run().reauthorRequests.length, 1); assert.equal(f.calls.reauthors.length, 1);
+    assert.equal(allocations(f), creates + 1); assert.equal(f.calls.creates.length, createCalls);
+    assert.equal(f.calls.removes.length, removes);
+    const saved = await namespace(f, f.run().worktree);
+    assert.equal(saved.gitfile, allocated.gitfile); assert.deepEqual(saved.files, allocated.files);
+    assert.deepEqual(f.store.get().evaluationRuns, before.rows); assert.deepEqual(f.calls.samples, before.samples);
+    assert.deepEqual(f.calls.models, [...before.models, "reauthor"]); assert.deepEqual(f.pr, before.pr); assert.deepEqual(f.calls.pr, before.effects);
+  }));
+});
