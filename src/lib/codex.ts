@@ -407,7 +407,22 @@ export class CodexClient {
     return this.unstructuredSession(cwd, prompt, settings.agentModel);
   }
 
-  async revise(cwd: string, threadId: string, review: ReviewResult, settings: BurnerSettings, feedback: "review" | "evaluation" = "review"): Promise<SessionResult> {
+  async reauthor(cwd: string, threadId: string, guidance: string, settings: BurnerSettings, historicalFeedback?: ReviewResult): Promise<SessionResult> {
+    const prompt = [
+      "The operator has explicitly admitted one author-only revision of this retained candidate. This is not an independent review finding or approval. Follow the current requirements below, make the justified implementation changes, and run the relevant permitted checks. Burner will commit your result and stop for explicit continuation admission before evidence refresh, review, evaluation or publication.",
+      `Current operator requirements (not evidence or approval):\n${guidance}`,
+      historicalFeedback ? `Historical evaluation feedback for the recorded candidate only, not measurements of this revision:\n${historicalFeedback.summary}\n${historicalFeedback.findings.map((finding) => `${finding.title}: ${finding.detail}`).join("\n")}` : "",
+      "Preserve evaluation definitions, denominators, tolerances and supported behavior. Do not invent measurements or substitute an easier reference. Report a scope conflict or an unsound premise instead of silently broadening the request.",
+      "All edits, generated artifacts, dependency changes, and test fixtures must stay inside the current worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or any path outside this worktree.",
+      "Do not commit, push, create branches, or open a pull request; Burner owns the exact input parent and git delivery.",
+      PROGRESS_OWNERSHIP,
+      MEASURED_ARTIFACT_PROVENANCE,
+      "Summarize the actual changes, checks and unresolved limits. A no-op or metadata-only result is still an author-only output, not a completed or qualified leaf.",
+    ].filter(Boolean).join("\n\n");
+    return this.unstructuredSession(cwd, prompt, settings.agentModel, threadId);
+  }
+
+  async revise(cwd: string, threadId: string, review: ReviewResult, settings: BurnerSettings, feedback: "review" | "evaluation" = "review", taskScope?: string): Promise<SessionResult> {
     const prompt = [
       feedback === "evaluation"
         ? "The confirmed evaluation gate rejected this candidate. Address the evaluation feedback in the current worktree, preserve evaluation definitions, denominators, tolerances and supported behavior, run relevant checks, and leave the branch ready for independent review. This feedback is not an independent code review."
@@ -416,6 +431,7 @@ export class CodexClient {
       "Do not commit, push, or open a pull request; Burner handles git delivery.",
       `${PROGRESS_OWNERSHIP} If feedback asks for a current unmerged PR history point or duplicate progress infrastructure, do not implement that invalid request; explain that Burner stamps the point after final evaluation instead.`,
       MEASURED_ARTIFACT_PROVENANCE,
+      taskScope ? `Current task requirements (not evidence or approval; repair-local notes below are supplemental, not replacement requirements):\n${taskScope}` : "",
       `${feedback === "evaluation" ? "Evaluation feedback" : "Review"} summary: ${review.summary}`,
       `Findings:\n${review.findings.map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.title}${finding.file ? ` (${finding.file})` : ""}: ${finding.detail}`).join("\n")}`,
       "If a finding is invalid, verify that carefully and explain it, but make all justified fixes.",
@@ -436,8 +452,8 @@ export class CodexClient {
       `Perform the post-commit evidence step for this ${kind}. Burner has now committed the implementation, so final measurements can use a clean code commit before independent review.`,
       `Change: ${title}`,
       `Base branch: ${baseBranch}. Clean implementation commit: ${implementationCommit}.`,
-      taskScope ? `Original task scope (requirements, not proof of completion):\n${taskScope}` : "",
-      "Inspect the original task requirements and the complete candidate diff against the base. Refresh measured artifacts introduced or changed by this candidate that claim to describe its final implementation and are now stale. Generate and preserve any new measured artifacts explicitly required by the task, including captures deferred until the implementation was committed, even when no report has been checked in yet. Development-only runs from dirty or uncommitted sources do not satisfy required clean-commit captures. If neither stale current-candidate artifacts nor outstanding task-required captures exist, make no changes and report that briefly. Do not invent additional measurement requirements. Preserve historical baseline measurements and unrelated artifacts unchanged.",
+      taskScope ? `Current task scope (requirements, not proof of completion):\n${taskScope}` : "",
+      "Inspect the current task requirements and the complete candidate diff against the base. Refresh measured artifacts introduced or changed by this candidate that claim to describe its final implementation and are now stale. Generate and preserve any new measured artifacts explicitly required by the task, including captures deferred until the implementation was committed, even when no report has been checked in yet. Development-only runs from dirty or uncommitted sources do not satisfy required clean-commit captures. If neither stale current-candidate artifacts nor outstanding task-required captures exist, make no changes and report that briefly. Do not invent additional measurement requirements or revive superseded procedural scope. Preserve historical baseline measurements and unrelated artifacts unchanged.",
       MEASURED_ARTIFACT_PROVENANCE,
       "Use existing repository-supported build and measurement tooling from the committed implementation. Keep the established workload matrix, reference, denominator, unsupported outcomes, and slow results. Changes in this step must be limited to new or regenerated evidence and its accompanying documentation. Do not change implementation, dependencies, tests, benchmark harnesses, evaluation definitions, scoring, or supported behavior. If those changes are required, leave the evidence untouched and report the blocker for independent review instead of manufacturing a passing report.",
       "All generated files and edits must stay inside this worktree. Never modify parent or sibling repositories, external tools, the Burner installation, home-directory files, or paths outside this worktree. Do not commit, push, create branches, or open pull requests; Burner owns delivery.",

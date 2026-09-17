@@ -303,6 +303,7 @@ export type LeafAuthorReason =
   | { kind: "initial" }
   | { kind: "review"; roundId: string }
   | { kind: "evaluation"; assessment: FullAssessmentIdentity; notes?: string }
+  | { kind: "operator"; requestId: string }
   | { kind: "checks"; feedback: string };
 
 export type LeafContinuationIdentity = {
@@ -348,6 +349,18 @@ export type LeafContinuation = LeafCheckpoint & (
   | ({ step: "refresh" } & LeafRefresh)
 );
 
+/** Request provenance, not another execution cursor. Only the latest may resume. */
+export type LeafReauthorRequest = {
+  id: string;
+  guidance: string;
+  source: Extract<LeafContinuation, { step: "evidence" | "review" }>;
+  previousAuthorMessage?: string;
+  assessment?: FullAssessmentIdentity;
+  admittedAt: string;
+  output?: { continuationId: string; head: string };
+  releasedAt?: string;
+};
+
 export type AgentRun = {
   id: string;
   ideaId: string;
@@ -385,6 +398,8 @@ export type AgentRun = {
   /** Read-only legacy admission input; continuation owns new-format execution. */
   authoringComplete?: boolean;
   continuation?: LeafContinuation;
+  /** Older requests retain provenance; the latest unreleased request caps execution at its author output. */
+  reauthorRequests?: LeafReauthorRequest[];
   reviewRounds: ReviewRound[];
   reviewApproved?: boolean;
   baseRef?: string;

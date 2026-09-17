@@ -755,6 +755,7 @@ test("fresh and resumed composite builds forward scope and verified source feedb
       for (const worktree of worktrees.values()) await mkdir(worktree);
       const remotes = new Map();
       const orchestrator = new Orchestrator(root, store, new EventHub());
+      const currentGuidance = `Redirected source requirements ${"x".repeat(4_100)} end of source requirements`;
       await store.update((state) => {
         state.evaluations = fixture.evaluations.map((evaluation) => ({ ...evaluation, prompt: "Score architecture", weight: 1, createdAt: timestamp }));
         state.evaluationRuns = [fixture.evaluationRuns[0]];
@@ -773,6 +774,10 @@ test("fresh and resumed composite builds forward scope and verified source feedb
           run.leafPr = fixtureLeafPr(run, fields);
           run.continuation = { id: `delivery-${run.id}`, step: "delivery", head: remote.headRefOid,
             approvalRoundId: run.reviewRounds[0].id, identity: orchestrator.continuationIdentity(run, state, remote) };
+          if (run.id === "leaf") run.reauthorRequests = [{ id: "source-redirect", guidance: currentGuidance,
+            admittedAt: timestamp, releasedAt: timestamp,
+            source: { id: "past-source", step: "evidence", head: "past-input", identity: run.continuation.identity },
+            output: { continuationId: "past-output", head: remote.headRefOid } }];
           return run;
         });
         state.composites.push({
@@ -814,8 +819,8 @@ test("fresh and resumed composite builds forward scope and verified source feedb
       orchestrator.ensureLivingComposite = async () => undefined;
       const calls = [];
       orchestrator.codex = {
-        preflight: async (cwd) => assert.ok([...worktrees.values()].includes(cwd)),
-        evaluate: async (cwd) => ({ score: cwd === worktrees.get("leaf") ? 90 : 95,
+        preflight: async (cwd) => assert.ok(cwd === root || [...worktrees.values()].includes(cwd)),
+        evaluate: async (cwd) => ({ score: cwd === worktrees.get("leaf") || cwd === root ? 90 : 95,
           summary: fixture.evaluationRuns[1].summary, evidence: fixture.evaluationRuns[1].evidence,
           suggestions: fixture.evaluationRuns[1].suggestions }),
         integrateComposite: async (_cwd, _title, titles, _settings, context) => {
@@ -845,7 +850,17 @@ test("fresh and resumed composite builds forward scope and verified source feedb
       }
       if (missingOther) await store.update((state) => { state.agentRuns = state.agentRuns.filter((run) => run.id !== "other"); });
       const beforeSources = structuredClone(store.get().agentRuns);
-      orchestrator.reviewComposite = async () => { throw new Error("test stops after integration handoff"); };
+      let evaluationAuthorReached = false;
+      orchestrator.reviewComposite = async () => {
+        if (resume && !missingOther) return { threadId: "integration-thread", message: "Reviewed" };
+        throw new Error("test stops after integration handoff");
+      };
+      orchestrator.codex.revise = async (_cwd, _thread, _feedback, _settings, kind, scope) => {
+        assert.equal(kind, "evaluation");
+        assert.ok(scope.includes(currentGuidance), "later evaluation-repair authors receive complete current source requirements");
+        evaluationAuthorReached = true;
+        throw new Error("test stops after evaluation-author handoff");
+      };
       await orchestrator.buildComposite("combined", resume);
       assert.deepEqual(store.get().agentRuns, beforeSources, "consumption neither adopts nor rewrites source owners");
       assert.equal(orchestrator.agentClaims.size, 0);
@@ -856,16 +871,18 @@ test("fresh and resumed composite builds forward scope and verified source feedb
         return;
       }
       assert.equal(calls.length, resume ? 1 : 2);
+      assert.equal(evaluationAuthorReached, resume, store.get().composites[0].error);
       assert.deepEqual(merged, resume ? [] : [...heads.values()]);
       if (!resume) assert.equal(calls[0].context.phase, "resolve-conflicts", "source conflicts use the bounded resolution phase");
       assert.equal(calls.at(-1).context.phase, undefined, "full integration still runs after all source merges, including resumed builds");
       assert.deepEqual(calls.at(-1).titles, ["CUDA storage", "Other change"], "resumed builds retain the complete included scope");
       for (const call of calls) {
-        assert.equal(call.context.description, "Repair native ownership");
+        assert.match(call.context.description, /Integration requirements: Repair native ownership/);
+        assert.ok(call.context.description.includes(currentGuidance), "both conflict and full integration authors receive complete current source requirements");
         assert.equal(call.context.sourceRegressions[0].source, "PR #7: CUDA storage");
         assert.equal(call.context.sourceRegressions[0].after, 90);
       }
-      assert.match(store.get().composites[0].error, /test stops after integration handoff/);
+      assert.match(store.get().composites[0].error, resume ? /test stops after evaluation-author handoff/ : /test stops after integration handoff/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1030,7 +1047,7 @@ test("post-commit evidence includes task-required first captures without expandi
   for (const method of ["refreshAgentEvidence", "refreshCompositeEvidence"]) {
     await codex[method]("/worktree", "main", "CUDA support", "author", "implementation-sha", { agentModel: "gpt-6-astra" }, taskScope);
     assert.ok(prompt.includes(taskScope), `${method} carries explicit capture requirements`);
-    assert.match(prompt, /Original task scope \(requirements, not proof of completion\)/);
+    assert.match(prompt, /Current task scope \(requirements, not proof of completion\)/);
     assert.match(prompt, /Generate and preserve any new measured artifacts explicitly required by the task/);
     assert.match(prompt, /even when no report has been checked in yet/);
     assert.match(prompt, /Do not invent additional measurement requirements/);
@@ -1087,6 +1104,33 @@ test("evidence handoffs carry leaf requirements and only currently included comp
     assert.match(handoffs[1], /Do not require omitted, removed, or quarantined changes/);
     assert.doesNotMatch(handoffs[1], /OMITTED SOURCE REQUIREMENTS/);
     assert.equal(store.get().evaluationRuns.length, 0);
+    const guidance = `CURRENT REDIRECTED REQUIREMENTS ${"x".repeat(4_100)} END OF CURRENT REQUIREMENTS`;
+    await store.update((state) => {
+      state.agentRuns[0].reauthorRequests = [{ id: "redirect", guidance, admittedAt: timestamp, releasedAt: timestamp,
+        source: { id: "old-source", head: "old-input", step: "evidence", identity: { baseCommit: "base" } },
+        output: { continuationId: "author-output", head: "new-implementation" } }];
+    });
+    await orchestrator.refreshCompositeEvidence(root, "composite", "Combined", "main", "author", store.get().settings);
+    assert.ok(handoffs[2].includes(guidance));
+    assert.doesNotMatch(handoffs[2], /Preserve new clean-commit CUDA captures|OMITTED SOURCE REQUIREMENTS/);
+    const scopes = [];
+    let reviews = 0;
+    orchestrator.publishCompositeDraft = async () => undefined;
+    orchestrator.codex.review = async (_cwd, _base, scope) => {
+      scopes.push(scope);
+      return ++reviews === 1 ? { approved: false, summary: "One correction", findings: [{ severity: "high", title: "Correct the implementation", detail: "Preserve current scope", file: "source" }] }
+        : { approved: true, summary: "Approved", findings: [] };
+    };
+    orchestrator.codex.revise = async (_cwd, _thread, _feedback, _settings, _kind, scope) => {
+      scopes.push(scope);
+      return { threadId: "author", message: "Corrected implementation" };
+    };
+    await orchestrator.reviewComposite(root, "composite", "Combined", "main", "author", store.get().settings);
+    assert.equal(scopes.length, 3);
+    for (const scope of scopes) {
+      assert.ok(scope.includes(guidance), "composite review and author receive complete current requirements");
+      assert.doesNotMatch(scope, /Preserve new clean-commit CUDA captures|OMITTED SOURCE REQUIREMENTS/);
+    }
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

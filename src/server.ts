@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EventHub } from "./lib/events.js";
-import { canRetryAgent, Orchestrator, validateAgentRetryOptions, validateLeafAdmissionOptions, type AgentRetryOptions, type AgentWithdrawalInput, type LeafAdmissionOptions } from "./lib/orchestrator.js";
+import { canRetryAgent, Orchestrator, validateAgentReauthorInput, validateAgentRetryOptions, validateLeafAdmissionOptions, type AgentReauthorInput, type AgentRetryOptions, type AgentWithdrawalInput, type LeafAdmissionOptions } from "./lib/orchestrator.js";
 import { StateStore, validateEvaluation } from "./lib/store.js";
 import type { BurnerSettings, Idea } from "./types.js";
 import { errorMessage, id, now } from "./lib/utils.js";
@@ -225,11 +225,23 @@ export async function createBurnerServer(options: BurnerServerOptions) {
       const run = await orchestrator.withdrawAgent(params.runId, body as AgentWithdrawalInput);
       json(response, 200, run);
     }),
+    route("POST", "/api/agents/:runId/reauthor", (_request, response, params, body) => {
+      if (!store.get().agentRuns.some((item) => item.id === params.runId)) return json(response, 404, { error: "Agent run not found." });
+      const input = body as AgentReauthorInput;
+      try { validateAgentReauthorInput(input); }
+      catch (error) { return json(response, 400, { error: errorMessage(error) }); }
+      json(response, 202, { accepted: true, runId: params.runId, requestId: input.requestId });
+      void orchestrator.reauthorAgent(params.runId, input).catch(async (error) => {
+        await store.addActivity({ type: "error", message: `Agent re-authoring failed: ${params.runId}`, detail: errorMessage(error) });
+        events.emit("error", { message: errorMessage(error) });
+      });
+    }),
     route("POST", "/api/agents/:runId/retry", (_request, response, params, body) => {
       const run = store.get().agentRuns.find((item) => item.id === params.runId);
       if (!run) return json(response, 404, { error: "Agent run not found." });
-      if (!canRetryAgent(run)) return json(response, 409, { error: "Only a failed run or an approved full-evaluation-rejected leaf can be retried." });
+      if (!canRetryAgent(run) && body.continueReauthor === undefined) return json(response, 409, { error: "Only a failed run or an approved full-evaluation-rejected leaf can be retried." });
       const options = { repairNotes: body.repairNotes,
+        ...(body.continueReauthor !== undefined ? { continueReauthor: body.continueReauthor } : {}),
         ...(body.legacyPrProof !== undefined ? { legacyPrProof: body.legacyPrProof } : {}),
         ...(body.retainWorktree !== undefined ? { retainWorktree: body.retainWorktree } : {}) } as AgentRetryOptions;
       try { validateAgentRetryOptions(run, options); }
