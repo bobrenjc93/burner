@@ -208,6 +208,102 @@ test("borrowing uses the canonical physical key and rejects foreign or released 
   assert.throws(() => held.forResource(manager, "cpu-heavy"), /releasing or released/);
 });
 
+test("a multi-resource lease acquires physical aliases once and lends that actual CPU handle", async (t) => {
+  const { root, manager } = await fixture(t);
+  const names = ["cpu/heavy", "gpu", "cpu-heavy", "cpu:heavy", "gpu"];
+  const other = new LockManager(root);
+  const lease = await manager.tryAcquireAll(names, "composite");
+  assert.ok(lease, "aliases in one plan must not contend with the same plan");
+  const cpu = lease.locks.find((held) => held.forResource(manager, "cpu-heavy"));
+  try {
+    assert.equal(lease.locks.length, 2);
+    assert.ok(names.includes(cpu.name), "the handle keeps an original display name");
+    assert.equal(cpu.forResource(manager, "cpu:heavy"), cpu);
+    assert.deepEqual((await manager.list()).sort(), ["cpu-heavy", "gpu"]);
+    for (const name of names) assert.equal(await other.tryAcquire(name, "competitor"), undefined);
+    assert.throws(() => cpu.forResource(other, "cpu-heavy"), /different resource manager/);
+  } finally { await lease.release(); }
+  assert.throws(() => cpu.forResource(manager, "cpu/heavy"), /releasing or released/);
+  assert.deepEqual(await manager.list(), []);
+});
+
+test("multi-resource acquisition order is canonical rather than the spelling or input order", async (t) => {
+  const { manager } = await fixture(t);
+  const physical = new Map([["a", "a"], ["cpu/heavy", "cpu-heavy"], ["cpu-heavy", "cpu-heavy"],
+    ["z/a", "z-a"], ["z-a", "z-a"], ["z.a", "z.a"]]);
+  const inputs = ["z.a", "z/a", "a", "z-a", "cpu/heavy", "cpu-heavy"];
+  const acquire = manager.tryAcquire.bind(manager);
+  const attempts = [];
+  manager.tryAcquire = async (name, owner) => { attempts.push(physical.get(name)); return acquire(name, owner); };
+  for (const names of [inputs, [...inputs].reverse()]) {
+    attempts.length = 0;
+    const lease = await manager.tryAcquireAll(names, "ordered");
+    assert.ok(lease);
+    try { assert.deepEqual(attempts, ["a", "cpu-heavy", "z-a", "z.a"]); }
+    finally { await lease.release(); }
+  }
+});
+
+test("alias deduplication cannot let a composite plan overtake an existing canonical FIFO waiter", async (t) => {
+  const { manager } = await fixture(t);
+  const entered = deferred();
+  const resume = deferred();
+  const initialize = manager.init.bind(manager);
+  let first = true;
+  manager.init = async () => {
+    if (first) { first = false; entered.resolve(); await resume.promise; }
+    await initialize();
+  };
+  const waiting = manager.acquire("cpu/heavy", "evaluation-first", { timeoutMs: 2_000, pollMs: 10 });
+  let oldest;
+  let unrelated;
+  try {
+    await entered.promise;
+    assert.equal(await manager.tryAcquireAll(["aaa", "cpu-heavy", "cpu:heavy"], "composite-later"), undefined);
+    assert.deepEqual(await manager.list(), [], "the denied plan rolls back its earlier resource");
+    unrelated = await manager.tryAcquireAll(["gpu", "gpu"], "independent-work");
+    assert.ok(unrelated, "FIFO admission is per canonical resource, not a global queue");
+    resume.resolve();
+    oldest = await waiting;
+    assert.equal(await manager.tryAcquireAll(["cpu-heavy", "cpu:heavy"], "still-later"), undefined);
+    assert.equal(oldest.forResource(manager, "cpu-heavy"), oldest);
+  } finally {
+    resume.resolve();
+    oldest ??= await waiting;
+    await oldest.release();
+    await unrelated?.release();
+  }
+  assert.deepEqual(await manager.list(), []);
+  assert.equal(manager.waiters.size, 0);
+});
+
+for (const failure of ["busy", "throw"]) {
+  test(`canonical deduplication retains complete owned rollback on later-resource ${failure === "busy" ? "contention" : "failure"}`, async (t) => {
+    const { root, manager } = await fixture(t);
+    const other = new LockManager(root);
+    const occupied = failure === "busy" ? await other.acquire("z-last", "previous-owner") : undefined;
+    const acquire = manager.tryAcquire.bind(manager);
+    const releases = [];
+    manager.tryAcquire = async (name, owner) => {
+      if (name === "z-last" && failure === "throw") throw new Error("fixture later acquisition failed");
+      const held = await acquire(name, owner);
+      if (held) {
+        const release = held.release;
+        held.release = async () => { releases.push(name); await release(); };
+      }
+      return held;
+    };
+    try {
+      const attempt = manager.tryAcquireAll(["gpu", "cpu/heavy", "cpu-heavy", "z-last", "gpu"], "new-plan");
+      if (failure === "throw") await assert.rejects(attempt, /later acquisition failed/);
+      else assert.equal(await attempt, undefined);
+      assert.deepEqual(releases.sort(), ["cpu/heavy", "gpu"]);
+      assert.deepEqual(await manager.list(), occupied ? ["z-last"] : []);
+      if (occupied) assert.equal(JSON.parse(await fs.readFile(join(root, "z-last.lock"), "utf8")).owner, "previous-owner");
+    } finally { await occupied?.release(); }
+  });
+}
+
 test("live owners never age out, including the ignored legacy constructor argument", async (t) => {
   const { root, manager } = await fixture(t);
   const probes = t.mock.method(process, "kill", () => assert.fail("admission must not infer work completion from a PID"));

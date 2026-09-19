@@ -1204,6 +1204,11 @@ export class Orchestrator {
   private ticking = false;
   private activeAgents = new Set<string>();
   private activeComposites = new Set<string>();
+  // Canonical composite records remain the queue. Tokens retain only accepted
+  // request lifetimes, including a newer retry made while an old build exits.
+  private readonly compositeRequests = new Map<string, symbol>();
+  private compositeWakeup?: NodeJS.Timeout;
+  private compositeAdmissionClosed = false;
   private runningEvaluations = 0;
   private lastPrSyncAt = 0;
   private runtimeCache?: { value: RuntimeStatus; expires: number };
@@ -1640,6 +1645,7 @@ export class Orchestrator {
   }
 
   async close(): Promise<void> {
+    this.stopCompositeAdmission();
     if (this.timer) clearInterval(this.timer);
     await this.store.update((state) => {
       state.orchestrator.enabled = false;
@@ -3863,8 +3869,8 @@ export class Orchestrator {
         this.events.emit("state", this.store.get());
         if (started && !bounded() && this.store.get().orchestrator.enabled) {
           if (this.yolo) void this.tick(false);
-          else void this.scheduleComposites(true);
-        }
+          this.wakeCompositeSchedulerAfterWork();
+        } else if (this.compositeRequests.size) this.wakeCompositeSchedulerAfterWork();
       }
     }
     return this.store.get().agentRuns.find((item) => item.id === runId)!;
@@ -4411,6 +4417,7 @@ export class Orchestrator {
     const reserved = reservedCompositeSourceIds(state);
     if (uniqueIds.some((runId) => reserved.has(runId))) throw new Error("A selected source is already reserved by a composite.");
     const claim = this.claimAgents(uniqueIds);
+    let accepted = false;
     try {
       const sources: CompositeSource[] = uniqueIds.map((runId) => {
         const run = state.agentRuns.find((item) => item.id === runId);
@@ -4448,6 +4455,8 @@ export class Orchestrator {
           for (const item of draft.composites) item.isLiving = item.id === composite.id;
         }
       });
+      accepted = true;
+      this.requestComposite(compositeId);
       await this.store.addActivity({
         type: "pr",
         message: `Composite queued: ${composite.title}`,
@@ -4456,9 +4465,16 @@ export class Orchestrator {
           : `${sources.length} reviewed leaf PRs are reserved for this independently rebuilt and recalculated portfolio generation.`,
       });
       this.events.emit("state", this.store.get());
-      void this.scheduleComposites(true);
       return composite;
-    } finally { claim.release(); }
+    } finally {
+      claim.release();
+      // Accepted work survives notification/persistence waits, but integration
+      // must not compete with its creator's still-held source reservations.
+      if (accepted) {
+        this.clearCompositeWakeup();
+        void this.scheduleComposites();
+      }
+    }
   }
 
   async setLivingComposite(compositeId: string): Promise<void> {
@@ -5196,7 +5212,7 @@ export class Orchestrator {
       claim.release();
     }
     if (!found) throw new Error("Only a failed composite can be retried.");
-    void this.scheduleComposites(true);
+    this.requestComposite(compositeId);
   }
 
   async refreshAgentBaseAndRetry(runId: string, options: LeafAdmissionOptions = {}): Promise<AgentRun> {
@@ -5921,6 +5937,7 @@ export class Orchestrator {
             const current = this.store.get();
             if (!current.orchestrator.enabled || this.runningEvaluations > 0 || this.activeAgents.size > 0 || this.activeComposites.size > 0) return;
             if (!selectYoloMergeCandidate(current, baseCommit, false) && !this.missingBaselineEvaluations(baseCommit, current).length) {
+              this.clearCompositeWakeup();
               await this.scheduleComposites();
               return;
             }
@@ -5964,6 +5981,7 @@ export class Orchestrator {
       if (!refreshed.orchestrator.enabled && !force) return;
       const configuredLiving = refreshed.orchestrator.livingCompositeId ? refreshed.composites.find((item) => item.id === refreshed.orchestrator.livingCompositeId) : undefined;
       if (!(this.yolo && this.yoloBatchSize > 1) && refreshed.settings.preferLivingComposite && configuredLiving && configuredLiving.status !== "open") {
+        this.clearCompositeWakeup();
         await this.scheduleComposites();
         return;
       }
@@ -5983,6 +6001,7 @@ export class Orchestrator {
         }
       }
       if (!this.store.get().orchestrator.enabled && !force) return;
+      this.clearCompositeWakeup();
       await this.scheduleComposites();
       await this.schedule();
     } catch (error) {
@@ -6099,6 +6118,7 @@ export class Orchestrator {
     };
     if (run.leafPr!.pending) await this.acknowledgeLeafPrIntent(run, claim, run.leafPr!.pending!.id, finish);
     else await this.updateLeafOwner(run, claim, finish);
+    this.requestComposite(compositeId);
     await this.retireTerminalExperimentPr(runId, claim);
     await this.store.addActivity({ type: "pr", message: `Experiment absorbed: ${idea.title}`, detail: `Impact +${impact.toFixed(1)}. ${composite.title} will now be rebuilt, reviewed, and fully reevaluated.` });
     this.events.emit("state", this.store.get());
@@ -6403,7 +6423,7 @@ export class Orchestrator {
         if (this.yolo) void this.tick(false);
         else void this.schedule();
       }
-      if (!this.yolo || !this.store.get().orchestrator.enabled) void this.scheduleComposites(true);
+      this.wakeCompositeSchedulerAfterWork();
     }
   }
 
@@ -6508,19 +6528,105 @@ export class Orchestrator {
     this.events.emit("agent", { runId: run.id, status: "completed", prUrl: pr?.url, impact });
   }
 
-  private async scheduleComposites(force = false): Promise<void> {
-    if (this.activeComposites.size) return;
+  private requestComposite(compositeId: string): void {
+    if (this.compositeAdmissionClosed) return;
+    this.compositeRequests.set(compositeId, Symbol(compositeId));
+    void this.scheduleComposites();
+  }
+
+  private clearCompositeWakeup(): void {
+    if (this.compositeWakeup) clearTimeout(this.compositeWakeup);
+    this.compositeWakeup = undefined;
+  }
+
+  private stopCompositeAdmission(): void {
+    this.compositeAdmissionClosed = true;
+    this.clearCompositeWakeup();
+    this.compositeRequests.clear();
+  }
+
+  private scheduleCompositeWakeup(): void {
+    if (this.compositeAdmissionClosed || this.compositeWakeup) return;
+    this.compositeWakeup = setTimeout(() => {
+      this.compositeWakeup = undefined;
+      if (this.compositeAdmissionClosed) return;
+      if (!this.yolo || !this.store.get().orchestrator.enabled) {
+        void this.scheduleComposites();
+        return;
+      }
+      // Elapsed time is not a completed merge-priority decision. The enabled
+      // tick consumes the wakeup only at its existing composite-admission gates.
+      // If it is already running or observes pause after an await, keep a future
+      // wakeup for eligible canonical work rather than losing accepted intent.
+      void this.tick(false).finally(() => {
+        const state = this.store.get();
+        if (state.composites.some((composite) =>
+          (composite.status === "queued" || composite.status === "rebuilding") &&
+          (state.orchestrator.enabled || this.compositeRequests.has(composite.id)))) this.scheduleCompositeWakeup();
+      }).catch((error) => {
+        this.stopCompositeAdmission();
+        console.error("Composite scheduler wakeup failed:", error);
+      });
+    }, 5_000);
+  }
+
+  private wakeCompositeSchedulerAfterWork(): void {
+    if (this.compositeAdmissionClosed) return;
+    if (this.yolo && this.store.get().orchestrator.enabled) {
+      // YOLO retains its merge/planning priority, but its tick may already be
+      // running or observe pause after an await. It must never be the only
+      // carrier of accepted work. Keep any existing deadline, without resetting
+      // it on each completion, or create one if this request has none.
+      if (this.compositeRequests.size) this.scheduleCompositeWakeup();
+    } else {
+      this.clearCompositeWakeup();
+      void this.scheduleComposites();
+    }
+  }
+
+  private async scheduleComposites(): Promise<void> {
+    if (this.compositeAdmissionClosed) return;
     const state = this.store.get();
-    if (this.activeAgents.size + this.activeComposites.size >= state.settings.parallelism) return;
-    const next = state.composites.find((composite) => composite.status === "rebuilding") ?? state.composites.find((composite) => composite.status === "queued");
-    if (!next || (!force && !state.orchestrator.enabled)) return;
+    const pending = state.composites.filter((composite) => composite.status === "rebuilding" || composite.status === "queued");
+    for (const compositeId of this.compositeRequests.keys()) {
+      if (!this.activeComposites.has(compositeId) && !pending.some((composite) => composite.id === compositeId)) {
+        this.compositeRequests.delete(compositeId);
+      }
+    }
+    const eligible = pending.filter((composite) => state.orchestrator.enabled || this.compositeRequests.has(composite.id));
+    const next = eligible.find((composite) => composite.status === "rebuilding") ?? eligible[0];
+    if (!next || this.compositeWakeup) return;
+    if (this.activeComposites.size || this.activeAgents.size >= state.settings.parallelism ||
+      next.sources.some((source) => this.agentClaims.has(source.agentRunId))) {
+      this.scheduleCompositeWakeup();
+      return;
+    }
+    const request = this.compositeRequests.get(next.id);
     this.activeComposites.add(next.id);
-    void this.buildComposite(next.id, next.status === "rebuilding").finally(() => {
+    let deferred = false;
+    void this.buildComposite(next.id, next.status === "rebuilding").then((outcome) => {
+      deferred = outcome === "deferred";
+      if (deferred) this.scheduleCompositeWakeup();
+      else if (this.compositeRequests.get(next.id) === request) this.compositeRequests.delete(next.id);
+    }).catch(async (error) => {
+      // An escaping acquisition/cleanup error is not contention. Fence every
+      // successor path; a timer must not restart work after failed cleanup.
+      this.stopCompositeAdmission();
+      await this.store.addActivity({ type: "error", message: "Composite admission stopped after a resource or cleanup failure", detail: errorMessage(error) });
+    }).finally(() => {
       this.activeComposites.delete(next.id);
       this.runtimeCache = undefined;
       this.events.emit("state", this.store.get());
-      if (this.yolo && this.store.get().orchestrator.enabled) void this.tick(false);
-      else void this.scheduleComposites(true);
+      if (this.compositeAdmissionClosed) return;
+      if (!deferred) {
+        this.wakeCompositeSchedulerAfterWork();
+        if (this.yolo && this.store.get().orchestrator.enabled) void this.tick(false);
+      }
+    }).catch((error) => {
+      // Even failure to persist/emit the scheduler error must not leave a
+      // detached rejected promise or allow later admission in this instance.
+      this.stopCompositeAdmission();
+      console.error("Composite scheduler failed:", error);
     });
   }
 
@@ -6594,15 +6700,44 @@ export class Orchestrator {
     }
   }
 
-  private async buildComposite(compositeId: string, rebuild: boolean): Promise<void> {
-    const lease = await this.locks.tryAcquireAll(["composite-build", ...this.store.get().settings.defaultResources], compositeId);
-    if (!lease) return;
+  private compositeResourcePlan(state: BurnerState, compositeId: string): { identity: string; resources: string[] } | undefined {
+    const composite = state.composites.find((item) => item.id === compositeId);
+    if (!composite || (composite.status !== "queued" && composite.status !== "rebuilding")) return undefined;
+    const resources = ["composite-build", `living-${compositeId}`, ...state.settings.defaultResources];
+    for (const source of composite.sources) {
+      const run = state.agentRuns.find((item) => item.id === source.agentRunId);
+      if (!run) throw new Error(`Composite source '${source.agentRunId}' is missing; its resource requirements cannot be established.`);
+      resources.push(...run.resources);
+    }
+    return { identity: compositeIdentity(composite), resources: [...new Set(resources)].sort() };
+  }
+
+  private async buildComposite(compositeId: string, rebuild: boolean): Promise<"settled" | "deferred"> {
+    let lease: ResourceLease | undefined;
     let worktree = "";
+    let cleaningUp = false;
     const sourceHeads = new Map<string, string>();
     try {
+      if (this.compositeAdmissionClosed) return "settled";
+      await this.store.refresh();
+      if (this.compositeAdmissionClosed) return "settled";
       let state = this.store.get();
+      const plan = this.compositeResourcePlan(state, compositeId);
+      if (!plan) return "settled";
+      if (!state.orchestrator.enabled && !this.compositeRequests.has(compositeId)) return "deferred";
+      try { lease = await this.locks.tryAcquireAll(plan.resources, compositeId); }
+      catch (error) { this.stopCompositeAdmission(); throw error; }
+      if (!lease) return "deferred";
+      await this.store.refresh();
+      if (this.compositeAdmissionClosed) return "settled";
+      state = this.store.get();
+      const currentPlan = this.compositeResourcePlan(state, compositeId);
+      if (!currentPlan) return "settled";
+      if (currentPlan.identity !== plan.identity || JSON.stringify(currentPlan.resources) !== JSON.stringify(plan.resources) ||
+        (!state.orchestrator.enabled && !this.compositeRequests.has(compositeId))) return "deferred";
       let composite = state.composites.find((item) => item.id === compositeId);
       if (!composite) throw new Error("Composite not found.");
+      if ((composite.status === "rebuilding") !== rebuild) return "deferred";
       if (composite.sources.length < 2) throw new Error("A composite requires at least two constituent changes.");
       const settings = state.settings;
       const incremental = rebuild && composite.rebuildMode === "incremental" && Boolean(composite.pendingExperimentRunIds?.length);
@@ -6816,17 +6951,26 @@ export class Orchestrator {
       await this.updateComposite(compositeId, { status: "open", deltas, impact, compositeScore, reviewApproved: true, rebuildMode: undefined, pendingExperimentRunIds: [], checkpointBranch, error: undefined, updatedAt: now() });
       await this.ensureLivingComposite();
       await this.store.addActivity({ type: "pr", message: rebuild ? `Composite rebuilt: ${composite.title}` : `Composite opened: ${composite.title}`, detail: `Recalculated score ${compositeScore.toFixed(1)} (${impact >= 0 ? "+" : ""}${impact.toFixed(1)} impact).` });
+      cleaningUp = true;
       const cleanupLock = await this.locks.acquire("git-metadata", `${compositeId}-cleanup`);
       try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
+      cleaningUp = false;
+      return "settled";
     } catch (error) {
+      if (cleaningUp) this.stopCompositeAdmission();
       const message = errorMessage(error);
       if (worktree) {
-        const cleanupLock = await this.locks.acquire("git-metadata", `${compositeId}-failed-cleanup`);
-        try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
+        try {
+          const cleanupLock = await this.locks.acquire("git-metadata", `${compositeId}-failed-cleanup`);
+          try { await this.git.removeWorktree(worktree); } finally { await cleanupLock.release(); }
+        } catch (cleanupError) {
+          this.stopCompositeAdmission();
+          throw new AggregateError([error, cleanupError], "Composite work and cleanup failed.");
+        }
       }
       if (error instanceof PortfolioReviewLimitError && error.target === "composite") {
         await this.quarantineCompositeBlocker(compositeId, error.findings);
-        return;
+        return "settled";
       }
       const baseMoved = message.startsWith("BASE_CHANGED:");
       const currentMode = this.store.get().composites.find((item) => item.id === compositeId)?.rebuildMode;
@@ -6843,8 +6987,10 @@ export class Orchestrator {
       }
       if (!baseMoved) await this.ensureLivingComposite();
       await this.store.addActivity({ type: baseMoved ? "system" : "error", message: baseMoved ? "Composite queued for a fresh base" : "Composite build failed", detail: message.replace("BASE_CHANGED: ", "") });
+      return baseMoved ? "deferred" : "settled";
     } finally {
-      await lease.release();
+      try { await lease?.release(); }
+      catch (error) { this.stopCompositeAdmission(); throw error; }
     }
   }
 
