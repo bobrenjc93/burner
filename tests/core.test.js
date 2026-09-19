@@ -757,6 +757,7 @@ test("fresh and resumed composite builds forward scope and verified source feedb
       const orchestrator = new Orchestrator(root, store, new EventHub());
       const currentGuidance = `Redirected source requirements ${"x".repeat(4_100)} end of source requirements`;
       await store.update((state) => {
+        state.orchestrator.enabled = true;
         state.evaluations = fixture.evaluations.map((evaluation) => ({ ...evaluation, prompt: "Score architecture", weight: 1, createdAt: timestamp }));
         state.evaluationRuns = [fixture.evaluationRuns[0]];
         state.agentRuns = allSources.map((source) => {
@@ -865,9 +866,9 @@ test("fresh and resumed composite builds forward scope and verified source feedb
       assert.deepEqual(store.get().agentRuns, beforeSources, "consumption neither adopts nor rewrites source owners");
       assert.equal(orchestrator.agentClaims.size, 0);
       if (missingOther) {
-        assert.match(store.get().composites[0].error, /source lost its exact leaf owner\/membership/);
-        assert.ok(calls.every((call) => call.context.phase === "resolve-conflicts"), "full integration cannot start with an unowned source");
-        assert.deepEqual(merged, resume ? [] : [heads.get("leaf")]);
+        assert.match(store.get().composites[0].error, /source 'other' is missing; its resource requirements cannot be established/);
+        assert.deepEqual(calls, [], "no integration can start without every source's resource requirements");
+        assert.deepEqual(merged, []);
         return;
       }
       assert.equal(calls.length, resume ? 1 : 2);
@@ -7063,6 +7064,9 @@ test("successful experiments bind to and incrementally evolve the living composi
     const pushed = [];
     const closed = [];
     const orchestrator = new Orchestrator(root, store, new EventHub(), { yolo: true, yoloBatchSize: 10 });
+    // This fixture tests the completed transfer, not its downstream build.
+    // The public living-line fixture exercises real paused parent scheduling.
+    orchestrator.scheduleComposites = async () => undefined;
     const pr = { number: 11, url: "https://example.test/pull/11", headRefName: "burner/experiment", headRefOid: "candidate",
       title: "Experiment", body: "Published checkpoint", isDraft: true, state: "OPEN", mergeable: "MERGEABLE", statusCheckRollup: [] };
     await store.update((state) => { state.agentRuns[0].leafPr = fixtureLeafPr(state.agentRuns[0], { title: pr.title, body: pr.body, isDraft: true, state: "OPEN" }); });
@@ -7120,6 +7124,8 @@ test("living-composite experiments confirm prompt score changes before absorptio
     });
     const baseline = new Map([["quality", store.get().evaluationRuns[0]]]);
     const orchestrator = new Orchestrator(root, store, new EventHub());
+    // This fixture owns prompt confirmation and transfer, not parent creation.
+    orchestrator.scheduleComposites = async () => undefined;
     const pushes = [];
     orchestrator.git = { resolveRef: async () => "base", pushLeaf: async (...args) => { pushes.push(args); } };
     installLeafPrFixtureTransport(orchestrator.git, { observe: async () => assert.fail("This source has never opened a PR") });

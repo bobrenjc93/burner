@@ -138,7 +138,12 @@ export class LockManager {
       if (failures.length) throw new AggregateError(failures, "Could not release all acquired resource locks.");
     };
     try {
-      for (const name of [...new Set(names)].sort()) {
+      // Aliases share one physical lock. Acquire that key only once, in the
+      // same order for every caller, while retaining an original display name.
+      const namesByKey = new Map<string, string>();
+      for (const name of names) if (!namesByKey.has(lockKey(name))) namesByKey.set(lockKey(name), name);
+      for (const key of [...namesByKey.keys()].sort()) {
+        const name = namesByKey.get(key)!;
         const lock = await this.tryAcquire(name, owner);
         if (!lock) {
           await release();
